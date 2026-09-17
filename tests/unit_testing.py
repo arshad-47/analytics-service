@@ -824,8 +824,7 @@ def test_theme_001_short_statement_classified_unknown_unclear(monkeypatch):
         monkeypatch.setattr(thematic_module, "insert_analysis_result", insert_mock)
         result, pending = await thematic_module._run_local_classification(
             conn=conn, statement="Too short", submission_id="1", tenant_code="mitra",
-            statement_type="challenges", theme_vectors={}, theme_id_to_info={},
-            abusive_masked_at=[], is_discussion=True,
+            statement_type="challenges", statement_id="stmt-1", abusive_masked_at=[],
         )
         assert pending is None
         assert result["category_type"] == "Unknown/Unclear"
@@ -840,8 +839,7 @@ def test_theme_002_garbage_spam_statement_classified_unknown_unclear(monkeypatch
         monkeypatch.setattr(thematic_module, "insert_analysis_result", AsyncMock())
         result, pending = await thematic_module._run_local_classification(
             conn=conn, statement="asdf asdf asdf asdf asdf", submission_id="1", tenant_code="mitra",
-            statement_type="challenges", theme_vectors={}, theme_id_to_info={},
-            abusive_masked_at=[], is_discussion=True,
+            statement_type="challenges", statement_id="stmt-1", abusive_masked_at=[],
         )
         assert pending is None
         assert result["category_type"] == "Unknown/Unclear"
@@ -856,7 +854,7 @@ def test_theme_003_pii_mask_tag_classified_flagged(monkeypatch):
         result, pending = await thematic_module._run_local_classification(
             conn=conn, statement="Met with <PERSON> at the village school today",
             submission_id="1", tenant_code="mitra", statement_type="challenges",
-            theme_vectors={}, theme_id_to_info={}, abusive_masked_at=[], is_discussion=True,
+            statement_id="stmt-1", abusive_masked_at=[],
         )
         assert pending is None
         assert result["category_type"] == "Flagged"
@@ -871,7 +869,7 @@ def test_theme_004_abusive_flagged_column_classified_flagged(monkeypatch):
         result, pending = await thematic_module._run_local_classification(
             conn=conn, statement="This is a perfectly normal length statement here",
             submission_id="1", tenant_code="mitra", statement_type="challenges",
-            theme_vectors={}, theme_id_to_info={}, abusive_masked_at=["challenges"], is_discussion=True,
+            statement_id="stmt-1", abusive_masked_at=["challenges"],
         )
         assert pending is None
         assert result["category_type"] == "Flagged"
@@ -891,8 +889,7 @@ def test_theme_005_local_similarity_match_classified_standard_no_llm(monkeypatch
         result, pending = await thematic_module._run_local_classification(
             conn=conn, statement="A statement long enough to pass the word count gate",
             submission_id="1", tenant_code="mitra", statement_type="challenges",
-            theme_vectors={"theme-1": "vec"}, theme_id_to_info={"theme-1": {"name": "Infra"}},
-            abusive_masked_at=[], is_discussion=True,
+            statement_id="stmt-1", abusive_masked_at=[],
         )
         assert pending is None
         assert result["category_type"] == "Standard"
@@ -912,8 +909,7 @@ def test_theme_006_below_threshold_queued_for_llm_fallback(monkeypatch):
         result, pending = await thematic_module._run_local_classification(
             conn=conn, statement="A statement long enough to pass the word count gate",
             submission_id="1", tenant_code="mitra", statement_type="challenges",
-            theme_vectors={"theme-1": "vec"}, theme_id_to_info={"theme-1": {"name": "Infra"}},
-            abusive_masked_at=[], is_discussion=True,
+            statement_id="stmt-1", abusive_masked_at=[],
         )
         assert result is None
         assert pending is not None
@@ -927,7 +923,7 @@ def test_theme_007_discussion_multi_theme_mapped_capped_at_max(monkeypatch):
         {"theme_id": f"t{i}", "confidence_score": 0.9 - i * 0.01, "justification": "j"} for i in range(5)
     ]
     settings_override(monkeypatch, thematic_module.settings, LLM_CONFIDENCE_SCORE_THRESHOLD=0.5)
-    qualifying = thematic_module._finalize_qualifying_themes(resolved_items, is_discussion)
+    qualifying = thematic_module._finalize_qualifying_themes(resolved_items)
     assert len(qualifying) == thematic_module.MAX_MULTI_THEME_MATCHES
 
 
@@ -936,7 +932,7 @@ def test_theme_008_story_stays_single_theme_even_with_multiple_qualifying():
         {"theme_id": "t1", "confidence_score": 0.9, "justification": "j"},
         {"theme_id": "t2", "confidence_score": 0.85, "justification": "j"},
     ]
-    qualifying = thematic_module._finalize_qualifying_themes(resolved_items, is_discussion=False)
+    qualifying = thematic_module._finalize_qualifying_themes(resolved_items)
     assert len(qualifying) == 1
 
 
@@ -948,7 +944,7 @@ def test_theme_009_llm_confidence_at_threshold_classified_standard():
 def test_theme_010_llm_confidence_below_threshold_would_resolve_others(monkeypatch):
     settings_override(monkeypatch, thematic_module.settings, LLM_CONFIDENCE_SCORE_THRESHOLD=0.8)
     resolved_items = [{"theme_id": "t1", "confidence_score": 0.5, "justification": "j"}]
-    qualifying = thematic_module._finalize_qualifying_themes(resolved_items, is_discussion=True)
+    qualifying = thematic_module._finalize_qualifying_themes(resolved_items)
     assert qualifying == []
 
 

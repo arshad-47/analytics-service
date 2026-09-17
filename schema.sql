@@ -97,25 +97,29 @@ CREATE TABLE submissions (
 
 CREATE TABLE discussion_submissions (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    submission_id       TEXT NOT NULL,
-    tenant_code         TEXT NOT NULL,
-    title               TEXT,
-    discussion_date     TIMESTAMPTZ,
-    challenges          TEXT[], -- one array element per discrete statement (see operations.py's _normalize_statement_list)
-    solutions           TEXT[], -- same format as challenges
-    author              TEXT,
-    language            TEXT,
-    image_urls          TEXT[] DEFAULT '{}',
-    blur_image_urls     TEXT[] DEFAULT '{}',
-    pdf_urls            TEXT[] DEFAULT '{}',
-    masked_pdf_urls     TEXT[] DEFAULT '{}',
-    transcript_link     TEXT,
-    pii_masked          BOOLEAN NOT NULL DEFAULT FALSE,
-    pii_masked_at       TEXT[] DEFAULT '{}',
-    abusive_masked_at   TEXT[] DEFAULT '{}',
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-     meta_data           JSONB,
+    submission_id                     TEXT NOT NULL,
+    tenant_code                       TEXT NOT NULL,
+    title                             TEXT,
+    discussion_date                   TIMESTAMPTZ,
+    challenges                        TEXT[], -- one array element per discrete statement (see operations.py's _normalize_statement_list)
+    solutions                         TEXT[], -- same format as challenges
+    author                            TEXT,
+    language                          TEXT,
+    image_urls                        TEXT[] DEFAULT '{}',
+    blur_image_urls                   TEXT[] DEFAULT '{}',
+    pdf_urls                          TEXT[] DEFAULT '{}',
+    masked_pdf_urls                   TEXT[] DEFAULT '{}',
+    transcript_link                   TEXT,
+    pii_masked                        BOOLEAN NOT NULL DEFAULT FALSE,
+    pii_masked_at                     TEXT[] DEFAULT '{}',
+    abusive_masked_at                 TEXT[] DEFAULT '{}',
+    pri_member_name                   TEXT,
+    pri_member_designation            TEXT,
+    school_representative_name        TEXT,
+    school_representative_designation TEXT,
+    created_at                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    meta_data                         JSONB,
     
     FOREIGN KEY (submission_id, tenant_code) 
         REFERENCES submissions(submission_id, tenant_code) ON DELETE CASCADE
@@ -225,8 +229,8 @@ CREATE INDEX idx_statements_cleaned_lower
     ON statements (LOWER(cleaned_statement));
 
 -- Submission lookup + cascade delete path.
-CREATE INDEX idx_statements_submission_parent ON statements (submission_id, parent_id);
-CREATE INDEX idx_statements_parent ON statements (parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_statements_submission_parent ON statements (submission_id, parent_id);
+CREATE INDEX IF NOT EXISTS idx_statements_parent ON statements (parent_id) WHERE parent_id IS NOT NULL;
 
 -- =========================================================================
 -- Trigger: automatically promote a duplicate child to be the new parent
@@ -238,11 +242,14 @@ CREATE OR REPLACE FUNCTION promote_statement_child()
 RETURNS TRIGGER AS $$
 DECLARE
     new_parent_id UUID;
+    new_sub_id TEXT;
+    new_tenant TEXT;
 BEGIN
     -- Only act if the statement being deleted is a root (parent)
     IF OLD.parent_id IS NULL THEN
         -- Find one child to become the new parent (the oldest duplicate)
-        SELECT id INTO new_parent_id
+        SELECT id, submission_id, tenant_code
+        INTO new_parent_id, new_sub_id, new_tenant
         FROM statements
         WHERE parent_id = OLD.id
         ORDER BY created_at ASC
@@ -258,6 +265,7 @@ BEGIN
             UPDATE statements
             SET parent_id = new_parent_id
             WHERE parent_id = OLD.id AND id != new_parent_id;
+            
         END IF;
     END IF;
 

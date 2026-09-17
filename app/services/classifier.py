@@ -6,9 +6,10 @@ and approved themes, then computes cosine similarity to find the best match.
 """
 import logging
 import threading
-from typing import Dict, Any, List, Optional, Tuple
-
+import torch
 import numpy as np
+from typing import Dict, Any, List, Optional, Tuple
+from setfit import SetFitModel
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -25,16 +26,6 @@ _model_lock = threading.Lock()
 
 
 def _get_model() -> SentenceTransformer:
-    """
-    Lazily load the sentence transformer model (cached at module level).
-    Thread-safe: double-checked locking, since multiple concurrent activities
-    call this from separate OS threads. Without the lock, several threads can
-    all see _model is None at once and each construct their own
-    SentenceTransformer concurrently — that's not safe (load-tested: it
-    corrupts PyTorch's internal state with "NotImplementedError: Cannot copy
-    out of meta tensor; no data" under concurrent load). The un-locked fast
-    path below keeps the common case (already loaded) lock-free.
-    """
     global _model
     if _model is not None:
         return _model
@@ -48,14 +39,6 @@ def _get_model() -> SentenceTransformer:
 
 
 def build_theme_embeddings(approved_themes: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
-    """
-    Build embeddings for each approved theme, matching the representation used
-    by the offline thematic_analysis.py discovery tool:
-      - one base vector encoding name + definition + keywords combined
-      - one additional vector per '|'-delimited example statement
-
-    Returns: {theme_id_str: np.ndarray of shape (N, embedding_dim)}
-    """
     model = _get_model()
     theme_vectors: Dict[str, np.ndarray] = {}
 
@@ -111,16 +94,44 @@ def classify_statement(
     theme_vectors: Dict[str, np.ndarray],
     theme_id_to_info: Dict[str, Dict[str, Any]],
 ) -> Tuple[Optional[str], float]:
-    """
-    Classify a single statement against pre-computed theme embeddings,
-    returning only the single best match. See get_theme_similarities()
-    for the full ranked list (used by multi-theme callers).
-
-    Returns:
-        (best_theme_id, best_similarity_score)
-        If no themes available, returns (None, 0.0)
-    """
     scores = get_theme_similarities(statement, theme_vectors)
     if not scores:
         return None, 0.0
     return scores[0]
+
+
+# Shared SetFit Model Loader & Batch Predictor
+
+_setfit_models_cache: Dict[Tuple[str, str], Any] = {}
+_setfit_models_lock = threading.Lock()
+
+
+def load_setfit_model(model_id: str, revision: str = "main"):
+    cache_key = (model_id, revision)
+    if cache_key not in _setfit_models_cache:
+        with _setfit_models_lock:
+            if cache_key not in _setfit_models_cache:
+                logger.info(f"Loading SetFit model '{model_id}' (revision={revision})...")
+                model = SetFitModel.from_pretrained(model_id, revision=revision)
+                if revision != "main":
+                    model.model_body = SentenceTransformer(model_id, revision=revision)
+                    logger.info(
+                        f"Patched model body for '{model_id}' revision='{revision}' "
+                        f"(embedding dim: {model.model_body.get_sentence_embedding_dimension()})."
+                    )
+                _setfit_models_cache[cache_key] = model
+                logger.info(f"SetFit model '{model_id}' loaded successfully.")
+    return _setfit_models_cache[cache_key]
+
+
+def predict_setfit_batch(model, texts: List[str]) -> Tuple[List[str], List[float]]:
+    raw_probs = model.predict_proba(texts)
+    if hasattr(raw_probs, "cpu"):
+        probs = raw_probs.cpu().numpy()
+    else:
+        probs = np.asarray(raw_probs)
+        
+    pred_idx = probs.argmax(axis=1)
+    confs = probs.max(axis=1).tolist()
+    preds = [str(model.labels[i]) for i in pred_idx]
+    return preds, confs

@@ -71,5 +71,38 @@ VALUES
   'Addiction,Addicted,Alcohol,Drugs,Alcoholism,online games,mobile phones,Gambling,sharab,daru,nasha,ganja,drunk father,mobile addiction,drinking problem,alcohol addiction,use mobile,online gaming,using mobile,children mobile phones,father drinks,husband alcohol,drunk parent,neglect due to alcohol,drug use in community,gutka,tobacco addiction,mobile gaming addiction,smartphone overuse,screen time excessive,children watch videos all day,internet addiction,children distracted by phone,online gaming harm,alcoholic parent neglect,drunkard father,marijuana',
   'Gambling addiction in children|Children''s education is affected by alcohol|Drug addiction is a significant challenge that is affecting the education of children in the community|The father is an alcoholic, so the daughter is being forced to study|Alcohol addiction in a household member is a problem|Children use mobile phones more often|Children are increasingly playing online games using mobile phones|Alcohol addiction in a household member is a problem.|Children are increasingly using mobile phones to play online games.|Alcohol addiction among members of the household is a problem.|About alcohol addiction in a household member|There is an issue of alcohol addiction among members of the household.|About children using mobile phones more often|Improving education of children affected by drug addiction|Children are spending more time playing online games using mobile phones, which is affecting their education.|A parent said that nowadays mobile phones have become a part of sending children to school, so children are not studying.|Children use mobile phones too much and do not concentrate on studies.|Nowadays children spend most of their time on mobile phones.|About the alcohol addiction of members of the household|Children do not go to school because they are too busy watching mobile phones|Children spend a lot of their time on mobile phones.|Children use mobile phones excessively|Household members addicted to alcohol|Drug addiction is another challenge that hinders the educational progress of children.|Increased mobile phone use among children|Alcohol addiction among household members is a challenge.|Children''s mobile phone use is increasing|Children''s education affected due to drug addiction|Parents say that children get spoiled by using mobile phones, so we do not teach them because they are not interested in studying and remain busy with the mobile phones.|Some children do not attend school due to excessive use of mobile phones.',
   'approved'
+),
+(
+  '550e8400-e29b-41d4-a716-446655440010'::UUID,
+  'Disability Barriers',
+  'This theme includes responses where children''s education is affected by disability-related challenges. It covers issues such as physical disabilities, visual impairment, special needs, and other physical needs conditions that make it difficult for children to attend or participate in education regularly.',
+  'disabled,Disability,handicapped,blind,etc.',
+  'Due to disability children face difficulties in accessing education|Savita Kumari has poor eyesight which is why she is unable to study|He cannot go to school because he is blind',
+  'approved'
+),
+(
+  '550e8400-e29b-41d4-a716-446655440011'::UUID,
+  'Health and Nutrition Barriers',
+  'This theme includes responses where children''s education is affected by health conditions challenges. It covers issues such as illness, mental health concerns, and other health conditions that make it difficult for children to attend or participate in education regularly.',
+  'Ill - Health,illness,mental health,poor health,Ill etc.',
+  'The girl is unable to go to school due to ill health|Some children are also deprived of education due to mental illness',
+  'approved'
+),
+(
+  '550e8400-e29b-41d4-a716-446655440012'::UUID,
+  'Information Barriers',
+  'This theme includes responses where children''s education is affected by limited awareness or understanding among parents and communities. It covers issues such as parental illiteracy, lack of awareness about the importance of education, limited knowledge of government education schemes, and community-level unawareness about education.',
+  'Lack of Parent awareness,Community awareness gap,Parental Illiteracy & Neglect,importance of education',
+  'Village people do not understand the importance of education|Children in rural areas often drop out of school after Class 5 due to lack of awareness about government facilities for girls education|Parents do not pay attention to education',
+  'approved'
+),
+(
+  '550e8400-e29b-41d4-a716-446655440013'::UUID,
+  'Aspiration Barriers',
+  'This theme includes responses where children''s education is affected by low motivation, lack of interest, or challenges in learning. It covers issues such as student disinterest, distractions, and exam failure that may reduce motivation and contribute to dropout.',
+  'Lack of interest,no interest,failed in exam,old age,go out and play,bad company',
+  'Lack of interest among children in education is another challenge that needs to be addressed|Dropping out of school due to old age|While going to school the child goes out and starts playing and studies less in the school|She is no longer studying because she failed in matriculation three times',
+  'approved'
 )
 ON CONFLICT (name) DO NOTHING;
+

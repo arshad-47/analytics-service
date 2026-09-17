@@ -20,7 +20,7 @@ from app.temporal.pii_and_abusive_activity import pii_and_abusive_language_detec
 from app.temporal.thematic_activity import thematic_classification_activity
 from app.temporal.environment_activity import environment_detection_activity
 from app.temporal.story_rating_activity import story_rating_activity
-
+from app.temporal.statement_category_activity import statement_category_activity
 logger = logging.getLogger("analytics_service.temporal.worker")
 
 async def start_worker():
@@ -75,6 +75,7 @@ async def start_worker():
         thematic_classification_activity,
         deface_blur_activity,
         story_rating_activity,
+        statement_category_activity,
         update_status_activity,
         fetch_pending_submissions_activity,
     ]

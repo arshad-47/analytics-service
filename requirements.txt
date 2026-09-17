@@ -13,7 +13,7 @@ json5>=0.14.0
 streamlit>=1.35.0
 pandas>=2.0.0
 plotly>=5.15.0
-sentence-transformers==3.0.1
+sentence-transformers>=3.1.0
 tritopic
 spacy>=3.5.0,<3.8.0
 spacy-huggingface-pipelines>=0.0.4
@@ -24,6 +24,7 @@ langdetect
 numpy>=1.24.0
 google-cloud-storage
 pypdf>=4.0.0
+setfit
 
 
 # spacy<3.8.0

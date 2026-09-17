@@ -99,6 +99,16 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = Field(default=2048)
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
 
+    # SetFit Statement Categorization
+    SETFIT_MODEL_ID: str = Field(default="")
+    SETFIT_MODEL_VERSION: str = Field(default="")
+    SETFIT_CONFIDENCE_THRESHOLD: Dict[str, float] = Field(default={"challenge": 0.0, "solution or action": 0.0, "other": 0.0})
+
+    # SetFit Thematic Classification model
+    SETFIT_THEME_MODEL_ID: str = Field(default="")
+    SETFIT_THEME_MODEL_VERSION: str = Field(default="")
+    SETFIT_THEME_CONFIDENCE_THRESHOLD: Dict[str, float] = Field(default_factory=dict)
+
     # Story Rating Configuration
     MAX_PDF_TEXT_CHARS: int = Field(default=40000)
 
@@ -304,6 +314,40 @@ class Settings(BaseSettings):
                 )
 
         return v
+
+    @field_validator("SETFIT_THEME_CONFIDENCE_THRESHOLD", mode="before")
+    @classmethod
+    def validate_setfit_theme_threshold(cls, v: Any) -> Dict[str, float]:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return {}
+            try:
+                v = json.loads(v)
+            except (json.JSONDecodeError, TypeError) as e:
+                raise ValueError(f"Invalid JSON for SETFIT_THEME_CONFIDENCE_THRESHOLD: {e}") from e
+        if isinstance(v, dict):
+            return {str(k): float(val) for k, val in v.items()}
+        if isinstance(v, (int, float)):
+            return {}
+        return v or {}
+
+    def get_setfit_theme_threshold(self, theme_name: str) -> float:
+        """
+        Returns the SetFit threshold for a specific theme name from SETFIT_THEME_CONFIDENCE_THRESHOLD.
+        Raises ValueError if theme_name is not configured in SETFIT_THEME_CONFIDENCE_THRESHOLD.
+        """
+        thresholds = self.SETFIT_THEME_CONFIDENCE_THRESHOLD
+        if isinstance(thresholds, dict) and theme_name in thresholds:
+            return float(thresholds[theme_name])
+        if isinstance(thresholds, dict):
+            normalized = {k.strip().lower(): v for k, v in thresholds.items()}
+            theme_norm = theme_name.strip().lower()
+            if theme_norm in normalized:
+                return float(normalized[theme_norm])
+        raise ValueError(
+            f"SetFit threshold for theme '{theme_name}' is not configured in SETFIT_THEME_CONFIDENCE_THRESHOLD."
+        )
 
     def get_process_config(self, submission_type: str) -> List[Dict[str, Any]]:
         """
