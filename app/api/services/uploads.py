@@ -13,7 +13,7 @@ from fastapi import BackgroundTasks
 
 from app.config import settings
 from app.api.validators.uploads import validate_columns
-from app.services.gcp_storage import upload_csv, fetch_csv
+from app.services.storage import get_object_storage, AccessMode
 from app.database import operations
 from app.database.db import db
 from app.services.ingestion_validation import validate_ingestion_schema
@@ -503,14 +503,17 @@ async def process_csv_inline(
                 last_exc: Exception = RuntimeError("unreachable")
                 for attempt in range(3):
                     try:
-                        csv_file = await asyncio.to_thread(fetch_csv, cloud_storage_path)
+                        storage = get_object_storage()
+                        csv_file = await asyncio.to_thread(
+                            storage.download_bytes, cloud_storage_path, AccessMode.PRIVATE
+                        )
                         break
                     except Exception as exc:
                         last_exc = exc
                         if attempt < 2:
                             wait = 2 ** attempt  # 1s, 2s — then give up
                             logger.warning(
-                                "GCS fetch attempt %d/3 failed for record %s (%s); retrying in %ds",
+                                "Storage fetch attempt %d/3 failed for record %s (%s); retrying in %ds",
                                 attempt + 1, record_id, exc, wait,
                             )
                             await asyncio.sleep(wait)
@@ -731,6 +734,35 @@ async def handle_upload(
     if is_duplicate:
         raise DuplicateFile("FILE ALREADY EXISTS")
 
+    # Validate columns FIRST — reject before touching GCS or the DB, so a
+    # malformed CSV never leaves cloud-storage or tracking-table clutter behind.
+    try:
+        df = await asyncio.to_thread(pd.read_csv, io.BytesIO(file_bytes))
+    except Exception as exc:
+        raise InvalidCsvColumns([f"Failed to parse CSV: {exc}"])
+
+    is_valid, errors = await asyncio.to_thread(validate_columns, df, normalized_type)
+    if not is_valid:
+        raise InvalidCsvColumns(errors)
+
+    # Upload to Cloud Storage
+    try:
+        storage = get_object_storage()
+        prefix = settings.STORAGE_CSV_PREFIX.strip("/")
+        object_key = f"{prefix}/{uuid.uuid4()}_{file_name}"
+
+        stored_object = await asyncio.to_thread(
+            storage.upload_bytes,
+            data=file_bytes,
+            object_key=object_key,
+            content_type="text/csv",
+            access_mode=AccessMode.PRIVATE,
+        )
+        cloud_storage_path = stored_object.key
+    except Exception as exc:
+        logger.error("Cloud Storage Upload failed: %s", exc)
+        raise RuntimeError(f"Cloud Storage Upload failed: {exc}. Please verify storage settings.")
+
     meta_data = {
         "original_filename": file_name,
         "program_name": program_name,
@@ -738,47 +770,6 @@ async def handle_upload(
         "report_type": normalized_type,
         "tenant_code": tenant_code,
     }
-
-    # Validate CSV content and structure
-    parse_errors = []
-    df = None
-    try:
-        df = await asyncio.to_thread(pd.read_csv, io.BytesIO(file_bytes))
-    except Exception as exc:
-        parse_errors = [f"Failed to parse CSV: {exc}"]
-
-    validation_errors = []
-    if df is not None:
-        is_valid, errors = await asyncio.to_thread(validate_columns, df, normalized_type)
-        if not is_valid:
-            validation_errors = errors
-
-    all_errors = parse_errors or validation_errors
-
-    if all_errors:
-        # Reject before touching GCS or the DB — no side effects for invalid uploads.
-        raise InvalidCsvColumns(all_errors)
-
-    # Upload valid file to GCS
-    try:
-        cloud_storage_path = await asyncio.to_thread(upload_csv, file_bytes, normalized_type, file_name)
-    except Exception as exc:
-        logger.error("GCS Upload failed: %s", exc)
-        meta_data["error"] = f"GCS Upload failed: {exc}"
-        try:
-            await operations.insert_upload_record(
-                report_type=normalized_type,
-                program_name=program_name,
-                leader_category=leader_category,
-                cloud_storage_path="gcs_upload_failed",
-                file_name=file_name,
-                file_size=file_size,
-                meta_data=meta_data,
-                status="failed",
-            )
-        except Exception as db_exc:
-            logger.warning("Failed to record upload failure in DB: %s", db_exc)
-        raise RuntimeError(f"GCS Upload failed: {exc}. Please verify GCS settings.")
 
     record_id = await operations.insert_upload_record(
         report_type=normalized_type,

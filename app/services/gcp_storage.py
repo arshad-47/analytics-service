@@ -1,3 +1,11 @@
+import warnings
+warnings.warn(
+    "app.services.gcp_storage is deprecated. "
+    "Use app.services.storage instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import json
 import logging
 import uuid

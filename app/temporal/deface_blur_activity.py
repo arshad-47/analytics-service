@@ -13,7 +13,8 @@ from app.config import settings
 from app.database.db import db
 from app.database.operations import get_submission_type_and_payload
 from app.services.image_blur import anonymize_face
-from app.services.gcp_storage import upload_to_gcp
+from app.services.storage import get_object_storage, AccessMode
+from app.services.storage.base import resolve_url
 
 logger = logging.getLogger("analytics_service.temporal.activities")
 
@@ -149,16 +150,28 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
                 scale=deface_scale,
             )
 
-        # 3. Upload to GCP Storage
+        # 3. Upload to Cloud Storage
         if "story" in sub_type:
-            blob_prefix = settings.STORY_BLOB or "story_blurred_image"
+            blob_prefix = settings.STORAGE_STORY_PREFIX or "story_blurred_image"
         else:
-            blob_prefix = settings.DISCUSSION_BLOB or "dicussion_blurred_image"
+            blob_prefix = settings.STORAGE_DISCUSSION_PREFIX or "discussion_blurred_image"
 
         blob_name = f"{blob_prefix}/{actual_name}"
-        public_url = await _run_in_image_executor(upload_to_gcp, str(output_path), blob_name)
+        
+        storage = get_object_storage()
+        stored_object = await _run_in_image_executor(
+            storage.upload_file,
+            local_file_path=str(output_path),
+            object_key=blob_name,
+            content_type="image/jpeg",
+            access_mode=AccessMode.PUBLIC,
+        )
 
-        return {"relative_url": parsed_path, "public_url": public_url}
+        # Resolve to a plain URL string — the DB column (blur_image_urls) is
+        # text[], so we must store a string, not a StoredObject/dict.
+        public_url_str = resolve_url(stored_object, storage)
+
+        return {"relative_url": parsed_path, "public_url": public_url_str}
 
     except Exception as e:
         logger.error(f"Failed face blurring for {resolved_url}: {e}")
