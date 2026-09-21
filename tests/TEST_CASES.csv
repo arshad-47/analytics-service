@@ -247,7 +247,7 @@ UPLOAD-001,CSV Upload & Process API,Missing Authorization header rejected on upl
 -> expect 403 (FastAPI's HTTPBearer default response for a missing Authorization header)"
 UPLOAD-002,CSV Upload & Process API,Invalid Bearer token rejected on upload,Security,Critical,Web API running,POST /v1/upload/ with Authorization: Bearer <wrong-token>,401 Unauthorized: Invalid token (secrets.compare_digest check in app/api/deps.py fails),Verified,"curl -s -X POST http://localhost:8000/v1/upload/ -H ""Authorization: Bearer wrong-token"" -w ""\n%{http_code}\n""
 -> expect {""detail"":""Unauthorized: Invalid token""} and HTTP 401"
-UPLOAD-003,CSV Upload & Process API,Valid story CSV uploads successfully,Positive,Critical,Web API running; GCS credentials configured; a valid AUTH_TOKEN,"POST /v1/upload/ with report_type=story, valid program_name/leader_category/tenant_code, and a CSV matching STORY_CSV_COLUMN headers exactly",200 {status: pending}; a csv_uploads row is created (status=pending); the raw CSV is uploaded to gs://<BUCKET_NAME>/<CSV_BLOB_UPLOADS>/<uuid>_<filename>,Verified,"1) AUTH_TOKEN=$(grep ""^AUTH_TOKEN="" .env | cut -d= -f2)
+UPLOAD-003,CSV Upload & Process API,Valid story CSV uploads successfully,Positive,Critical,Web API running; GCS credentials configured; a valid AUTH_TOKEN,"POST /v1/upload/ with report_type=story, valid program_name/leader_category/tenant_code, and a CSV matching STORY_CSV_COLUMN headers exactly",200 {status: pending}; a csv_uploads row is created (status=pending); the raw CSV is uploaded to gs://<BUCKET_NAME>/<CSV_BLOB_UPLOADS>/<uuid>_<filename>,Failing,"1) AUTH_TOKEN=$(grep ""^AUTH_TOKEN="" .env | cut -d= -f2)
 curl -s -X POST http://localhost:8000/v1/upload/ -H ""Authorization: Bearer $AUTH_TOKEN"" -F ""report_type=story"" -F ""program_name=P"" -F ""leader_category=L"" -F ""tenant_code=mitra"" -F ""file=@tests/csv_uploads/valid_story.csv;type=text/csv"" -w ""\n%{http_code}\n""
 2) DB: SELECT id, status, cloud_storage_path FROM csv_uploads ORDER BY id DESC LIMIT 1;  -> status='pending', cloud_storage_path populated
 3) Confirm the object exists in GCS at that cloud_storage_path"
@@ -286,7 +286,7 @@ UPLOAD-015,CSV Upload & Process API,"batch mode leaves a valid upload pending, n
 2) Upload tests/csv_uploads/valid_story.csv
 3) DB: SELECT status FROM csv_uploads WHERE id=<id>;  -> remains 'pending' (does not change on its own)
 4) Temporal UI: confirm no 'csv-upload-<id>' workflow was started"
-UPLOAD-016,CSV Upload & Process API,GCS upload failure prevents any csv_uploads row from being created,Edge,Medium,GCS temporarily unreachable/misconfigured (e.g. invalid BUCKET_NAME),Upload a column-valid CSV while GCS is unreachable,"500/RuntimeError 'GCS Upload failed...'; NO csv_uploads row is created, since the DB insert only happens after a successful GCS upload",Verified,"1) Temporarily set BUCKET_NAME to a nonexistent bucket in a test .env, restart web
+UPLOAD-016,CSV Upload & Process API,GCS upload failure prevents any csv_uploads row from being created,Edge,Medium,GCS temporarily unreachable/misconfigured (e.g. invalid BUCKET_NAME),Upload a column-valid CSV while GCS is unreachable,"500/RuntimeError 'GCS Upload failed...'; NO csv_uploads row is created, since the DB insert only happens after a successful GCS upload",Failing,"1) Temporarily set BUCKET_NAME to a nonexistent bucket in a test .env, restart web
 2) Upload tests/csv_uploads/valid_story.csv
 3) Expect a 500 error mentioning 'GCS Upload failed'
 4) DB: SELECT count(*) FROM csv_uploads;  -> unchanged from before the request

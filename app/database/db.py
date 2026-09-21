@@ -82,8 +82,16 @@ class Database:
                         )
 
                 schema_sql = SCHEMA_FILE.read_text(encoding="utf-8")
+                # Only inject IF NOT EXISTS on bare CREATE TABLE/INDEX statements;
+                # schema.sql already has IF NOT EXISTS on some indexes — a blind
+                # replace would produce "CREATE INDEX IF NOT EXISTS IF NOT EXISTS"
+                # which is invalid SQL and causes a syntax error at "NOT".
+                schema_sql = schema_sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
                 schema_sql = schema_sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+                schema_sql = schema_sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
+                schema_sql = schema_sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
                 schema_sql = schema_sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
+                schema_sql = schema_sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
                 await conn.execute(schema_sql)
 
                 # Always run the seed script to keep prompts in sync with seed_prompts.sql

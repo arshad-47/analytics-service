@@ -633,7 +633,7 @@ async def thematic_classification_activity(params: Dict[str, Any]) -> Dict[str, 
                 ON ds.submission_id = sub.submission_id AND ds.tenant_code = sub.tenant_code
             WHERE sub.submission_id = $1 AND sub.tenant_code = $2
             """,
-            submission_id, tenant_code, analysis_type
+            submission_id, tenant_code
         )
         abusive_masked_at: List[str] = (
             list(abusive_masked_at_row["abusive_masked_at"] or [])

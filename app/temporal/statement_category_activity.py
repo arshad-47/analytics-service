@@ -83,7 +83,7 @@ async def statement_category_activity(params: Dict[str, Any]) -> Dict[str, Any]:
     llm_model = params.get("llm_model")
     max_tokens = params.get("max_tokens")
     llm_timeout_seconds = params.get("llm_timeout_seconds")
-    analysis_type = params.get("analysis_type")
+    analysis_type = params.get("analysis_type", "statement_category")
     thresholds = settings.SETFIT_CONFIDENCE_THRESHOLD
 
     logger.info(
@@ -257,8 +257,7 @@ async def statement_category_activity(params: Dict[str, Any]) -> Dict[str, Any]:
                     parent_statement_id=r["statement_id"],
                     submission_id=submission_id,
                     tenant_code=tenant_code,
-                analysis_type,
-            )
+                )
                 for child in children:
                     await insert_analysis_result(
                         conn,

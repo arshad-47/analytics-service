@@ -13,4 +13,6 @@ torch
 numpy>=1.24.0
 pandas>=2.0.0
 google-cloud-storage
+azure-storage-blob>=12.19.0
+oci>=2.115.0
 pypdf>=4.0.0

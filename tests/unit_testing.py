@@ -2449,6 +2449,37 @@ def test_storage_011_gcp_exception_mapping(monkeypatch):
         pass
 
 
+def test_storage_017_azure_upload_routing(monkeypatch):
+    from app.services.storage.azure import AzureStorage
+    monkeypatch.setattr("app.services.storage.azure.BlobServiceClient", MagicMock())
+    storage = AzureStorage(public_bucket="pub-c", private_bucket="priv-c", account_name="test")
+    mock_blob_client = MagicMock()
+    storage.blob_service_client.get_blob_client.return_value = mock_blob_client
+
+    obj_pub = storage.upload_bytes(b"data", "key.jpg", access_mode=AccessMode.PUBLIC)
+    storage.blob_service_client.get_blob_client.assert_called_with(container="pub-c", blob="key.jpg")
+    assert obj_pub.bucket == "pub-c"
+    
+    obj_priv = storage.upload_bytes(b"data", "key.csv", access_mode=AccessMode.PRIVATE)
+    storage.blob_service_client.get_blob_client.assert_called_with(container="priv-c", blob="key.csv")
+    assert obj_priv.bucket == "priv-c"
+
+
+def test_storage_018_oci_upload_routing(monkeypatch):
+    from app.services.storage.oci import OciStorage
+    monkeypatch.setattr("oci.config.from_file", MagicMock(return_value={}))
+    monkeypatch.setattr("oci.object_storage.ObjectStorageClient", MagicMock())
+    storage = OciStorage(public_bucket="pub-b", private_bucket="priv-b", namespace="ns")
+    
+    obj_pub = storage.upload_bytes(b"data", "key.jpg", access_mode=AccessMode.PUBLIC)
+    storage.client.put_object.assert_any_call("ns", "pub-b", "key.jpg", b"data", content_type="application/octet-stream")
+    assert obj_pub.bucket == "pub-b"
+
+    obj_priv = storage.upload_bytes(b"data", "key.csv", access_mode=AccessMode.PRIVATE)
+    storage.client.put_object.assert_any_call("ns", "priv-b", "key.csv", b"data", content_type="application/octet-stream")
+    assert obj_priv.bucket == "priv-b"
+
+
 def test_storage_012_resolve_url_public():
     storage = MagicMock()
     obj = StoredObject(provider="aws", bucket="pub-b", key="k", access_mode=AccessMode.PUBLIC)

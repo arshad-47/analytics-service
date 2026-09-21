@@ -2,6 +2,8 @@ from app.config import settings
 from .base import ObjectStorage
 from .gcp import GcpStorage
 from .aws_s3 import AwsS3Storage
+from .azure import AzureStorage
+from .oci import OciStorage
 
 def validate_storage_config(provider: str, settings_obj) -> None:
     # Both buckets must always be configured — the code routes objects to the
@@ -45,5 +47,23 @@ def get_object_storage() -> ObjectStorage:
             max_retries     = settings.STORAGE_MAX_RETRIES,
         )
 
-    # OCI, Azure, S3-compatible can be wired in here following the same pattern.
+    if provider == "azure":
+        return AzureStorage(
+            public_bucket     = settings.STORAGE_PUBLIC_BUCKET,
+            private_bucket    = settings.STORAGE_PRIVATE_BUCKET,
+            connection_string = settings.AZURE_STORAGE_CONNECTION_STRING,
+            account_name      = settings.AZURE_STORAGE_ACCOUNT_NAME,
+        )
+
+    if provider == "oci":
+        return OciStorage(
+            public_bucket  = settings.STORAGE_PUBLIC_BUCKET,
+            private_bucket = settings.STORAGE_PRIVATE_BUCKET,
+            namespace      = settings.OCI_NAMESPACE,
+            config_file    = settings.OCI_CONFIG_FILE,
+            profile        = settings.OCI_CONFIG_PROFILE,
+            region         = settings.OCI_REGION,
+        )
+
+    # S3-compatible can be wired in here following the same pattern.
     raise ValueError(f"Unsupported storage provider: {provider}")
