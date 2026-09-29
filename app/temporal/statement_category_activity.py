@@ -263,6 +263,12 @@ async def statement_category_activity(params: Dict[str, Any]) -> Dict[str, Any]:
     model_only_count = sum(1 for r in results if not r["llm_pred"])
     llm_fallback_count = sum(1 for r in results if r["llm_pred"])
 
+    async with db.pool.acquire() as conn:
+        intra_submission_copies = await copy_parent_analysis_results(conn, submission_id, tenant_code, analysis_type)
+        if intra_submission_copies > 0:
+            logger.info("Copied %d intra-submission parent analysis_results", intra_submission_copies)
+            child_copies += intra_submission_copies
+
     logger.info(
         "Statement categorization complete for submission=%s: %d root classified, %d model-only, %d LLM-fallback, %d child copies",
         submission_id, len(results), model_only_count, llm_fallback_count, child_copies,

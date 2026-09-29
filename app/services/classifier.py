@@ -143,3 +143,115 @@ def predict_setfit_batch(model, texts: List[str]) -> Tuple[List[str], List[float
     confs = probs.max(axis=1).tolist()
     preds = [str(model.labels[i]) for i in pred_idx]
     return preds, confs
+
+
+# Shared HuggingFace Sequence Classification Model Loader & Batch Predictor
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import json
+import os
+
+_hf_models_cache: Dict[Tuple[str, str], Any] = {}
+_hf_models_lock = threading.Lock()
+
+
+def load_hf_sequence_classification_model(model_id: str, revision: str = "main"):
+    cache_key = (model_id, revision)
+    if cache_key not in _hf_models_cache:
+        with _hf_models_lock:
+            if cache_key not in _hf_models_cache:
+                logger.info(f"Loading HF Multi-Theme model '{model_id}' (revision={revision})...")
+                snapshot_path = snapshot_download(repo_id=model_id, revision=revision)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                tokenizer = AutoTokenizer.from_pretrained(snapshot_path)
+                model = AutoModelForSequenceClassification.from_pretrained(snapshot_path)
+                model.to(device)
+                model.eval()
+                
+                # Try to load label_config.json if available
+                class_names = []
+                label_cfg_path = os.path.join(snapshot_path, "label_config.json")
+                if os.path.exists(label_cfg_path):
+                    with open(label_cfg_path, "r") as f:
+                        cfg = json.load(f)
+                        class_names = cfg.get("labels", [])
+                
+                if not class_names:
+                    class_names = [
+                        model.config.id2label[i] if i in model.config.id2label else model.config.id2label[str(i)]
+                        for i in range(model.config.num_labels)
+                    ]
+                if len(class_names) != model.config.num_labels:
+                    raise ValueError(f"Label count mismatch: {len(class_names)} class names for {model.config.num_labels} model labels.")
+                    
+                _hf_models_cache[cache_key] = {
+                    "tokenizer": tokenizer,
+                    "model": model,
+                    "device": device,
+                    "class_names": class_names
+                }
+                logger.info(f"HF Multi-Theme model '{model_id}' loaded successfully.")
+    return _hf_models_cache[cache_key]
+
+
+def predict_hf_multi_theme_batch(
+    tokenizer,
+    model,
+    device,
+    class_names,
+    texts: List[str]
+) -> Tuple[List[List[str]], List[List[float]]]:
+    """
+    Predicts multiple themes per text based on TOP_K and MIN_CONFIDENCE from settings.
+    """
+    top_k = settings.HF_THEME_TOP_K
+    min_confidence = settings.HF_THEME_MIN_CONFIDENCE
+    
+    # Fill empty strings to avoid model crashes
+    safe_texts = [str(t) if t else "" for t in texts]
+    
+    with torch.no_grad():
+        inputs = tokenizer(
+            safe_texts, 
+            padding=True, 
+            truncation=True, 
+            max_length=128, 
+            return_tensors="pt"
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        outputs = model(**inputs)
+        # Apply sigmoid to convert raw logits to probabilities (0.0 to 1.0)
+        probabilities = torch.sigmoid(outputs.logits).cpu().numpy()
+        
+    batch_multi_themes = []
+    batch_multi_confs = []
+    
+    for probs in probabilities:
+        top_indexes = np.argsort(probs)[-top_k:][::-1]
+        themes = []
+        confs = []
+        
+        for i, idx in enumerate(top_indexes):
+            theme = class_names[idx]
+            conf = float(probs[idx])
+            
+            if conf < min_confidence:
+                break
+                
+            themes.append(theme)
+            confs.append(conf)
+            
+        # 4. Mutually Exclusive Filter for 'Unknown/Unclear'
+        if len(themes) > 1 and "Unknown/Unclear" in themes:
+            unclear_idx = themes.index("Unknown/Unclear")
+            if unclear_idx == 0:
+                themes = [themes[0]]
+                confs = [confs[0]]
+            else:
+                themes.pop(unclear_idx)
+                confs.pop(unclear_idx)
+                
+        batch_multi_themes.append(themes)
+        batch_multi_confs.append(confs)
+        
+    return batch_multi_themes, batch_multi_confs
+

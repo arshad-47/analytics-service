@@ -8,7 +8,7 @@ import asyncio
 import concurrent.futures
 import functools
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 from temporalio import activity
 
 from app.config import settings
@@ -94,6 +94,71 @@ def _download_file(url: str, filename: str) -> Path:
     return local_path
 
 
+def _compute_dynamic_scale(image_path: Path, cap: Optional[str]) -> Optional[str]:
+    """
+    Returns the --scale argument for deface, computed per-image based on its
+    actual pixel dimensions, or None to run at native resolution.
+
+    DEFACE_SCALE acts as a ceiling on the image's LONG EDGE, not a literal
+    WxH constraint. This makes it orientation-agnostic — portrait and landscape
+    photos with the same pixel budget are treated identically:
+
+      DEFACE_SCALE=1920x1080  →  long-edge cap = max(1920, 1080) = 1920
+
+      640×480   → long edge  480 ≤ 1920 → native res  ✅
+      1080×1912 → long edge 1912 ≤ 1920 → native res  ✅  (portrait phone photo)
+      1920×1080 → long edge 1920 ≤ 1920 → native res  ✅
+      4000×3000 → long edge 4000 > 1920 → 1920×1440   (proportional downscale)
+      6000×4000 → long edge 6000 > 1920 → 1920×1280   (proportional downscale)
+
+    This eliminates the fixed-scale problem where a 640x480 thumbnail and a
+    4000x3000 phone photo both got forced to the same detection resolution,
+    making faces in the thumbnail too tiny to detect.
+    """
+    if not cap:
+        # No cap configured — always run at native resolution
+        return None
+
+    # Parse the WxH cap string (e.g. "1920x1080") and derive the long-edge limit.
+    # max() makes this orientation-agnostic: portrait images whose height exceeds
+    # the smaller cap dimension are not penalised unnecessarily.
+    try:
+        cap_long_edge = max(int(v) for v in cap.lower().split("x"))
+    except (ValueError, AttributeError):
+        logger.warning(f"Invalid DEFACE_SCALE value {cap!r} — falling back to native resolution")
+        return None
+
+    # Read actual image dimensions — PIL is a deface dependency so always available
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            img_w, img_h = img.size
+    except Exception as exc:
+        logger.warning(f"Could not read dimensions of {image_path.name} ({exc}) — using native resolution")
+        return None
+
+    img_long_edge = max(img_w, img_h)
+
+    # Long edge already within cap → native resolution, no downscaling needed
+    if img_long_edge <= cap_long_edge:
+        logger.debug(
+            f"{image_path.name} is {img_w}x{img_h} (long edge {img_long_edge}px) — "
+            f"within {cap_long_edge}px cap, running detection at native resolution"
+        )
+        return None
+
+    # Proportionally downscale so the long edge meets the cap exactly
+    scale_factor = cap_long_edge / img_long_edge
+    target_w = max(1, int(img_w * scale_factor))
+    target_h = max(1, int(img_h * scale_factor))
+    dynamic_scale = f"{target_w}x{target_h}"
+    logger.info(
+        f"{image_path.name} is {img_w}x{img_h} (long edge {img_long_edge}px) — "
+        f"downscaling detection to {dynamic_scale} (cap {cap_long_edge}px, factor {scale_factor:.2f})"
+    )
+    return dynamic_scale
+
+
 async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str, i: int, url: Any) -> Dict[str, Any]:
     """
     Downloads, blurs, and uploads a single image. Runs concurrently with the
@@ -149,18 +214,22 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
 
         # 2. Deface/Blur image — gated globally (see BLUR_CONCURRENCY_LIMIT setting),
         # unlike the download/upload legs, since this is the memory-heavy step.
-        # DEFACE_SCALE downscales the detection input (blur is still applied to the
-        # full-res image) — this is what actually cuts per-call CPU/memory cost;
-        # the semaphore above only limits how many of these run at once, not how
-        # expensive each individual call is.
+        # Dynamic scale: DEFACE_SCALE is a *ceiling*, not a fixed override. Images
+        # smaller than the cap run at native resolution (better accuracy); images
+        # larger than the cap are proportionally downscaled to fit within it (saves
+        # CPU). This prevents both over-downscaling small images (which makes faces
+        # too tiny to detect) and under-downscaling huge phone photos (which wastes
+        # CPU on pixels the model can't use anyway).
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-        deface_scale = getattr(settings, "DEFACE_SCALE", None) or "640x360"
+        deface_scale = _compute_dynamic_scale(local_path, settings.DEFACE_SCALE or None)
+        deface_threshold = settings.DEFACE_THRESHOLD if settings.DEFACE_THRESHOLD is not None else 0.2
         async with _get_blur_semaphore():
             await _run_in_image_executor(
                 anonymize_face,
                 input_path=str(local_path),
                 output_path=str(output_path),
                 scale=deface_scale,
+                threshold=deface_threshold,
             )
 
         # 3. Upload to Object Storage

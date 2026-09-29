@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import Dict, Any, List
 from pydantic import Field, field_validator, model_validator
@@ -109,7 +110,15 @@ class Settings(BaseSettings):
     # SetFit Thematic Classification model
     SETFIT_THEME_MODEL_ID: str = Field(default="")
     SETFIT_THEME_MODEL_VERSION: str = Field(default="")
+    HF_THEME_MODEL_ID: str = Field(default="")
+    HF_THEME_MODEL_VERSION: str = Field(default="")
     SETFIT_THEME_CONFIDENCE_THRESHOLD: Dict[str, float] = Field(default_factory=dict)
+    HF_THEME_TOP_K: int = Field(default=3)
+    HF_THEME_MIN_CONFIDENCE: float = Field(default=0.15)
+    
+    HF_CHALLENGE_MULTI_THEME_CONFIDENCE_THRESHOLD: Dict[str, float] = Field(default_factory=dict)
+    HF_CHALLENGE_SINGLE_THEME_CONFIDENCE_THRESHOLD: Dict[str, float] = Field(default_factory=dict)
+    HF_SOLUTION_SINGLE_THEME_CONFIDENCE_THRESHOLD: Dict[str, float] = Field(default_factory=dict)
 
     # Story Rating Configuration
     MAX_PDF_TEXT_CHARS: int = Field(default=40000)
@@ -174,9 +183,12 @@ class Settings(BaseSettings):
     DISCUSSION_BLOB: str = Field(default="")
     MEDIA_BASE_URL: str = Field(default="")
     # Image Blur CPU Throttling
-    # Downscale resolution for face-detection neural network (WxH).
-    # Only affects detection speed — blur is applied to the original full-res image.
-    DEFACE_SCALE: str = Field(default="640x360")
+    # images larger than this cap are proportionally downscaled to fit within it
+    # (saves CPU/RAM on high-res phone photos). Leave empty to always run at
+    # native resolution regardless of image size (safest, most accurate).
+    DEFACE_SCALE: str = Field(default="1280x720")
+    # Face detection confidence threshold (0.0 - 1.0). Lower threshold detects smaller/group faces.
+    DEFACE_THRESHOLD: float = Field(default=0.2)
 
     # AWS S3 Configuration
     AWS_ACCESS_KEY_ID: str = Field(default="")
@@ -234,6 +246,43 @@ class Settings(BaseSettings):
         except (json.JSONDecodeError, TypeError) as e:
             raise ValueError(f"Invalid JSON configuration for {info.field_name}: {e}") from e
         return v
+
+    @field_validator("DEFACE_SCALE")
+    @classmethod
+    def validate_deface_scale(cls, v: str) -> str:
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError(f"DEFACE_SCALE must be a string, got {type(v).__name__}.")
+        s = v.strip()
+        if not s:
+            return v
+        parts = s.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError(
+                f"DEFACE_SCALE must be empty or in 'WIDTHxHEIGHT' format, got {v!r}."
+            )
+        for part in parts:
+            try:
+                val = int(part.strip())
+                if val <= 0:
+                    raise ValueError
+            except ValueError:
+                raise ValueError(
+                    f"DEFACE_SCALE dimensions must be positive integers, got {v!r}."
+                ) from None
+        return v
+
+    @field_validator("DEFACE_THRESHOLD")
+    @classmethod
+    def validate_deface_threshold(cls, v: float) -> float:
+        if v is None or not math.isfinite(v):
+            raise ValueError(f"DEFACE_THRESHOLD must be a finite float, got {v!r}.")
+        if not (0.0 <= float(v) < 1.0):
+            raise ValueError(
+                f"DEFACE_THRESHOLD must be between 0 (inclusive) and 1 (exclusive), got {v!r}."
+            )
+        return float(v)
 
     @field_validator("LOG_DIR")
     @classmethod
@@ -357,6 +406,50 @@ class Settings(BaseSettings):
         raise ValueError(
             f"SetFit threshold for theme '{theme_name}' is not configured in SETFIT_THEME_CONFIDENCE_THRESHOLD."
         )
+
+    @field_validator(
+        "HF_CHALLENGE_MULTI_THEME_CONFIDENCE_THRESHOLD",
+        "HF_CHALLENGE_SINGLE_THEME_CONFIDENCE_THRESHOLD",
+        "HF_SOLUTION_SINGLE_THEME_CONFIDENCE_THRESHOLD",
+        mode="before"
+    )
+    @classmethod
+    def validate_hf_theme_threshold(cls, v: Any) -> Dict[str, float]:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return {}
+            try:
+                v = json.loads(v)
+            except (json.JSONDecodeError, TypeError) as e:
+                raise ValueError(f"Invalid JSON for HF_THEME_CONFIDENCE_THRESHOLD: {e}") from e
+        if isinstance(v, dict):
+            return {str(k): float(val) for k, val in v.items()}
+        if isinstance(v, (int, float)):
+            return {}
+        return v or {}
+
+    def _get_mapped_threshold(self, config_dict: Dict[str, float], theme_name: str, config_name: str) -> float:
+        """Helper method to extract threshold from a specific dictionary."""
+        if isinstance(config_dict, dict) and theme_name in config_dict:
+            return float(config_dict[theme_name])
+        if isinstance(config_dict, dict):
+            normalized = {k.strip().lower(): v for k, v in config_dict.items()}
+            theme_norm = theme_name.strip().lower()
+            if theme_norm in normalized:
+                return float(normalized[theme_norm])
+        raise ValueError(
+            f"HF threshold for theme '{theme_name}' is not configured in {config_name}."
+        )
+
+    def get_hf_challenge_multi_theme_threshold(self, theme_name: str) -> float:
+        return self._get_mapped_threshold(self.HF_CHALLENGE_MULTI_THEME_CONFIDENCE_THRESHOLD, theme_name, "HF_CHALLENGE_MULTI_THEME_CONFIDENCE_THRESHOLD")
+
+    def get_hf_challenge_single_theme_threshold(self, theme_name: str) -> float:
+        return self._get_mapped_threshold(self.HF_CHALLENGE_SINGLE_THEME_CONFIDENCE_THRESHOLD, theme_name, "HF_CHALLENGE_SINGLE_THEME_CONFIDENCE_THRESHOLD")
+
+    def get_hf_solution_single_theme_threshold(self, theme_name: str) -> float:
+        return self._get_mapped_threshold(self.HF_SOLUTION_SINGLE_THEME_CONFIDENCE_THRESHOLD, theme_name, "HF_SOLUTION_SINGLE_THEME_CONFIDENCE_THRESHOLD")
 
     def get_process_config(self, submission_type: str) -> List[Dict[str, Any]]:
         """

@@ -2239,6 +2239,210 @@ def test_upload_032_stale_schedules_deleted_in_realtime_mode(monkeypatch):
         assert set(deleted_schedules) == {"daily-batch-processing"}
     asyncio.run(run_test())
 
+
+# =============================================================================
+# THEMATIC HF MODEL (THEME-HF-*)
+# =============================================================================
+
+import app.services.classifier as classifier_module
+import app.temporal.thematic_activity as thematic_activity_module
+from unittest.mock import patch, MagicMock
+import numpy as np
+import torch
+
+def test_hf_multi_theme_threshold_fallback():
+    # Test top-k filtering, min_confidence, mutually exclusive filter, and threshold validation
+    # Mocking HF output
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+    
+    class FakeOutputs:
+        def __init__(self, logits):
+            self.logits = logits
+            
+    # Batch of 3 texts
+    # Text 1: Top 2 above min_confidence, top passes threshold
+    # Text 2: Top prediction is Unknown/Unclear (index 0). Secondary passed min_confidence but should be dropped.
+    # Text 3: Top prediction is below threshold
+    # Logits (sigmoid applied):
+    # probs = torch.sigmoid(logits)
+    logits_vals = torch.tensor([
+        # Theme0, Theme1, Unknown/Unclear
+        [2.0, 1.0, -1.0],  # sigmoid: ~0.88, ~0.73, ~0.26
+        [1.0, -1.0, 3.0],  # sigmoid: ~0.73, ~0.26, ~0.95 (Unknown is top)
+        [-1.0, -2.0, -3.0] # sigmoid: ~0.26, ~0.11, ~0.04 (All low)
+    ])
+    
+    # We mock model outputs
+    mock_model.return_value = FakeOutputs(logits_vals)
+    mock_tokenizer.return_value = {"input_ids": torch.tensor([[1]]), "attention_mask": torch.tensor([[1]])}
+    
+    class_names = ["Theme0", "Theme1", "Unknown/Unclear"]
+    
+    # Temporarily set config
+    with settings_override(
+        HF_THEME_TOP_K=3,
+        HF_THEME_MIN_CONFIDENCE=0.5,
+        HF_THEME_CONFIDENCE_THRESHOLD='{"Theme0": 0.8, "Theme1": 0.8, "Unknown/Unclear": 0.8}'
+    ):
+        themes_batch, confs_batch = classifier_module.predict_hf_multi_theme_batch(
+            mock_tokenizer, mock_model, "cpu", class_names, ["text1", "text2", "text3"]
+        )
+        
+        # Text 1: Theme0 (0.88), Theme1 (0.73) -> both > 0.5
+        assert len(themes_batch[0]) == 2
+        assert themes_batch[0][0] == "Theme0"
+        assert themes_batch[0][1] == "Theme1"
+        
+        # Text 2: Unknown/Unclear (0.95) -> should drop Theme0 (0.73)
+        assert len(themes_batch[1]) == 1
+        assert themes_batch[1][0] == "Unknown/Unclear"
+        
+        # Text 3: All below 0.5 min_confidence, so no themes
+        assert len(themes_batch[2]) == 0
+
+
+def test_hf_class_names_alignment():
+    # Test string to integer label map
+    mock_model = MagicMock()
+    mock_model.config.num_labels = 3
+    mock_model.config.id2label = {"0": "A", "1": "B", 2: "C"}
+    
+    with patch("app.services.classifier.snapshot_download", return_value="dummy/path"):
+        with patch("app.services.classifier.AutoTokenizer.from_pretrained", return_value=MagicMock()):
+            with patch("app.services.classifier.AutoModelForSequenceClassification.from_pretrained", return_value=mock_model):
+                with patch("torch.cuda.is_available", return_value=False):
+                    with patch("os.path.exists", return_value=False):
+                        # Force cache miss
+                        classifier_module._hf_models_cache.clear()
+                        res = classifier_module.load_hf_sequence_classification_model("test-model")
+                        assert res["class_names"] == ["A", "B", "C"]
+
+
+def test_hf_word_count_gate(monkeypatch):
+    # Ensure statements < MINIMUM_THEME_WORD_COUNT bypass inference and marked Unknown/Unclear
+    async def run_test():
+        conn = FakeConn()
+        stmts = [
+            {"statement_id": "1", "raw_statement": "too short", "statement_type": "challenge", "submission_type": "discussion"}
+        ]
+        
+        with settings_override(
+            MINIMUM_THEME_WORD_COUNT=5,
+            HF_THEME_MODEL_ID="mock-model",
+            HF_THEME_MODEL_VERSION="v1"
+        ):
+            # mock load_hf_sequence_classification_model to avoid actually loading
+            mock_load = MagicMock(return_value={"tokenizer": None, "model": None, "device": "cpu", "class_names": []})
+            monkeypatch.setattr(thematic_activity_module, "load_hf_sequence_classification_model", mock_load)
+            
+            # mock predict_hf_multi_theme_batch
+            mock_predict = MagicMock()
+            monkeypatch.setattr(thematic_activity_module, "predict_hf_multi_theme_batch", mock_predict)
+            
+            await thematic_activity_module.run_thematic_analysis(
+                submission_id="sub-1",
+                tenant_code="tenant-1",
+                analysis_type="thematic_classification",
+                statements=stmts,
+                approved_themes=[]
+            )
+            
+            # Assert predict was never called because the statement was filtered
+            mock_predict.assert_not_called()
+            
+            # Check DB insertion
+            insert_call = _find_execute_call(conn, "INSERT INTO analysis_results", "category_type")
+            # The category_type parameter in insert_analysis_result is at a specific index or kwargs
+            # Since insert_analysis_result is a helper, we know it inserts category_type='Unknown/Unclear'
+            assert "Unknown/Unclear" in str(insert_call.args) or "Unknown/Unclear" in str(insert_call.kwargs)
+
+    asyncio.run(run_test())
+
+
+def test_hf_empty_model_id_fallback(monkeypatch):
+    # Ensure when HF_THEME_MODEL_ID is unset, discussion challenge statements go to SetFit (other_stmts)
+    async def run_test():
+        conn = FakeConn()
+        stmts = [
+            {"statement_id": "1", "raw_statement": "long enough discussion challenge", "statement_type": "challenge", "submission_type": "discussion"}
+        ]
+        
+        with settings_override(HF_THEME_MODEL_ID="", SETFIT_THEME_MODEL_ID="mock-setfit"):
+            mock_load_setfit = MagicMock()
+            monkeypatch.setattr(thematic_activity_module, "load_setfit_model", mock_load_setfit)
+            
+            mock_predict_setfit = MagicMock(return_value=(["mock_pred"], [0.9]))
+            monkeypatch.setattr(thematic_activity_module, "predict_setfit_batch", mock_predict_setfit)
+            
+            # Also mock word-count/garbage to avoid local fallback failure
+            monkeypatch.setattr(thematic_activity_module, "_is_garbage_or_spam", lambda x: False)
+            
+            await thematic_activity_module.run_thematic_analysis(
+                submission_id="sub-1",
+                tenant_code="tenant-1",
+                analysis_type="thematic_classification",
+                statements=stmts,
+                approved_themes=[{"id": "tid1", "theme_name": "mock_pred", "is_primary": True, "pillar_name": ""}]
+            )
+            
+            # Assert SetFit predict WAS called for the discussion challenge statement
+            mock_predict_setfit.assert_called_once()
+            
+    asyncio.run(run_test())
+
+
+def test_hf_discussion_solutions_routing(monkeypatch):
+    # Ensure discussion solutions are routed to HF and truncated to top-1 prediction
+    async def run_test():
+        conn = FakeConn()
+        stmts = [
+            # Challenge should get all 3 themes
+            {"statement_id": "challenge-1", "raw_statement": "challenge text", "statement_type": "challenge", "submission_type": "discussion"},
+            # Solution should be truncated to top-1 theme
+            {"statement_id": "solution-1", "raw_statement": "solution text", "statement_type": "solution", "submission_type": "discussion"}
+        ]
+        
+        with settings_override(HF_THEME_MODEL_ID="mock-model", HF_THEME_MODEL_VERSION="v1", MINIMUM_THEME_WORD_COUNT=0):
+            # mock load_hf_sequence_classification_model to avoid actually loading
+            mock_load = MagicMock(return_value={"tokenizer": None, "model": None, "device": "cpu", "class_names": []})
+            monkeypatch.setattr(thematic_activity_module, "load_hf_sequence_classification_model", mock_load)
+            
+            # mock predict_hf_multi_theme_batch to return 3 themes for both
+            mock_predict = MagicMock(return_value=(
+                [["T1", "T2", "T3"], ["T4", "T5", "T6"]],
+                [[0.9, 0.8, 0.7],    [0.9, 0.8, 0.7]]
+            ))
+            monkeypatch.setattr(thematic_activity_module, "predict_hf_multi_theme_batch", mock_predict)
+            
+            # Mock garbage check
+            monkeypatch.setattr(thematic_activity_module, "_is_garbage_or_spam", lambda x: False)
+            
+            # Mock threshold to always pass
+            monkeypatch.setattr(thematic_activity_module.settings, "get_hf_theme_threshold", lambda x: 0.0)
+            
+            await thematic_activity_module.run_thematic_analysis(
+                submission_id="sub-1",
+                tenant_code="tenant-1",
+                analysis_type="thematic_classification",
+                statements=stmts,
+                approved_themes=[]
+            )
+            
+            # Extract insert calls
+            inserts = [c for c in conn.execute.call_args_list if "INSERT INTO analysis_results" in c.args[0]]
+            
+            # Count insertions per statement
+            chal_inserts = [c for c in inserts if c.kwargs.get("statement_id") == "challenge-1"]
+            sol_inserts = [c for c in inserts if c.kwargs.get("statement_id") == "solution-1"]
+            
+            # Challenge gets all 3 themes
+            assert len(chal_inserts) == 3
+            # Solution is truncated to top 1 theme
+            assert len(sol_inserts) == 1
+            assert sol_inserts[0].kwargs.get("model_prediction") == "T4"
+            
+    asyncio.run(run_test())
 # STORAGE ABSTRACTION (STORAGE-*)
 from app.services.storage import StoredObject, AccessMode, StorageNotFoundError, StoragePermissionError, StorageTransientError, StorageError, resolve_url
 from app.services.storage.aws_s3 import AwsS3Storage

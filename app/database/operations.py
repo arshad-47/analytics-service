@@ -1024,6 +1024,7 @@ async def fetch_statements_for_submission(
         FROM statements s
         WHERE s.submission_id = $1
           AND s.tenant_code = $2
+          AND s.parent_id IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM analysis_results existing
               WHERE existing.statement_id = s.id
@@ -1060,7 +1061,8 @@ async def fetch_challenge_and_solution_statements_for_submission(
         SELECT
             ar.statement_id,
             s.raw_statement,
-            s.statement_type
+            s.statement_type,
+            s.submission_type
         FROM analysis_results ar
         JOIN statements s ON s.id = ar.statement_id
         WHERE ar.submission_id  = $1
