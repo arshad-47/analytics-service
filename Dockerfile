@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 # libgl1/libglib2.0-0: needed by opencv-python (pulled in transitively via `deface`).
 # confluent-kafka needs no extra apt packages — manylinux wheels cover this base image.

@@ -125,6 +125,10 @@ class GcpStorage(ObjectStorage):
             self._handle_error(e)
 
     # Delete / URL helpers — target the correct bucket from access_mode.
+    def generate_public_url(self, object_key: str) -> str:
+        """Return the object key for persistence; callers add the bucket when building URLs."""
+        return f"/{object_key.lstrip('/')}"
+
     def delete_object(
         self,
         object_key:  str,
