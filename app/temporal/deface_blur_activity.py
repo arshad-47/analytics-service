@@ -19,7 +19,7 @@ from app.services.storage import get_object_storage, AccessMode, resolve_url
 
 logger = logging.getLogger("analytics_service.temporal.activities")
 
-ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff"}
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def _check_content_type_via_head(url: str) -> Optional[str]:
