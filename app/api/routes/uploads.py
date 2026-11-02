@@ -183,15 +183,26 @@ async def _dispatch_all_retry_workflows(
     total_success = 0
     total_failed = 0
     page = 0
+    cursor_updated_at = None
+    cursor_submission_id = None
 
     while True:
         async with db.pool.acquire() as conn:
             rows = await fetch_retryable_failed_submissions(
-                conn, tenant_code, settings.BATCH_SIZE, failed_before=cutoff
+                conn,
+                tenant_code,
+                settings.BATCH_SIZE,
+                failed_before=cutoff,
+                cursor_updated_at=cursor_updated_at,
+                cursor_submission_id=cursor_submission_id,
             )
 
         if not rows:
             break
+
+        # Advance keyset cursor to the last row of the current page
+        cursor_updated_at = rows[-1]["updated_at"]
+        cursor_submission_id = rows[-1]["submission_id"]
 
         page += 1
         tasks = []
