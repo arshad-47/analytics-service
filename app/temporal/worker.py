@@ -1,9 +1,7 @@
 import asyncio
 import concurrent.futures
 import logging
-import uuid
 import torch
-from datetime import datetime, timedelta, timezone
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -26,66 +24,6 @@ from app.temporal.environment_activity import environment_detection_activity
 from app.temporal.story_rating_activity import story_rating_activity
 from app.temporal.statement_category_activity import statement_category_activity
 logger = logging.getLogger("analytics_service.temporal.worker")
-
-
-def _compute_next_run_delay(cron_expr: str, now: datetime) -> tuple[datetime, float]:
-    """
-    Parse a daily cron expression (``MM HH * * *``) and return
-    ``(target_utc_datetime, delay_seconds)`` for the next scheduled run.
-    Advances by one day if the scheduled time has already passed today.
-    """
-    parts = cron_expr.strip().split()
-    cron_minute = int(parts[0])
-    cron_hour = int(parts[1])
-
-    target = now.replace(hour=cron_hour, minute=cron_minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-
-    delay = (target - now).total_seconds()
-    return target, delay
-
-
-async def _retry_cron_loop() -> None:
-    """
-    In-process retry cron: sleeps until the next RETRY_CRON_SCHEDULE time,
-    then calls the same sweep the /v1/retry-step/all API uses.
-    No parent workflow is created in Temporal — only individual step-retry-*
-    entries appear (identical behaviour to the bulk retry API endpoint).
-    Runs forever; catches and logs any exception so the loop never dies on its own.
-    """
-    # Deferred import to avoid circular imports at module load time
-    from app.api.routes.uploads import _dispatch_all_retry_workflows
-
-    logger.info(
-        "Retry cron loop started (schedule=%s, UTC).", settings.RETRY_CRON_SCHEDULE
-    )
-    try:
-        while True:
-            now = datetime.now(timezone.utc)
-            target, delay = _compute_next_run_delay(settings.RETRY_CRON_SCHEDULE, now)
-            logger.info(
-                "Retry cron: next run at %s UTC (in %.0f s).", target.isoformat(), delay
-            )
-            await asyncio.sleep(delay)
-
-            sweep_id = f"cron-retry-sweep-{uuid.uuid4().hex[:8]}"
-            cutoff = datetime.now(timezone.utc).isoformat()
-            logger.info("Retry cron: starting sweep %s (cutoff=%s).", sweep_id, cutoff)
-            try:
-                await _dispatch_all_retry_workflows(
-                    tenant_code=None,
-                    cutoff=cutoff,
-                    sweep_id=sweep_id,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Retry cron: sweep %s raised an unexpected error: %s", sweep_id, exc
-                )
-            # Loop continues to the next scheduled time regardless of outcome
-    except asyncio.CancelledError:
-        logger.info("Retry cron loop cancelled — shutting down cleanly.")
-        raise
 
 async def start_worker():
     """
@@ -202,26 +140,42 @@ async def start_worker():
             except Exception:
                 pass  # schedule doesn't exist — nothing to clean up
 
-    for sched_id in ("daily-failed-submissions-retry",):
+    # Register retry cron schedule if enabled
+    if settings.ENABLE_RETRY_CRON:
+        retry_schedule = Schedule(
+            action=ScheduleActionStartWorkflow(
+                BulkStepRetryWorkflow.run,
+                {"tenant_code": None, "batch_size": settings.BATCH_SIZE},
+                id="automated-daily-retry-sweep",
+                task_queue=settings.TEMPORAL_QUEUE,
+            ),
+            spec=ScheduleSpec(
+                cron_expressions=[settings.RETRY_CRON_SCHEDULE]
+            ),
+        )
         try:
-            handle = client.get_schedule_handle(sched_id)
+            logger.info(f"Registering retry cron schedule '{settings.RETRY_CRON_SCHEDULE}' in Temporal...")
+            await client.create_schedule(
+                id="daily-failed-submissions-retry",
+                schedule=retry_schedule,
+            )
+            logger.info("Retry cron schedule successfully registered.")
+        except ScheduleAlreadyRunningError:
+            # Schedule exists — update it so a changed cron expression takes effect on restart
+            logger.info("Retry cron schedule already exists — updating with current config.")
+            handle = client.get_schedule_handle("daily-failed-submissions-retry")
+            await handle.update(lambda _: ScheduleUpdate(schedule=retry_schedule))
+            logger.info("Retry cron schedule updated.")
+        except Exception as e:
+            logger.error(f"Failed to register retry cron schedule: {e}")
+    else:
+        # Clean up stale retry schedule if ENABLE_RETRY_CRON was toggled off
+        try:
+            handle = client.get_schedule_handle("daily-failed-submissions-retry")
             await handle.delete()
-            logger.info("Deleted stale retry Temporal schedule '%s'.", sched_id)
+            logger.info("Deleted stale retry cron schedule (ENABLE_RETRY_CRON=false).")
         except Exception:
             pass  # schedule doesn't exist — nothing to clean up
-
-    # Start in-process retry cron if enabled.
-    # This fires _dispatch_all_retry_workflows directly — the same function the
-    # /v1/retry-step/all API uses — so only individual step-retry-* workflows
-    # appear in Temporal UI, with no parent workflow at all.
-    retry_cron_task = None
-    if settings.ENABLE_RETRY_CRON:
-        retry_cron_task = asyncio.create_task(_retry_cron_loop())
-        logger.info(
-            "In-process retry cron task started (schedule=%s).", settings.RETRY_CRON_SCHEDULE
-        )
-    else:
-        logger.info("Retry cron disabled (ENABLE_RETRY_CRON=false).")
 
     logger.info(f"🚀 Temporal Worker started. Listening on task queue '{settings.TEMPORAL_QUEUE}'...")
     try:
@@ -229,14 +183,6 @@ async def start_worker():
     except asyncio.CancelledError:
         logger.info("Worker execution cancelled.")
     finally:
-        # Cancel the retry cron loop before closing the DB pool so any
-        # in-flight sweep can finish its current DB acquire cleanly.
-        if retry_cron_task is not None and not retry_cron_task.done():
-            retry_cron_task.cancel()
-            try:
-                await retry_cron_task
-            except asyncio.CancelledError:
-                pass
         await db.disconnect()
 
 if __name__ == "__main__":
