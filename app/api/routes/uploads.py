@@ -132,39 +132,50 @@ async def retry_step(
         existing_steps = (process_status or {}).get("steps", [])
 
         submission_id = row["submission_id"]
-        # Stable workflow ID prevents concurrent duplicate retries for the same submission
-        workflow_id = f"step-retry-{submission_id}-{body.tenant_code}"
+        session_id = row["session_id"]
 
-        payload = {
-            "submission_id": submission_id,
-            "session_id": row["session_id"],
-            "tenant_code": body.tenant_code,
-            "submission_type": sub_type,
-            "process_steps": process_steps,
-            "existing_steps": existing_steps,
-        }
+    # DB connection released — now build payload and dispatch to Temporal
 
-        # 5. Dispatch to Temporal using shared singleton client
-        client = await get_temporal_client()
-        try:
-            await client.start_workflow(
-                ConfigDrivenProcessingWorkflow.run,
-                payload,
-                id=workflow_id,
-                task_queue=settings.TEMPORAL_QUEUE,
-            )
-        except WorkflowAlreadyStartedError:
-            raise HTTPException(
-                status_code=409,
-                detail=f"A retry workflow for submission '{submission_id}' is already running.",
-            )
-
-        return StepRetryResponse(
-            workflow_id=workflow_id,
-            submission_id=submission_id,
-            session_id=row["session_id"],
-            message="Retry workflow started.",
+    if not process_steps:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No process steps configured for submission type '{sub_type}'. Cannot retry."
         )
+
+    # Stable workflow ID prevents concurrent duplicate retries for the same submission
+    workflow_id = f"step-retry-{submission_id}-{body.tenant_code}"
+
+    payload = {
+        "submission_id": submission_id,
+        "session_id": session_id,
+        "tenant_code": body.tenant_code,
+        "submission_type": sub_type,
+        "process_steps": process_steps,
+        "existing_steps": existing_steps,
+        "process_status": process_status,
+    }
+
+    # Dispatch to Temporal using shared singleton client
+    client = await get_temporal_client()
+    try:
+        await client.start_workflow(
+            ConfigDrivenProcessingWorkflow.run,
+            payload,
+            id=workflow_id,
+            task_queue=settings.TEMPORAL_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A retry workflow for submission '{submission_id}' is already running.",
+        )
+
+    return StepRetryResponse(
+        workflow_id=workflow_id,
+        submission_id=submission_id,
+        session_id=session_id,
+        message="Retry workflow started.",
+    )
 
 
 async def _dispatch_all_retry_workflows(
@@ -215,6 +226,12 @@ async def _dispatch_all_retry_workflows(
                     process_status = {}
 
             sub_type = row["submission_type"]
+            process_steps = settings.get_process_config(sub_type)
+
+            if not process_steps:
+                logger.warning(f"[{sweep_id}] Skipping submission '{row['submission_id']}' — no steps configured for type '{sub_type}'")
+                continue
+
             tasks.append(
                 client.start_workflow(
                     ConfigDrivenProcessingWorkflow.run,
@@ -223,8 +240,9 @@ async def _dispatch_all_retry_workflows(
                         "session_id": row.get("session_id"),
                         "tenant_code": row["tenant_code"],
                         "submission_type": sub_type,
-                        "process_steps": settings.get_process_config(sub_type),
+                        "process_steps": process_steps,
                         "existing_steps": (process_status or {}).get("steps", []),
+                        "process_status": process_status,
                     },
                     # Stable ID: prevents duplicate retries if called twice
                     id=f"step-retry-{row['submission_id']}-{row['tenant_code']}",
@@ -267,9 +285,14 @@ async def retry_all_failed(
     (BATCH_SIZE at a time) and fires an individual ConfigDrivenProcessingWorkflow
     for each one. Only individual step-retry-* workflows appear in Temporal UI.
     Returns immediately with a sweep_id you can use to correlate logs.
+
+    Any holder of AUTH_TOKEN can trigger this endpoint including across all tenants
+    (tenant_code=None). This is intentional — the endpoint is internal-only, protected
+    by the shared AUTH_TOKEN.
     """
     cutoff = datetime.now(timezone.utc).isoformat()
-    sweep_id = f"bulk-retry-sweep-{body.tenant_code or 'all'}-{uuid.uuid4().hex[:8]}"
+    tenant_label = body.tenant_code if body.tenant_code is not None else "all"
+    sweep_id = f"bulk-retry-sweep-{tenant_label}-{uuid.uuid4().hex[:8]}"
 
     background_tasks.add_task(
         _dispatch_all_retry_workflows,
@@ -279,14 +302,14 @@ async def retry_all_failed(
     )
 
     logger.info(
-        f"Bulk retry sweep '{sweep_id}' enqueued for tenant_code={body.tenant_code or 'all'} "
+        f"Bulk retry sweep '{sweep_id}' enqueued for tenant_code={tenant_label} "
         f"(cutoff={cutoff}, batch_size={settings.BATCH_SIZE})."
     )
 
     return BulkRetryResponse(
         workflow_id=sweep_id,
         message=(
-            f"Bulk retry sweep started (tenant_code={body.tenant_code or 'all'}). "
+            f"Bulk retry sweep started (tenant_code={tenant_label}). "
             f"Individual step-retry-* workflows will appear in Temporal as they are dispatched. "
             f"Track progress in logs with sweep_id='{sweep_id}'."
         ),

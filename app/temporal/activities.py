@@ -75,10 +75,21 @@ async def fetch_failed_submissions_activity(params: Optional[Dict[str, Any]] = N
     tenant_code = params.get("tenant_code")  # None = all tenants
     limit = params.get("limit", settings.BATCH_SIZE)
     failed_before = params.get("failed_before")
+    cursor_updated_at = params.get("cursor_updated_at")
+    cursor_submission_id = params.get("cursor_submission_id")
+    max_retry_attempts = params.get("max_retry_attempts", 5)
 
     async with db.pool.acquire() as conn:
         from app.database.operations import fetch_retryable_failed_submissions
-        rows = await fetch_retryable_failed_submissions(conn, tenant_code, limit, failed_before=failed_before)
+        rows = await fetch_retryable_failed_submissions(
+            conn,
+            tenant_code,
+            limit,
+            failed_before=failed_before,
+            cursor_updated_at=cursor_updated_at,
+            cursor_submission_id=cursor_submission_id,
+            max_retry_attempts=max_retry_attempts,
+        )
 
         results = []
         for row in rows:
@@ -100,6 +111,8 @@ async def fetch_failed_submissions_activity(params: Optional[Dict[str, Any]] = N
                 "submission_type": sub_type,
                 "process_steps": process_steps,
                 "existing_steps": existing_steps,
+                "process_status": process_status,
+                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
             })
         return results
 

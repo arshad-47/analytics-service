@@ -124,7 +124,12 @@ async def start_worker():
             # Schedule exists — update it so a changed cron expression or batch size takes effect
             logger.info("Daily analysis batch schedule already exists — updating with current config.")
             handle = client.get_schedule_handle("daily-batch-processing")
-            await handle.update(lambda _: ScheduleUpdate(schedule=batch_schedule))
+            def _apply_batch(inp):
+                sched = inp.description.schedule
+                sched.action = batch_schedule.action
+                sched.spec = batch_schedule.spec
+                return ScheduleUpdate(schedule=sched)
+            await handle.update(_apply_batch)
             logger.info("Daily analysis batch schedule updated.")
         except Exception as e:
             logger.error(f"Failed to register daily analysis batch schedule in Temporal: {e}")
@@ -164,7 +169,12 @@ async def start_worker():
             # Schedule exists — update it so a changed cron expression takes effect on restart
             logger.info("Retry cron schedule already exists — updating with current config.")
             handle = client.get_schedule_handle("daily-failed-submissions-retry")
-            await handle.update(lambda _: ScheduleUpdate(schedule=retry_schedule))
+            def _apply_retry(inp):
+                sched = inp.description.schedule
+                sched.action = retry_schedule.action
+                sched.spec = retry_schedule.spec
+                return ScheduleUpdate(schedule=sched)
+            await handle.update(_apply_retry)
             logger.info("Retry cron schedule updated.")
         except Exception as e:
             logger.error(f"Failed to register retry cron schedule: {e}")

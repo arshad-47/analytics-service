@@ -1183,9 +1183,11 @@ async def fetch_retryable_failed_submissions(
     failed_before: Optional[Any] = None,
     cursor_updated_at: Optional[Any] = None,
     cursor_submission_id: Optional[str] = None,
+    max_retry_attempts: int = 5,
 ) -> List[Dict[str, Any]]:
     """
     Fetches submissions with status = 'failed' for retry using keyset pagination.
+    Only submissions with fewer than max_retry_attempts recorded retries are returned.
     """
     if limit is None:
         raise ValueError("limit must be provided by the caller; do not rely on a hardcoded default.")
@@ -1202,6 +1204,7 @@ async def fetch_retryable_failed_submissions(
               $4::timestamptz IS NULL
               OR (updated_at, submission_id) > ($4, $5)
           )
+          AND (process_status->>'retry_attempt' IS NULL OR (process_status->>'retry_attempt')::int < $6)
         ORDER BY updated_at ASC, submission_id ASC
         LIMIT $2
         """,
@@ -1210,6 +1213,7 @@ async def fetch_retryable_failed_submissions(
         cutoff_dt,
         cursor_updated_at,
         cursor_submission_id,
+        max_retry_attempts,
     )
     return [dict(row) for row in rows]
 

@@ -16,6 +16,7 @@ with workflow.unsafe.imports_passed_through():
     from app.temporal.thematic_activity import thematic_classification_activity
     from app.temporal.story_rating_activity import story_rating_activity
     from app.temporal.statement_category_activity import statement_category_activity
+    from app.config import settings
 
 @workflow.defn
 class ConfigDrivenProcessingWorkflow:
@@ -24,7 +25,6 @@ class ConfigDrivenProcessingWorkflow:
         submission_id = payload["submission_id"]
         tenant_code = payload["tenant_code"]
         process_steps = payload.get("process_steps", [])
-        start_from_step: Optional[str] = payload.get("start_from_step")
         existing_steps: List[dict] = payload.get("existing_steps", [])
 
         # Set up a generic, resilient retry policy for LLM/CV activities
@@ -45,12 +45,6 @@ class ConfigDrivenProcessingWorkflow:
         # Build lookup of existing steps from previous runs
         prior_steps = {s.get("name"): s for s in existing_steps if isinstance(s, dict)}
 
-        start_idx = 0
-        if start_from_step:
-            matched = [i for i, s in enumerate(process_steps) if s.get("name") == start_from_step]
-            if matched:
-                start_idx = matched[0]
-
         completed_steps = []
         steps_execution = []
         for idx, step in enumerate(process_steps):
@@ -58,7 +52,7 @@ class ConfigDrivenProcessingWorkflow:
             prior = prior_steps.get(step_name)
 
             # If step already succeeded and not forced to rerun, preserve and skip it
-            if (not start_from_step or idx < start_idx) and prior and prior.get("status") == "success":
+            if prior and prior.get("status") == "success":
                 steps_execution.append(prior)
                 completed_steps.append(step_name)
             else:
@@ -237,6 +231,13 @@ class ConfigDrivenProcessingWorkflow:
                 if s["status"] == "pending":
                     s["status"] = "skipped"
 
+            # Find the name of the first failed step for diagnostic tracking
+            failed_step_name = next((s["name"] for s in steps_execution if s.get("status") == "failed"), None)
+
+            # Carry forward the retry_attempt counter from the existing process_status
+            prior_process_status = payload.get("process_status") or {}
+            retry_attempt = (prior_process_status.get("retry_attempt") or 0) + 1
+
             # Update status to 'failed' with error details
             await workflow.execute_activity(
                 update_status_activity,
@@ -248,7 +249,9 @@ class ConfigDrivenProcessingWorkflow:
                         "status": "failed",
                         "error_message": str(e),
                         "steps": steps_execution,
-                        "timestamp": workflow.now().isoformat()
+                        "timestamp": workflow.now().isoformat(),
+                        "failed_at_step": failed_step_name,
+                        "retry_attempt": retry_attempt,
                     }
                 },
                 start_to_close_timeout=timedelta(seconds=10),
@@ -379,7 +382,8 @@ class BulkStepRetryWorkflow:
         ConfigDrivenProcessingWorkflow instances in bounded chunks.
         """
         tenant_code = params.get("tenant_code")
-        batch_size = params.get("batch_size", 100)
+        batch_size = params.get("batch_size") or settings.BATCH_SIZE
+        max_retry_attempts = params.get("max_retry_attempts", 5)
 
         carry_over = carry_over or {}
         total_processed = carry_over.get("total_processed", 0)
@@ -387,18 +391,31 @@ class BulkStepRetryWorkflow:
         total_failed = carry_over.get("total_failed", 0)
         chunk_index = carry_over.get("chunk_index", 0)
         cutoff = carry_over.get("cutoff") or workflow.now().isoformat()
+        cursor_updated_at = carry_over.get("cursor_updated_at")
+        cursor_submission_id = carry_over.get("cursor_submission_id")
         processed_this_generation = 0
 
         while True:
             failed_list: List[Dict[str, Any]] = await workflow.execute_activity(
                 fetch_failed_submissions_activity,
-                {"tenant_code": tenant_code, "limit": batch_size, "failed_before": cutoff},
+                {
+                    "tenant_code": tenant_code,
+                    "limit": batch_size,
+                    "failed_before": cutoff,
+                    "cursor_updated_at": cursor_updated_at,
+                    "cursor_submission_id": cursor_submission_id,
+                    "max_retry_attempts": max_retry_attempts,
+                },
                 start_to_close_timeout=timedelta(minutes=2),
                 retry_policy=RetryPolicy(maximum_attempts=2)
             )
 
             if not failed_list:
                 break
+
+            # Advance keyset cursor to the last row of the current page
+            cursor_updated_at = failed_list[-1].get("updated_at")
+            cursor_submission_id = failed_list[-1]["submission_id"]
 
             chunk_index += 1
             child_tasks = [
@@ -439,6 +456,8 @@ class BulkStepRetryWorkflow:
                     "total_failed": total_failed,
                     "chunk_index": chunk_index,
                     "cutoff": cutoff,
+                    "cursor_updated_at": cursor_updated_at,
+                    "cursor_submission_id": cursor_submission_id,
                 }])
 
         if total_processed == 0:
