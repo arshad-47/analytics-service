@@ -1174,3 +1174,72 @@ async def copy_parent_analysis_results(
         return int(result.split()[-1])
     except Exception:
         return 0
+
+
+async def fetch_retryable_failed_submissions(
+    conn: asyncpg.Connection,
+    tenant_code: Optional[str] = None,
+    limit: int = None,
+    failed_before: Optional[Any] = None,
+    cursor_updated_at: Optional[Any] = None,
+    cursor_submission_id: Optional[str] = None,
+    max_retry_attempts: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Fetches submissions with status = 'failed' for retry using keyset pagination.
+    Only submissions with fewer than max_retry_attempts recorded retries are returned.
+    """
+    if limit is None:
+        raise ValueError("limit must be provided by the caller; do not rely on a hardcoded default.")
+    cutoff_dt = datetime.fromisoformat(failed_before) if isinstance(failed_before, str) else failed_before
+    rows = await conn.fetch(
+        """
+        SELECT submission_id, session_id, tenant_code, submission_type, status,
+               process_status, updated_at
+        FROM submissions
+        WHERE status = 'failed'
+          AND ($1::text IS NULL OR tenant_code = $1)
+          AND ($3::timestamptz IS NULL OR updated_at < $3)
+          AND (
+              $4::timestamptz IS NULL
+              OR (updated_at, submission_id) > ($4, $5)
+          )
+          AND (process_status->>'retry_attempt' IS NULL OR (process_status->>'retry_attempt')::int < $6)
+        ORDER BY updated_at ASC, submission_id ASC
+        LIMIT $2
+        """,
+        tenant_code,
+        limit,
+        cutoff_dt,
+        cursor_updated_at,
+        cursor_submission_id,
+        max_retry_attempts,
+    )
+    return [dict(row) for row in rows]
+
+
+
+async def fetch_failed_submission_for_retry(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    session_id: str,
+    tenant_code: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns the single submission row needed to build a step-retry payload,
+    or None if no matching row exists.
+    Only columns required for retry dispatch are selected.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT submission_id, session_id, tenant_code, submission_type, status, process_status
+        FROM submissions
+        WHERE submission_id = $1
+          AND session_id    = $2
+          AND tenant_code   = $3
+        """,
+        submission_id,
+        session_id,
+        tenant_code,
+    )
+    return dict(row) if row else None

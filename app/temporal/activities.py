@@ -66,4 +66,56 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
         return results
 
 
+@activity.defn
+async def fetch_failed_submissions_activity(params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    Retrieves failed submissions for bulk retry.
+    """
+    params = params or {}
+    tenant_code = params.get("tenant_code")  # None = all tenants
+    limit = params.get("limit", settings.BATCH_SIZE)
+    failed_before = params.get("failed_before")
+    cursor_updated_at = params.get("cursor_updated_at")
+    cursor_submission_id = params.get("cursor_submission_id")
+    max_retry_attempts = params.get("max_retry_attempts", 5)
+
+    async with db.pool.acquire() as conn:
+        from app.database.operations import fetch_retryable_failed_submissions
+        rows = await fetch_retryable_failed_submissions(
+            conn,
+            tenant_code,
+            limit,
+            failed_before=failed_before,
+            cursor_updated_at=cursor_updated_at,
+            cursor_submission_id=cursor_submission_id,
+            max_retry_attempts=max_retry_attempts,
+        )
+
+        results = []
+        for row in rows:
+            process_status = row.get("process_status")
+            if isinstance(process_status, str):
+                try:
+                    process_status = json.loads(process_status)
+                except Exception:
+                    process_status = {}
+
+            existing_steps = (process_status or {}).get("steps", [])
+            sub_type = row["submission_type"]
+            process_steps = settings.get_process_config(sub_type)
+
+            results.append({
+                "submission_id": row["submission_id"],
+                "session_id": row.get("session_id"),
+                "tenant_code": row["tenant_code"],
+                "submission_type": sub_type,
+                "process_steps": process_steps,
+                "existing_steps": existing_steps,
+                "process_status": process_status,
+                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+            })
+        return results
+
+
+
 

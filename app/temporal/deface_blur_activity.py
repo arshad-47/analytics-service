@@ -19,6 +19,21 @@ from app.services.storage import get_object_storage, AccessMode, resolve_url
 
 logger = logging.getLogger("analytics_service.temporal.activities")
 
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _check_content_type_via_head(url: str) -> Optional[str]:
+    """
+    Sends an HTTP HEAD request to get the Content-Type without downloading the file.
+    Returns the content-type string or None if the request fails.
+    """
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.headers.get("Content-Type", "")
+    except Exception:
+        return None
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 OUTPUTS_DIR = BASE_DIR / "outputs"
@@ -200,7 +215,24 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
     else:
         actual_name = parts[-1] if parts else f"{submission_id}_{i}.jpg"
 
-    ext = os.path.splitext(unquoted_path)[1]
+    ext = os.path.splitext(unquoted_path)[1].lower()
+
+    # Level 1: Extension check (free — no network call)
+    if ext and ext not in ALLOWED_IMAGE_EXTENSIONS:
+        logger.warning(
+            f"Skipping non-image URL '{resolved_url}' (unsupported extension '{ext}')"
+        )
+        return None
+
+    # Level 2: HEAD request (only when URL has no file extension)
+    if not ext:
+        content_type = await _run_in_image_executor(_check_content_type_via_head, resolved_url)
+        if content_type and not content_type.startswith("image/"):
+            logger.warning(
+                f"Skipping '{resolved_url}' — Content-Type is '{content_type}', not an image"
+            )
+            return None
+
     if not ext:
         ext = ".jpg"
     filename = f"{submission_id}_{tenant_code}_{i}{ext}"

@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # keeps memory and concurrent child-workflow count bounded regardless of queue size.
     BATCH_SIZE: int = Field(default=100, gt=0)
 
+    # Step-level retry cron configuration
+    ENABLE_RETRY_CRON: bool = Field(default=False)
+    RETRY_CRON_SCHEDULE: str = Field(default="0 2 * * *")  # 2:00 AM daily
+
+
     # Deployment environment — defaults to the safe option ('production') so a
     # missing/unset value never accidentally allows destructive operations like
     # RESET_DB. Must be explicitly set to 'development' to opt into those.
