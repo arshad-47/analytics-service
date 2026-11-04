@@ -156,6 +156,11 @@ async def pii_and_abusive_language_detection_activity(params: Dict[str, Any]) ->
             db_col = map_column_to_db_col(col, sub_type)
             col_res = _get_case_insensitive_key(llm_response_dict, col)
 
+            # Blank scalar input has nothing to mask, so the LLM may answer with
+            # [], {} or omit the key. Leave the column untouched instead of failing.
+            if col not in column_statements and not str(payload.get(db_col) or "").strip():
+                continue
+
             # Scalar column — the LLM should return a single object, but sometimes
             # wraps it in a list (one entry) or splits the field into multiple entries.
             # • Single-item list → unwrap transparently (common LLM formatting quirk).
