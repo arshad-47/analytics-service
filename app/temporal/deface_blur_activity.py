@@ -14,7 +14,11 @@ from temporalio import activity
 from app.config import settings
 from app.database.db import db
 from app.database.operations import get_submission_type_and_payload
-from app.services.image_blur import anonymize_face
+from app.services.image_blur import (
+    anonymize_face,
+    prepare_image_for_blur,
+    ImageNotBlurrableError,
+)
 from app.services.storage import get_object_storage, AccessMode, resolve_url
 
 logger = logging.getLogger("analytics_service.temporal.activities")
@@ -244,6 +248,13 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
         # 1. Download file locally
         await _run_in_image_executor(_download_file, resolved_url, filename)
 
+        # 1b. Check the image can be blurred, rotate phone photos upright per
+        # their EXIF tag, and convert non-RGB images (e.g. CMYK JPEGs) to RGB —
+        # see normalize_image_for_blur. Runs before the dynamic scale below so
+        # the scale is computed from the upright size.
+        # Raises ImageNotBlurrableError, handled below by skipping this image.
+        await _run_in_image_executor(prepare_image_for_blur, str(local_path))
+
         # 2. Deface/Blur image — gated globally (see BLUR_CONCURRENCY_LIMIT setting),
         # unlike the download/upload legs, since this is the memory-heavy step.
         # Dynamic scale: DEFACE_SCALE is a *ceiling*, not a fixed override. Images
@@ -288,7 +299,18 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
     except urllib.error.URLError as e:
         logger.warning(f"Failed to download image {resolved_url} (ignoring): {e}")
         return None
+    except ImageNotBlurrableError as e:
+        # Skip only this image; the submission's other images and the rest of
+        # the pipeline continue. The original stays in image_urls but gets no
+        # blurred entry — it is never uploaded unblurred.
+        logger.error(f"Skipping image {resolved_url} — cannot be blurred: {e}")
+        return {"relative_url": parsed_path, "public_url": None}
     except Exception as e:
+        # Includes DefaceError. Bad inputs are already filtered out by
+        # prepare_image_for_blur above, so a deface failure here is most likely
+        # environmental (detector init, ONNX runtime, disk) — and deface exits 1
+        # for any uncaught exception, so its exit code can't tell them apart.
+        # Re-raise so Temporal retries instead of silently skipping the image.
         logger.error(f"Failed face blurring for {resolved_url}: {e}")
         raise
     finally:
@@ -353,7 +375,10 @@ async def deface_blur_activity(params: Dict[str, Any]) -> Dict[str, Any]:
             raise r
 
     valid_results = [r for r in results if r is not None]
-    blurred_local_paths = [r["public_url"] for r in valid_results]
+    # Images that couldn't be blurred have public_url None: keep their original
+    # in image_urls, but leave them out of blur_image_urls. The two lists are
+    # therefore not index-aligned when any image was skipped.
+    blurred_local_paths = [r["public_url"] for r in valid_results if r["public_url"]]
     relative_original_urls = [r["relative_url"] for r in valid_results]
 
     # Save output paths back to DB — acquire fresh here rather than reusing a
