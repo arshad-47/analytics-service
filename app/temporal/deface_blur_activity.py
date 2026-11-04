@@ -17,7 +17,6 @@ from app.database.operations import get_submission_type_and_payload
 from app.services.image_blur import (
     anonymize_face,
     prepare_image_for_blur,
-    DefaceError,
     ImageNotBlurrableError,
 )
 from app.services.storage import get_object_storage, AccessMode, resolve_url
@@ -306,16 +305,12 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
         # blurred entry — it is never uploaded unblurred.
         logger.error(f"Skipping image {resolved_url} — cannot be blurred: {e}")
         return {"relative_url": parsed_path, "public_url": None}
-    except DefaceError as e:
-        # A positive exit code means deface rejected this input — retrying the
-        # same file fails the same way, so skip it like a failed pre-check.
-        # Negative codes (killed by a signal, e.g. -9 OOM) stay retryable.
-        if e.returncode > 0:
-            logger.error(f"Skipping image {resolved_url} — deface could not blur it: {e}")
-            return {"relative_url": parsed_path, "public_url": None}
-        logger.error(f"Failed face blurring for {resolved_url}: {e}")
-        raise
     except Exception as e:
+        # Includes DefaceError. Bad inputs are already filtered out by
+        # prepare_image_for_blur above, so a deface failure here is most likely
+        # environmental (detector init, ONNX runtime, disk) — and deface exits 1
+        # for any uncaught exception, so its exit code can't tell them apart.
+        # Re-raise so Temporal retries instead of silently skipping the image.
         logger.error(f"Failed face blurring for {resolved_url}: {e}")
         raise
     finally:

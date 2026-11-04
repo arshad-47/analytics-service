@@ -10,9 +10,10 @@ logger = logging.getLogger("analytics_service.services.image_blur")
 
 
 class DefaceError(RuntimeError):
-    """Raised when the deface CLI exits non-zero. Carries the exit code so callers
-    can tell a bad input (positive code, fails the same way every time) apart
-    from the process being killed (negative code, e.g. -9 on OOM)."""
+    """Raised when the deface CLI exits non-zero. Carries the exit code for
+    logging: 1 means any uncaught exception inside deface (bad input or a
+    detector/runtime failure — the code can't tell which), negative means the
+    process was killed by a signal (e.g. -9 on OOM)."""
 
     def __init__(self, returncode: int, stderr: str):
         self.returncode = returncode
@@ -28,6 +29,13 @@ class ImageNotBlurrableError(ValueError):
 # Formats deface can read and write back. MPO is the multi-picture JPEG many
 # phone cameras produce; Pillow reports it separately but it is a normal JPEG.
 BLURRABLE_FORMATS = {"JPEG", "MPO", "PNG", "WEBP"}
+
+
+def _is_system_error(e: BaseException) -> bool:
+    """OS-level failures (disk full, I/O error, ...) carry an errno; Pillow's
+    own decode/encode errors don't. These are transient, so callers re-raise
+    them for a Temporal retry instead of skipping the image."""
+    return isinstance(e, OSError) and e.errno is not None
 
 
 def prepare_image_for_blur(image_path: str) -> None:
@@ -58,12 +66,19 @@ def prepare_image_for_blur(image_path: str) -> None:
         raise
     except UnidentifiedImageError as e:
         raise ImageNotBlurrableError(f"{path.name}: not a readable image ({e})") from e
+    except MemoryError as e:
+        raise ImageNotBlurrableError(f"{path.name}: too large to decode in memory") from e
     except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as e:
+        if _is_system_error(e):
+            raise
         raise ImageNotBlurrableError(f"{path.name}: corrupt or truncated image ({e})") from e
 
     try:
         normalize_image_for_blur(str(path))
     except Exception as e:
+        # MemoryError is skipped like a bad image; disk/I-O errors retry.
+        if _is_system_error(e):
+            raise
         raise ImageNotBlurrableError(f"{path.name}: could not convert to upright RGB ({e})") from e
 
 

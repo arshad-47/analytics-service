@@ -13,11 +13,16 @@ def _get_nested(obj: dict, dotted_path: str):
 
 
 def _is_empty(value) -> bool:
-    """True only for None, "", [], {} — explicitly NOT for 0 or False, which are
-    falsy-but-valid values (unlike a bare `not value` check)."""
+    """True for None, a blank or whitespace-only string, {}, and a list whose
+    items are all empty (so [] and ["  ", ""] both count) — explicitly NOT for
+    0 or False, which are falsy-but-valid values (unlike a bare `not value` check)."""
     if value is None:
         return True
-    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
+    if isinstance(value, str):
+        return len(value.strip()) == 0
+    if isinstance(value, (list, tuple)):
+        return all(_is_empty(item) for item in value)
+    if isinstance(value, dict) and len(value) == 0:
         return True
     return False
 
