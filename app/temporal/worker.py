@@ -11,12 +11,14 @@ from app.temporal.workflows import (
     ConfigDrivenProcessingWorkflow,
     BatchProcessingWorkflow,
     BulkStepRetryWorkflow,
+    MigrationWorkflow,
 )
 from app.temporal.activities import (
     update_status_activity,
     fetch_pending_submissions_activity,
     fetch_failed_submissions_activity,
 )
+from app.temporal.migration_activity import run_migration_activity
 from app.temporal.deface_blur_activity import deface_blur_activity
 from app.temporal.pii_and_abusive_activity import pii_and_abusive_language_detection_activity
 from app.temporal.thematic_activity import thematic_classification_activity
@@ -71,6 +73,7 @@ async def start_worker():
         ConfigDrivenProcessingWorkflow,
         BatchProcessingWorkflow,
         BulkStepRetryWorkflow,
+        MigrationWorkflow,
     ]
     activities = [
         pii_and_abusive_language_detection_activity,
@@ -82,6 +85,7 @@ async def start_worker():
         update_status_activity,
         fetch_pending_submissions_activity,
         fetch_failed_submissions_activity,
+        run_migration_activity,
     ]
 
     worker = Worker(
@@ -184,6 +188,47 @@ async def start_worker():
             handle = client.get_schedule_handle("daily-failed-submissions-retry")
             await handle.delete()
             logger.info("Deleted stale retry cron schedule (ENABLE_RETRY_CRON=false).")
+        except Exception:
+            pass  # schedule doesn't exist — nothing to clean up
+
+    # Register migration cron schedule if enabled
+    if settings.ENABLE_MIGRATION_CRON:
+        migration_schedule = Schedule(
+            action=ScheduleActionStartWorkflow(
+                MigrationWorkflow.run,
+                id="scheduled-sl-analytics-migration-run",
+                task_queue=settings.TEMPORAL_QUEUE,
+            ),
+            spec=ScheduleSpec(
+                cron_expressions=[settings.MIGRATION_CRON_SCHEDULE]
+            ),
+        )
+        try:
+            logger.info(f"Registering migration cron schedule '{settings.MIGRATION_CRON_SCHEDULE}' in Temporal...")
+            await client.create_schedule(
+                id="scheduled-sl-analytics-migration",
+                schedule=migration_schedule,
+            )
+            logger.info("Migration cron schedule successfully registered.")
+        except ScheduleAlreadyRunningError:
+            # Schedule exists — update it so a changed cron expression takes effect on restart
+            logger.info("Migration cron schedule already exists — updating with current config.")
+            handle = client.get_schedule_handle("scheduled-sl-analytics-migration")
+            def _apply_migration(inp):
+                sched = inp.description.schedule
+                sched.action = migration_schedule.action
+                sched.spec = migration_schedule.spec
+                return ScheduleUpdate(schedule=sched)
+            await handle.update(_apply_migration)
+            logger.info("Migration cron schedule updated.")
+        except Exception as e:
+            logger.error(f"Failed to register migration cron schedule: {e}")
+    else:
+        # Clean up stale migration schedule if ENABLE_MIGRATION_CRON was toggled off
+        try:
+            handle = client.get_schedule_handle("scheduled-sl-analytics-migration")
+            await handle.delete()
+            logger.info("Deleted stale migration cron schedule (ENABLE_MIGRATION_CRON=false).")
         except Exception:
             pass  # schedule doesn't exist — nothing to clean up
 

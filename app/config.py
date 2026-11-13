@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     ENABLE_RETRY_CRON: bool = Field(default=False)
     RETRY_CRON_SCHEDULE: str = Field(default="0 2 * * *")  # 2:00 AM daily
 
+    # ShikshaLokam -> Analytics Migration cron configuration
+    ENABLE_MIGRATION_CRON: bool = Field(default=False)
+    MIGRATION_CRON_SCHEDULE: str = Field(default="0 */2 * * *")  # Every 2 hours
+
 
     # Deployment environment — defaults to the safe option ('production') so a
     # missing/unset value never accidentally allows destructive operations like

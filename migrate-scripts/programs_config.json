@@ -1,0 +1,45 @@
+{
+  "programs": {
+    "discussion": {
+      "name": "Shiksha Chaupals",
+      "submission_type": "discussion",
+      "session_types": [
+        "shikshalokam_chaupal",
+        "guest-discussion"
+      ],
+      "leader_category": "Women Leader"
+    },
+    "story": {
+      "name": "Shiksha Chaupals",
+      "submission_type": "story",
+      "session_types": [
+        "guest-mi-story",
+        "guided-validation",
+        "mi-story"
+      ],
+      "leader_category": "Women Leader"
+    },
+    "ylc": {
+      "name": "YLC Program",
+      "submission_type": "story",
+      "session_types": [
+        "YLC"
+      ],
+      "leader_category": "Youth Leader"
+    },
+    "slc": {
+      "name": "SLC Program",
+      "submission_type": "story",
+      "session_types": [
+        "SLC"
+      ],
+      "leader_category": "School Leader"
+    }
+  },
+  "defaults": {
+    "program_name": "Shiksha Chaupals",
+    "leader_category": "Women Leader"
+  },
+  "default_tenant": "mitra",
+  "source_tenant": "shikshalokamstaging"
+}

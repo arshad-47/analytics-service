@@ -16,6 +16,7 @@ with workflow.unsafe.imports_passed_through():
     from app.temporal.thematic_activity import thematic_classification_activity
     from app.temporal.story_rating_activity import story_rating_activity
     from app.temporal.statement_category_activity import statement_category_activity
+    from app.temporal.migration_activity import run_migration_activity
     from app.config import settings
 
 @workflow.defn
@@ -469,6 +470,25 @@ class BulkStepRetryWorkflow:
             "failed_count": total_failed,
             "chunks": chunk_index,
         }
+
+
+@workflow.defn
+class MigrationWorkflow:
+    @workflow.run
+    async def run(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Scheduled workflow that executes the ShikshaLokam -> Analytics delta migration.
+        """
+        params = params or {}
+        return await workflow.execute_activity(
+            run_migration_activity,
+            params,
+            start_to_close_timeout=timedelta(minutes=30),
+            retry_policy=RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(seconds=30),
+            ),
+        )
 
 
 
