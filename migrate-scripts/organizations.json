@@ -1,0 +1,50 @@
+{
+  "state_district_map": {
+    "Bihar": {
+      "West Champaran": "Swadha Mahila Samakhya",
+      "East Champaran": "Swadha Mahila Samakhya",
+      "Sitamarhi": "Pragati Ek Prayas",
+      "Sheohar": "Srishti Mahila Samakhya",
+      "Muzaffarpur": "Jyoti Mahila Samakhya",
+      "Vaishali": "Jyoti Mahila Samakhya",
+      "Siwan": "Jyoti Mahila Samakhya",
+      "Kaimur": "Deepmala Sanstha",
+      "Rohtas": "Samriddhi Sanstha",
+      "Gaya": "Hamari Drishti",
+      "Patna": "Sahyogi Sanstha"
+    },
+    "Odisha": {
+      "Mayurbhanj": "Atmashakti",
+      "Balangir": "Atmashakti",
+      "Nayagada": "Atmashakti",
+      "Kalahandi": "Atmashakti",
+      "Koraput": "Atmashakti",
+      "Debagada": "Atmashakti",
+      "Sundergada": "Atmashakti",
+      "Sambalpur": "Atmashakti",
+      "Nuapada": "Atmashakti"
+    },
+    "Karnataka": {
+      "Mysore": "Initiative for People Empowerment in India Foundation (IPEI)",
+      "Udupi": "Padivalored (PADI)",
+      "Mandya": "Padivalored (PADI)",
+      "Dakshina Kannada": "Padivalored (PADI)"
+    },
+    "Uttar Pradesh": {}
+  },
+  "keyword_rules": [
+    {
+      "pattern": "\\bip(?:ie|ei|e)\\b",
+      "organization": "Initiative for People Empowerment in India Foundation (IPEI)"
+    },
+    {
+      "pattern": "\\bpadi\\b|mangaluru|mangalore|udupi|mandya",
+      "organization": "Padivalored (PADI)"
+    },
+    {
+      "pattern": "v help|grameena|nagarabhivruddhi",
+      "organization": "V Help Grameena Mattu Nagarabhivruddhi Samsthe"
+    }
+  ],
+  "default_organization": ""
+}

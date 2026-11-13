@@ -40,6 +40,10 @@ class Settings(BaseSettings):
         description="Minimum minutes a submission must be in 'processing' before it can be retried by bulk sweep."
     )
 
+    # ShikshaLokam -> Analytics Migration cron configuration
+    ENABLE_MIGRATION_CRON: bool = Field(default=False)
+    MIGRATION_CRON_SCHEDULE: str = Field(default="0 */2 * * *")  # Every 2 hours
+
 
     # Deployment environment — defaults to the safe option ('production') so a
     # missing/unset value never accidentally allows destructive operations like
