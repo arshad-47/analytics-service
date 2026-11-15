@@ -134,6 +134,18 @@ async def retry_step(
             status_code=409,
             detail=f"Submission '{submission_id}' is currently actively executing in Temporal (workflow: '{outcome.active_wf}')."
         )
+    if outcome.status == "reconciled":
+        return StepRetryResponse(
+            workflow_id=outcome.workflow_id,
+            submission_id=submission_id,
+            session_id=session_id,
+            message=f"Submission '{submission_id}' was already completed in Temporal; status reconciled to 'success'.",
+        )
+    if outcome.status == "claim_rejected":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Submission '{submission_id}' cannot be claimed for retry (exceeded max retry attempts or invalid status).",
+        )
     if outcome.status == "already_started":
         raise HTTPException(
             status_code=409,

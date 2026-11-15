@@ -1259,13 +1259,13 @@ async def claim_submission_for_retry(
     conn: asyncpg.Connection,
     submission_id: str,
     tenant_code: str,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
     Atomically claims a submission for retry by incrementing
     process_status->>'retry_attempt' and touching updated_at.
-    Guards against poison-pill loops by ensuring crashes during execution
-    still advance the attempt counter.
-    Returns dict with 'retry_attempt' and updated 'process_status'.
+    Guarded to only claim submissions with status in ('failed', 'processing')
+    and retry_attempt < 5.
+    Returns dict with 'retry_attempt' and updated 'process_status', or None if rejected.
     """
     row = await conn.fetchrow(
         """
@@ -1276,14 +1276,17 @@ async def claim_submission_for_retry(
                 '{retry_attempt}',
                 to_jsonb(COALESCE((process_status->>'retry_attempt')::int, 0) + 1)
             )
-        WHERE submission_id = $1 AND tenant_code = $2
+        WHERE submission_id = $1
+          AND tenant_code = $2
+          AND status IN ('failed', 'processing')
+          AND COALESCE((process_status->>'retry_attempt')::int, 0) < 5
         RETURNING (process_status->>'retry_attempt')::int AS retry_attempt, process_status;
         """,
         submission_id,
         tenant_code,
     )
     if not row:
-        return {"retry_attempt": 1, "process_status": {"retry_attempt": 1}}
+        return None
 
     ps = row["process_status"]
     if isinstance(ps, str):
@@ -1295,6 +1298,30 @@ async def claim_submission_for_retry(
         "retry_attempt": row["retry_attempt"] or 1,
         "process_status": ps or {},
     }
+
+
+async def rollback_submission_claim(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+) -> None:
+    """
+    Rolls back / decrements retry_attempt if start_workflow fails due to WorkflowAlreadyStartedError,
+    preventing in-flight workflows from prematurely burning one of their 5 retry attempts.
+    """
+    await conn.execute(
+        """
+        UPDATE submissions
+        SET process_status = jsonb_set(
+            COALESCE(process_status, '{}'::jsonb),
+            '{retry_attempt}',
+            to_jsonb(GREATEST(COALESCE((process_status->>'retry_attempt')::int, 1) - 1, 0))
+        )
+        WHERE submission_id = $1 AND tenant_code = $2;
+        """,
+        submission_id,
+        tenant_code,
+    )
 
 
 async def reconcile_completed_submission(

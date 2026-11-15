@@ -18,6 +18,8 @@ from app.database.db import db
 from app.database.operations import (
     claim_submission_for_retry,
     fetch_retryable_submissions,
+    reconcile_completed_submission,
+    rollback_submission_claim,
 )
 from app.temporal.client import get_temporal_client
 from app.temporal.liveness import (
@@ -84,9 +86,19 @@ async def retry_single_submission(
 
         if liveness == TemporalLivenessStatus.RUNNING:
             return RetryOutcome(status="already_running", workflow_id=workflow_id, active_wf=active_wf)
+        if liveness == TemporalLivenessStatus.COMPLETED:
+            async with db.pool.acquire() as conn:
+                await reconcile_completed_submission(conn, sub_id, tenant_code)
+            return RetryOutcome(
+                status="reconciled",
+                workflow_id=active_wf or workflow_id,
+                active_wf=active_wf,
+            )
 
     async with db.pool.acquire() as conn:
         claim_info = await claim_submission_for_retry(conn, sub_id, tenant_code)
+        if not claim_info:
+            return RetryOutcome(status="claim_rejected", workflow_id=workflow_id)
         process_status["retry_attempt"] = claim_info["retry_attempt"]
 
     payload = {
@@ -108,6 +120,8 @@ async def retry_single_submission(
         )
         return RetryOutcome(status="started", workflow_id=workflow_id)
     except WorkflowAlreadyStartedError:
+        async with db.pool.acquire() as conn:
+            await rollback_submission_claim(conn, sub_id, tenant_code)
         return RetryOutcome(status="already_started", workflow_id=workflow_id)
 
 
@@ -167,11 +181,10 @@ async def dispatch_all_retry_workflows(
             if outcome.status == "already_running":
                 logger.info(f"[{sweep_id}] Skipping submission '{sub_id}' — actively running in Temporal ({outcome.active_wf})")
                 return "skipped"
-            if outcome.status == "no_steps":
-                logger.warning(f"[{sweep_id}] Skipping submission '{sub_id}' — no steps configured for type '{row.get('submission_type')}'")
-                return "skipped"
-            if outcome.status == "already_started":
-                logger.info(f"[{sweep_id}] Retry workflow already started for '{sub_id}'")
+            if outcome.status == "reconciled":
+                logger.info(f"[{sweep_id}] Reconciling submission '{sub_id}' — already COMPLETED in Temporal ({outcome.active_wf})")
+                return "reconciled"
+            if outcome.status in ("no_steps", "claim_rejected", "already_started"):
                 return "skipped"
             return "started"
 

@@ -10,14 +10,12 @@ from app.database.db import db
 from app.temporal.workflows import (
     ConfigDrivenProcessingWorkflow,
     BatchProcessingWorkflow,
-    BulkStepRetryWorkflow,
     MigrationWorkflow,
     TriggerBulkRetryWorkflow,
 )
 from app.temporal.activities import (
     update_status_activity,
     fetch_pending_submissions_activity,
-    fetch_retryable_submissions_activity,
     trigger_bulk_retry_activity,
 )
 from app.temporal.migration_activity import run_migration_activity
@@ -74,7 +72,6 @@ async def start_worker():
     workflows = [
         ConfigDrivenProcessingWorkflow,
         BatchProcessingWorkflow,
-        BulkStepRetryWorkflow,
         MigrationWorkflow,
         TriggerBulkRetryWorkflow,
     ]
@@ -87,7 +84,6 @@ async def start_worker():
         statement_category_activity,
         update_status_activity,
         fetch_pending_submissions_activity,
-        fetch_retryable_submissions_activity,
         run_migration_activity,
         trigger_bulk_retry_activity,
     ]

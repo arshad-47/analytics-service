@@ -53,8 +53,8 @@ def test_liveness_detects_running_workflow():
     asyncio.run(_run())
 
 
-def test_liveness_treats_completed_workflow_as_retryable():
-    """If a workflow was COMPLETED in the past and none is currently RUNNING, return RETRYABLE."""
+def test_liveness_detects_completed_workflow():
+    """If a workflow is COMPLETED and none is RUNNING, return COMPLETED."""
     async def _run():
         client = MagicMock()
 
@@ -69,9 +69,9 @@ def test_liveness_treats_completed_workflow_as_retryable():
 
         client.get_workflow_handle.side_effect = get_handle
 
-        status, active_id = await check_submission_temporal_state(client, "sub123", "mitra")
-        assert status == TemporalLivenessStatus.RETRYABLE
-        assert active_id is None
+        status, completed_id = await check_submission_temporal_state(client, "sub123", "mitra")
+        assert status == TemporalLivenessStatus.COMPLETED
+        assert completed_id == "realtime-sub123-mitra"
 
     asyncio.run(_run())
 
@@ -180,6 +180,40 @@ def test_retry_step_returns_409_if_workflow_is_running():
     asyncio.run(_run())
 
 
+def test_retry_step_reconciles_if_temporal_is_completed():
+    """When status is 'processing' and Temporal is COMPLETED, reconcile DB and return 200 without retrying."""
+    async def _run():
+        fake_row = {
+            "submission_id": "100",
+            "session_id": "sess-100",
+            "tenant_code": "mitra",
+            "submission_type": "story",
+            "status": "processing",
+            "process_status": {},
+        }
+
+        req = StepRetryRequest(submission_id="100", session_id="sess-100", tenant_code="mitra")
+        mock_reconcile = AsyncMock()
+        mock_pool, _ = _mock_db_pool()
+        db.pool = mock_pool
+        try:
+            with patch("app.api.routes.uploads.fetch_retryable_submission_for_retry", new=AsyncMock(return_value=fake_row)):
+                with patch("app.api.routes.uploads.get_temporal_client", new=AsyncMock()):
+                    with patch(
+                        "app.services.retry.check_submission_temporal_state",
+                        new=AsyncMock(return_value=(TemporalLivenessStatus.COMPLETED, "realtime-100-mitra"))
+                    ):
+                        with patch("app.services.retry.reconcile_completed_submission", new=mock_reconcile):
+                            res = await retry_step(body=req, _token=MagicMock())
+                            assert res.submission_id == "100"
+                            assert "status reconciled to 'success'" in res.message
+                            mock_reconcile.assert_awaited_once()
+        finally:
+            db.pool = None
+
+    asyncio.run(_run())
+
+
 def test_retry_step_claims_and_starts_workflow_for_dead_processing_row():
     """A stuck processing row with RETRYABLE liveness is claimed and started."""
     async def _run():
@@ -263,9 +297,12 @@ def test_bulk_sweep_skips_running_and_dispatches_retryable():
         async def mock_liveness(client, sub_id, t_code):
             if sub_id == "101":
                 return TemporalLivenessStatus.RUNNING, "realtime-101-mitra"
+            elif sub_id == "102":
+                return TemporalLivenessStatus.COMPLETED, "realtime-102-mitra"
             return TemporalLivenessStatus.RETRYABLE, None
 
         mock_claim = AsyncMock(return_value={"retry_attempt": 1, "process_status": {"retry_attempt": 1}})
+        mock_reconcile = AsyncMock()
         mock_pool, _ = _mock_db_pool()
         db.pool = mock_pool
 
@@ -274,18 +311,24 @@ def test_bulk_sweep_skips_running_and_dispatches_retryable():
                 with patch("app.services.retry.fetch_retryable_submissions", new=AsyncMock(side_effect=[rows, []])):
                     with patch("app.services.retry.check_submission_temporal_state", new=mock_liveness):
                         with patch("app.services.retry.claim_submission_for_retry", new=mock_claim):
-                            await dispatch_all_retry_workflows(
-                                tenant_code="mitra",
-                                cutoff=datetime.now(timezone.utc).isoformat(),
-                                sweep_id="test-sweep"
-                            )
+                            with patch("app.services.retry.reconcile_completed_submission", new=mock_reconcile):
+                                await dispatch_all_retry_workflows(
+                                    tenant_code="mitra",
+                                    cutoff=datetime.now(timezone.utc).isoformat(),
+                                    sweep_id="test-sweep"
+                                )
 
-                            # 101 was skipped (RUNNING)
-                            # 102 and 103 were dispatched to start_workflow
-                            assert mock_client.start_workflow.await_count == 2
-                            dispatched_ids = [call[1]["id"] for call in mock_client.start_workflow.call_args_list]
-                            assert "step-retry-102-mitra" in dispatched_ids
-                            assert "step-retry-103-mitra" in dispatched_ids
+                                # 101 was skipped (RUNNING)
+                                # 102 was reconciled
+                                assert mock_reconcile.await_count == 1
+                                recon_args = mock_reconcile.await_args[0]
+                                assert recon_args[1] == "102"
+                                assert recon_args[2] == "mitra"
+
+                                # Only 103 was dispatched to start_workflow
+                                assert mock_client.start_workflow.await_count == 1
+                                call_args = mock_client.start_workflow.call_args[1]
+                                assert call_args["id"] == "step-retry-103-mitra"
         finally:
             db.pool = None
 

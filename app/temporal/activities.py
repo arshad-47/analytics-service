@@ -69,58 +69,6 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
 
 
 @activity.defn
-async def fetch_retryable_submissions_activity(params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """
-    Retrieves retryable submissions (failed or stuck processing) for bulk retry.
-    """
-    params = params or {}
-    tenant_code = params.get("tenant_code")  # None = all tenants
-    limit = params.get("limit", settings.BATCH_SIZE)
-    failed_before = params.get("failed_before")
-    cursor_updated_at = params.get("cursor_updated_at")
-    cursor_submission_id = params.get("cursor_submission_id")
-    max_retry_attempts = params.get("max_retry_attempts", 5)
-
-    async with db.pool.acquire() as conn:
-        from app.database.operations import fetch_retryable_submissions
-        rows = await fetch_retryable_submissions(
-            conn,
-            tenant_code,
-            limit,
-            failed_before=failed_before,
-            cursor_updated_at=cursor_updated_at,
-            cursor_submission_id=cursor_submission_id,
-            max_retry_attempts=max_retry_attempts,
-            stuck_processing_min_age_minutes=settings.STUCK_PROCESSING_MIN_AGE_MINUTES,
-        )
-
-        results = []
-        for row in rows:
-            process_status = row.get("process_status")
-            if isinstance(process_status, str):
-                try:
-                    process_status = json.loads(process_status)
-                except Exception:
-                    process_status = {}
-
-            existing_steps = (process_status or {}).get("steps", [])
-            sub_type = row["submission_type"]
-            process_steps = settings.get_process_config(sub_type)
-
-            results.append({
-                "submission_id": row["submission_id"],
-                "session_id": row.get("session_id"),
-                "tenant_code": row["tenant_code"],
-                "submission_type": sub_type,
-                "process_steps": process_steps,
-                "existing_steps": existing_steps,
-                "process_status": process_status,
-                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-            })
-        return results
-
-
-@activity.defn
 async def trigger_bulk_retry_activity(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Called by the Temporal cron schedule (TriggerBulkRetryWorkflow) to run the same
