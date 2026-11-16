@@ -48,7 +48,7 @@ LlmFunction = Callable[..., Tuple[str, Dict[str, Any]]]
 class ExtractionSetupError(RuntimeError):
     """
     A deterministic setup problem: no extraction config for the session, a prompt that does not exist or has no active
-    version, an LLM timeout the activity budget cannot hold. Retrying cannot fix it (the activity reports it as
+    version, an activity budget too small for any LLM call. Retrying cannot fix it (the activity reports it as
     non-retryable). The message names configuration, never data.
     """
 
@@ -420,6 +420,29 @@ def resolve_llm_settings(config: ExtractionConfig, overrides: Mapping[str, Any])
     return {"model": model, "max_tokens": max_tokens, "timeout": timeout}
 
 
+def clamp_llm_timeout(timeout: int, activity_budget_seconds: int) -> int:
+    """
+    The LLM timeout that fits the Temporal activity's budget: min(timeout, budget - ACTIVITY_MARGIN_SECONDS).
+    The workflow sizes the budget from the step's llm_timeout_seconds or the .env setting only (workflow code cannot
+    read the database), so a longer `llm.timeout_seconds` of the extraction config can exceed it; that must not fail
+    every submission, so the call is shortened instead (one WARNING with the two numbers, never any text). Giving a
+    longer call a bigger budget stays the job of `llm_timeout_seconds` on the workflow step. Only a budget with
+    nothing left after the margin is an ExtractionSetupError (deterministic, nothing can be called).
+    """
+    available = activity_budget_seconds - ACTIVITY_MARGIN_SECONDS
+    if available <= 0:
+        raise ExtractionSetupError(
+            f"the activity budget ({activity_budget_seconds} s) leaves no time for an LLM call after the "
+            f"{ACTIVITY_MARGIN_SECONDS} s margin; set llm_timeout_seconds on the workflow step")
+    if timeout <= available:
+        return timeout
+    logger.warning(
+        "LLM timeout of %s s does not fit the activity budget of %s s; using %s s "
+        "(set llm_timeout_seconds on the workflow step to allow a longer call)",
+        timeout, activity_budget_seconds, available)
+    return available
+
+
 @dataclass
 class SubmissionOutcome:
     submission_id: str
@@ -460,7 +483,8 @@ async def extract_submission(
     failed LLM call raises LlmCallError carrying only the exception class and HTTP status, never the provider text.
     A 'failed' llm log is written only when a call was really made: a setup or prompt error before the call is not
     logged (and costs nothing). `activity_budget_seconds` (the Temporal activity's start_to_close_timeout, when run as
-    an activity) makes an effective LLM timeout that does not fit the budget an ExtractionSetupError before any call.
+    an activity) clamps an effective LLM timeout that does not fit the budget to budget - ACTIVITY_MARGIN_SECONDS (a
+    WARNING names both numbers); only a budget with nothing left raises ExtractionSetupError, before any call.
     """
     if llm_function is None:
         from app.services.llm import openrouter_chat_completion
@@ -474,10 +498,8 @@ async def extract_submission(
         config: ExtractionConfig = inputs["config_row"]["config"]
         prompt = await load_prompt_for_config(conn, config)
     llm = resolve_llm_settings(config, overrides)
-    if activity_budget_seconds is not None and llm["timeout"] + ACTIVITY_MARGIN_SECONDS > activity_budget_seconds:
-        raise ExtractionSetupError(
-            f"the effective LLM timeout ({llm['timeout']} s) does not fit the activity budget "
-            f"({activity_budget_seconds} s); set llm_timeout_seconds on the workflow step")
+    if activity_budget_seconds is not None:
+        llm["timeout"] = clamp_llm_timeout(llm["timeout"], activity_budget_seconds)
     prompt_version_id = prompt["id"]
     config_version_id = inputs["config_row"]["id"]
 

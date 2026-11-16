@@ -101,7 +101,7 @@ pytest tests -q --ignore=tests/unit_testing.py --ignore=tests/test_hf_thematic.p
 * **No setup is needed.** `tests/conftest.py` sets every setting the suite reads (`AUTH_TOKEN`, a `DATABASE_URL` that nothing listens on, the processing mode, the LLM and storage defaults, ...) before the app is imported, with `os.environ.setdefault`, so a fresh clone, CI and a developer machine behave alike and no test depends on your `.env`. A unit test can never reach a real database or the LLM.
 * **Real-Postgres tests are opt-in.** About one test in seven (every `tests/test_*_pg.py` file and the database parts of a few others) skip unless `FEEDBACK_TEST_DATABASE_URL` is set. It names a Postgres **server**, not a database to test in: any database on that server, with a role that has `CREATEDB`, for example `postgresql://postgres:postgres@localhost:5432/postgres`. For every test module that has such tests, `tests/pg_support.py` (through the module-scoped fixture in `tests/conftest.py`) creates a fresh, empty database `scratch_pg_<module>_<random>` on that server, points the module at it and drops it when the module is done. The destructive statements of the tests (`DELETE FROM config`, `DROP SCHEMA public`) can therefore only reach a database that the run itself created, and the modules are independent of each other and of their order. The database named in the URL is only used to connect and is never modified. If the role cannot create databases, or the server cannot be reached, the run stops at once with a message (the URL is never printed). A run that was killed can leave a `scratch_pg_*` database behind: drop it by hand.
 * **CI** (`.github/workflows/tests.yml`) runs the same command on every pull request and on pushes to `main` and `release-*`, against a `postgres:16` service container, and fails when any test was skipped (so a green run really exercised the Postgres tests).
-* **What not to run:** `tests/unit_testing.py` is the older harness; it is left out above because a run of it rewrites the tracked `tests/TEST_CASES.csv` (the `conftest.py` hook syncs each test's result into the sheet). Run it only on purpose, as `pytest tests/unit_testing.py`, and restore the sheet with `git checkout -- tests/TEST_CASES.csv` if you did not mean to change it. `tests/test_hf_thematic.py` needs the Hugging Face models and is not part of the CI run. Never point `FEEDBACK_TEST_DATABASE_URL` at a production server.
+* **What not to run:** `tests/unit_testing.py` is the older harness; it is left out above because a run of it rewrites the tracked `tests/TEST_CASES.csv` (the `conftest.py` hook syncs each test's result into the sheet). Run it only on purpose, as `pytest tests/unit_testing.py` (a run that names this file keeps your own `DATABASE_URL`: three of its tests, `test_storage_015`, `test_upload_003` and `test_upload_013`, reach that database through the upload route), and restore the sheet with `git checkout -- tests/TEST_CASES.csv` if you did not mean to change it. `tests/test_hf_thematic.py` needs the Hugging Face models and is not part of the CI run. Never point `FEEDBACK_TEST_DATABASE_URL` at a production server.
 
 ---
 
@@ -242,8 +242,8 @@ structure, so the settings that differ per bot are keys of the persona's active 
 Google Forms each have one): `adapter` (see above), `max_csv_upload_bytes` (size cap of one upload, 413 above it, checked before the file is
 stored; seeded 104857600), `ingestion_schema` (required / optional fields of the Kafka event, same structure as
 `STORY_KAFKA_SCHEMA`; an event that does not satisfy it goes to the DLQ), `process_steps` (steps run after ingestion,
-same format as `PROCESS_CONFIG_STORY`; seeded `[]`: extraction is opt-in because it is a paid LLM call per submission; an empty list means the
-submission is marked success at ingestion; turn extraction on per persona with the `set --key process_steps` line below) and the optional `expect_stages` (list of stage names; an upload then
+same format as `PROCESS_CONFIG_STORY`; the seed lists `feedback_metadata_extraction` for every upload config, so on a new database extraction (one paid LLM call per session)
+starts right after ingestion; a config with an empty list marks the submission success at ingestion; an existing database keeps its own list, change it with the `set --key process_steps` line below) and the optional `expect_stages` (list of stage names; an upload then
 reports, per stage that is neither expected nor a closing key, how many sessions carry it, in the upload response
 `stage_report` and in `csv_uploads.meta_data`; report-only, it never skips a session). A config that lacks one of the
 required keys (`adapter`, `max_csv_upload_bytes`, `ingestion_schema`, `process_steps`), or has one of the wrong type, is rejected with a clear message (400 on upload, DLQ in the
@@ -255,7 +255,7 @@ database keeps the config version it was seeded with: upgrade it once (next sect
 python tools/feedback_config.py show [--session-type Youth_Voice]
 python tools/feedback_config.py migrate --dry-run            # lists what would be added; then run without --dry-run
 python tools/feedback_config.py set --session-type Youth_Voice --source mitra --key max_csv_upload_bytes --value 50000000
-# turn metadata extraction ON for one persona (opt-in, one paid LLM call per submission); drop --dry-run to apply
+# turn metadata extraction ON for one persona of an existing database (new databases are seeded with it; one paid LLM call per submission); drop --dry-run to apply
 python tools/feedback_config.py set --session-type Youth_Voice --source mitra --key process_steps \
     --json '[{"name": "feedback_metadata_extraction"}]' --dry-run
 python tools/feedback_config.py set --session-type Youth_Voice --source mitra --key expect_stages --unset
@@ -264,6 +264,25 @@ python tools/feedback_config.py set --session-type Youth_Voice --source mitra --
 `show` and `set` also validate the adapter-related keys of the whole config (`adapter`, `column_map`, `completion_map`
 and the keys that belong to the other adapter): a problem shows under `adapter_config`, and `set --key adapter` refuses a
 switch the config would not survive. The startup health check logs the same problems as one ERROR per config.
+
+**Which config applies (one rule everywhere).** For a (tenant, source, session_type) the config of the session's **own
+program** wins; when that program has none, the tenant's **program-less default** config (`program_id` NULL) for the same
+source and persona is used; a config of **another program** is never used. The upload endpoints, the Kafka consumer's
+schema lookup, the process steps and the metadata extraction all follow it, so a program that only has the shared default
+can be uploaded to, ingested and extracted the same way. If more than one config is left at the winning level (a program
+with several session types and none named, or a tenant with the defaults of several personas and no own config) the upload
+is refused with 409 and an operator must disambiguate. The questionnaire versions follow it too: the windows of a default
+config relabel the sessions of the programs that have no config of their own for that source and persona, and never the
+sessions of a program that has one. The tools that edit a config (`set`, `migrate`, the version `set`) stay exact: they act
+on the one config row they are told, never on the fallback.
+
+**Operating notes.** A persona's settings are read in two places that do not see a change at the same moment. The upload
+endpoints read the active config on every request, so a change made with `tools/feedback_config.py set` applies to the next
+upload at once. The Kafka consumer caches each persona's settings (the ingestion schema, the adapter and the process steps,
+as loaded and validated by its config cache) for up to 60 seconds, so events consumed in the minute after a change can
+still be validated against the previous values (a config that was just fixed can still be reported invalid for that
+minute); after that the new ones apply without a restart. Tightening an `ingestion_schema` therefore does not take
+effect at once.
 
 ### Upgrading an existing database (created before `session_type`, questionnaire versions and adapters)
 

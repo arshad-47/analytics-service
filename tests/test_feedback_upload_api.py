@@ -366,7 +366,7 @@ def test_feedback_persona_without_mitra_config_rejected(client, monkeypatch):
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(leader_category="Educator"),
                        files=_files(_csv(rows)))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == ["No upload config for source 'mitra' is set up for Educator"]
+    assert resp.json()["errors"] == ["No upload config for source 'mitra' is set up for Educator: no config for this program and no program-less default"]
     _assert_nothing_stored(stores)
 
 
@@ -434,7 +434,7 @@ def test_feedback_unknown_but_safe_source_is_refused_only_for_lack_of_a_config(c
     stores = _patch_upload_pipeline(monkeypatch, active=None)
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(source="whatsapp"), files=_files())
     assert resp.status_code == 400 and resp.json()["errors"] == [
-        "No upload config for source 'whatsapp' is set up for Youth"]
+        "No upload config for source 'whatsapp' is set up for Youth: no config for this program and no program-less default"]
     stores.config.assert_awaited_once_with(PROGRAM["id"], "whatsapp", tenant_code="mitra")
     _assert_nothing_stored(stores)
 
@@ -563,7 +563,7 @@ def test_gforms_no_config_for_persona_rejected(client, monkeypatch):
     stores = _patch_upload_pipeline(monkeypatch, active=None)
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(source="google_forms"), files=_files(_gforms_csv()))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == ["No upload config for source 'google_forms' is set up for Youth"]
+    assert resp.json()["errors"] == ["No upload config for source 'google_forms' is set up for Youth: no config for this program and no program-less default"]
     _assert_nothing_stored(stores)
 
 
@@ -574,7 +574,7 @@ def test_gforms_educator_has_no_google_forms_config(client, monkeypatch):
     resp = client.post("/v1/upload/", headers=_headers(),
                        data=_form(source="google_forms", leader_category="Educator"), files=_files(_gforms_csv()))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == ["No upload config for source 'google_forms' is set up for Educator"]
+    assert resp.json()["errors"] == ["No upload config for source 'google_forms' is set up for Educator: no config for this program and no program-less default"]
     stores.config.assert_awaited_once_with(PERSONAS["Educator"]["program_id"], "google_forms", tenant_code="mitra")
     _assert_nothing_stored(stores)
 
@@ -1090,7 +1090,7 @@ def test_background_config_missing_on_hold(monkeypatch):
     h.run(file_bytes=GOOD_FILE)
     status, meta = h.final
     assert status == "on_hold"
-    assert meta["validation_errors"] == ["No upload config for source 'mitra' is set up for Youth"]
+    assert meta["validation_errors"] == ["No upload config for source 'mitra' is set up for Youth: no config for this program and no program-less default"]
 
 
 def test_background_db_error_on_hold(monkeypatch):

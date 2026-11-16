@@ -13,6 +13,7 @@ import pytest
 from fastapi import HTTPException
 
 import app.api.routes.uploads as uploads_routes
+import app.services.retry as retry_service
 import app.temporal.activities as activities
 from app.api.models.submissions import StepRetryRequest
 from app.config import settings
@@ -140,24 +141,28 @@ def test_pending_batch_activity_uses_the_persona_steps_for_feedback_and_settings
     asyncio.run(run())
 
 
-def test_failed_retry_activity_skips_a_feedback_submission_without_usable_steps(monkeypatch):
-    import app.database.operations as operations
+def test_bulk_retry_sweep_skips_a_feedback_submission_without_usable_steps(monkeypatch):
     rows = [
-        {"submission_id": "f1", "tenant_code": "mitra", "submission_type": "feedback", "process_status": None,
-         "session_id": "x", "updated_at": None},
-        {"submission_id": "f2", "tenant_code": "mitra", "submission_type": "feedback", "process_status": None,
-         "session_id": "y", "updated_at": None},
+        {"submission_id": "f1", "tenant_code": "mitra", "submission_type": "feedback", "status": "failed",
+         "process_status": None, "session_id": "x", "updated_at": None},
+        {"submission_id": "f2", "tenant_code": "mitra", "submission_type": "feedback", "status": "failed",
+         "process_status": None, "session_id": "y", "updated_at": None},
     ]
-    monkeypatch.setattr(operations, "fetch_retryable_failed_submissions", AsyncMock(return_value=rows))
+    monkeypatch.setattr(settings, "BATCH_SIZE", 100)
+    monkeypatch.setattr(retry_service, "fetch_retryable_submissions", AsyncMock(side_effect=[rows]))
+    monkeypatch.setattr(retry_service, "claim_submission_for_retry", AsyncMock(return_value={"retry_attempt": 1}))
     monkeypatch.setattr(ops, "get_feedback_process_steps",
                         AsyncMock(side_effect=[ValueError("no config"), [{"name": "feedback_metadata_extraction"}]]))
+    client = MagicMock()
+    client.start_workflow = AsyncMock()
+    monkeypatch.setattr(retry_service, "get_temporal_client", AsyncMock(return_value=client))
 
     async def run():
-        install_fake_db(monkeypatch, activities)
-        out = await activities.fetch_failed_submissions_activity({})
-        assert [r["submission_id"] for r in out] == ["f2"]
-        assert out[0]["process_steps"] == [{"name": "feedback_metadata_extraction"}]
+        install_fake_db(monkeypatch, retry_service)
+        await retry_service.dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
     asyncio.run(run())
+    assert [c.args[1]["submission_id"] for c in client.start_workflow.await_args_list] == ["f2"]
+    assert client.start_workflow.await_args.args[1]["process_steps"] == [{"name": "feedback_metadata_extraction"}]
 
 
 def test_pending_sweep_limit_zero_selects_nothing_and_a_missing_limit_uses_the_batch_size(monkeypatch):
@@ -298,56 +303,61 @@ class _CountingPool(FakePool):
 def test_bulk_retry_sweep_only_takes_a_connection_for_feedback_rows_and_reads_each_persona_once(monkeypatch):
     rows = [
         {"submission_id": "s1", "session_id": "x", "tenant_code": "mitra", "submission_type": "story",
-         "process_status": None, "updated_at": 1},
+         "status": "failed", "process_status": None, "updated_at": 1},
         {"submission_id": "f1", "session_id": "x", "tenant_code": "mitra", "submission_type": "feedback",
-         "process_status": None, "updated_at": 2},
+         "status": "failed", "process_status": None, "updated_at": 2},
         {"submission_id": "f2", "session_id": "y", "tenant_code": "mitra", "submission_type": "feedback",
-         "process_status": None, "updated_at": 3},
+         "status": "failed", "process_status": None, "updated_at": 3},
     ]
     monkeypatch.setattr(settings, "PROCESS_CONFIG_STORY", '[{"name": "story_step"}]')
     monkeypatch.setattr(settings, "BATCH_SIZE", 100)
-    monkeypatch.setattr(uploads_routes, "fetch_retryable_failed_submissions", AsyncMock(side_effect=[rows]))
+    monkeypatch.setattr(retry_service, "fetch_retryable_submissions", AsyncMock(side_effect=[rows]))
+    monkeypatch.setattr(retry_service, "claim_submission_for_retry", AsyncMock(return_value={"retry_attempt": 1}))
     client = MagicMock()
     client.start_workflow = AsyncMock()
-    monkeypatch.setattr(uploads_routes, "get_temporal_client", AsyncMock(return_value=client))
+    monkeypatch.setattr(retry_service, "get_temporal_client", AsyncMock(return_value=client))
     conn = _persona_conn({**mitra_config_v1("Youth"), "process_steps": [{"name": "feedback_metadata_extraction"}]})
     pool = _CountingPool(conn)
 
     async def run():
-        monkeypatch.setattr(uploads_routes.db, "pool", pool, raising=False)  # db.pool is per event loop
-        await uploads_routes._dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
+        monkeypatch.setattr(retry_service.db, "pool", pool, raising=False)  # db.pool is per event loop
+        await retry_service.dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
     asyncio.run(run())
 
-    assert pool.acquired == 2          # one for the page of rows, one for the config lookups of the feedback rows
+    # one connection for the page of rows, ONE for the config lookups of both feedback rows (not one per row), and
+    # one per dispatched row for the atomic retry claim (the shared retry service claims every row it dispatches)
+    assert pool.acquired == 1 + 1 + 3
     assert conn.calls["config"] == 1   # f1 and f2 share a persona
     assert client.start_workflow.await_count == 3
 
 
-def test_bulk_retry_sweep_with_only_story_rows_takes_one_connection(monkeypatch):
+def test_bulk_retry_sweep_with_only_story_rows_takes_no_connection_for_the_config(monkeypatch):
     rows = [{"submission_id": "s1", "session_id": "x", "tenant_code": "mitra", "submission_type": "story",
-             "process_status": None, "updated_at": 1}]
+             "status": "failed", "process_status": None, "updated_at": 1}]
     monkeypatch.setattr(settings, "PROCESS_CONFIG_STORY", '[{"name": "story_step"}]')
     monkeypatch.setattr(settings, "BATCH_SIZE", 100)
-    monkeypatch.setattr(uploads_routes, "fetch_retryable_failed_submissions", AsyncMock(side_effect=[rows]))
+    monkeypatch.setattr(retry_service, "fetch_retryable_submissions", AsyncMock(side_effect=[rows]))
+    monkeypatch.setattr(retry_service, "claim_submission_for_retry", AsyncMock(return_value={"retry_attempt": 1}))
     client = MagicMock()
     client.start_workflow = AsyncMock()
-    monkeypatch.setattr(uploads_routes, "get_temporal_client", AsyncMock(return_value=client))
+    monkeypatch.setattr(retry_service, "get_temporal_client", AsyncMock(return_value=client))
     pool = _CountingPool(FakeConn())
 
     async def run():
-        monkeypatch.setattr(uploads_routes.db, "pool", pool, raising=False)
-        await uploads_routes._dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
+        monkeypatch.setattr(retry_service.db, "pool", pool, raising=False)
+        await retry_service.dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
     asyncio.run(run())
-    assert pool.acquired == 1 and client.start_workflow.await_count == 1
+    assert pool.acquired == 1 + 1 and client.start_workflow.await_count == 1   # the page fetch + the claim, no config read
 
 
 # retry-step: a server-side config problem is a 409 -------------------------------------------------
 
 def test_retry_step_returns_409_when_the_persona_config_cannot_give_steps(monkeypatch):
-    row = {"submission_id": "f1", "session_id": "x", "status": "failed", "submission_type": "feedback",
-           "process_status": None}
-    monkeypatch.setattr(uploads_routes, "fetch_failed_submission_for_retry", AsyncMock(return_value=row))
-    monkeypatch.setattr(uploads_routes, "get_process_steps", AsyncMock(side_effect=ValueError("no config")))
+    row = {"submission_id": "f1", "session_id": "x", "tenant_code": "mitra", "status": "failed",
+           "submission_type": "feedback", "process_status": None}
+    monkeypatch.setattr(uploads_routes, "fetch_retryable_submission_for_retry", AsyncMock(return_value=row))
+    monkeypatch.setattr(retry_service, "get_process_steps", AsyncMock(side_effect=ValueError("no config")))
+    monkeypatch.setattr(uploads_routes, "get_temporal_client", AsyncMock(return_value=MagicMock()))
     body = StepRetryRequest(submission_id="f1", session_id="x", tenant_code="mitra")
 
     async def run():

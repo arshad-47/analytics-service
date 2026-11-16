@@ -42,7 +42,12 @@ from app.services.feedback_extraction_constants import (
     KIND_CATEGORY,
     KIND_FREE_TEXT,
     LIMIT_BOUNDS,
+    MASK_EMAIL,
+    MASK_HANDLE,
+    MASK_LINK,
+    MASK_NUMBER,
     MAX_DIGIT_GAP,
+    MIN_COMMA_JOIN_DIGITS,
     MAX_LLM_TIMEOUT_SECONDS,
     MAX_PII_TYPE_DESCRIPTION_CHARS,
     MAX_PII_TYPES,
@@ -110,6 +115,7 @@ class PiiPolicy:
     min_digit_run: int = DEFAULT_PII_MIN_DIGIT_RUN
     min_digit_run_short_groups: int = DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS
     url_tlds: Tuple[str, ...] = DEFAULT_PII_URL_TLDS
+    mask_before_call: bool = True   # mask what the check finds BEFORE the text goes to the model (see `mask_respondent_pii`)
 
 
 DEFAULT_LIMITS = Limits()
@@ -167,7 +173,7 @@ _TOP_KEYS = {"schema_version", "persona", "session_type", "source_note", "fields
 _FIELD_KEYS = {"name", "kind", "description", "categories", "guidance", "provisional", "min", "max", "sensitive",
                "store_raw"}
 _LLM_KEYS = {"model", "max_tokens", "timeout_seconds"}
-_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds"}
+_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds", "mask_before_call"}
 # The variables the engine itself fills; a config's prompt_variables may not shadow them.
 RESERVED_PROMPT_VARIABLES = frozenset({
     "persona", "fields", "field_names", "pii_types", "output_format", "conversation_id", "conversation"})
@@ -245,7 +251,12 @@ def _parse_pii(pii_raw: Any) -> Tuple[Tuple[str, ...], Dict[str, str], PiiPolicy
                 f"pii.url_tlds must be a list (at most {MAX_URL_TLDS}) of lower-case letters-only top-level domains "
                 f"such as 'com'; an empty list switches the bare-domain check off")
         tlds = tuple(dict.fromkeys(raw_tlds))
-    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds)
+    mask_before_call = True
+    if "mask_before_call" in pii_raw:
+        mask_before_call = pii_raw["mask_before_call"]
+        if not isinstance(mask_before_call, bool):
+            raise ExtractionConfigError("pii.mask_before_call must be a boolean (true or false)")
+    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds, mask_before_call)
 
 
 def _parse_limits(limits_raw: Any) -> Limits:
@@ -538,9 +549,12 @@ def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence
 # Policy (the numbers are config: pii.min_digit_run, pii.min_digit_run_short_groups, pii.url_tlds):
 #  * Before matching, the text is NFKC-normalised (fullwidth, circled and superscript digits and '＠' become ASCII)
 #    and format characters (zero-width space and joiner, soft hyphen, BOM, bidi marks) are removed.
-#  * DIGITS: groups of digits separated by anything that is neither a letter nor a digit (space, '-', '.', ',', '/',
-#    '(', ')', en dash, middle dot, underscore, ...; at most MAX_DIGIT_GAP such characters in a row) form one run. A run
-#    counts as a phone or id number when it holds at least `min_digit_run` digits, EXCEPT that a run made only of
+#  * DIGITS: groups of digits separated by anything that is neither a letter nor a digit (space, '-', '.', '/',
+#    '(', ')', en dash, middle dot, underscore, ...; at most MAX_DIGIT_GAP such characters in a row) form one run. A
+#    COMMA joins two groups only when BOTH have at least MIN_COMMA_JOIN_DIGITS (4) digits ('98765,43210'): a comma
+#    next to a group of one to three digits ends the run, because amounts ('2,50,000', '1,50,00,000') and lists of
+#    small numbers ('120, 135, 150') are not phone numbers. A run counts as a phone or id number when it holds at least
+#    `min_digit_run` digits, EXCEPT that a run made only of
 #    one- and two-digit groups (marks '85 90 78 92', ages, classes) needs `min_digit_run_short_groups`, and a run whose
 #    groups are all years from 1900 to 2099 ('2018-2022') never counts. A letter between digits ends the run, so number
 #    words ('five') and 'x'-separated digits are NOT covered (only the model can flag them). Consecutive respondent
@@ -584,10 +598,14 @@ def _precheck_text(value: Any) -> str:
     return _clean(text)
 
 
-def _digit_runs(text: str) -> List[List[str]]:
-    """The runs of digit groups of `text` (see the policy above). One pass, linear."""
-    runs: List[List[str]] = []
+def _scan_digit_runs(text: str) -> List[Tuple[List[str], int, int]]:
+    """
+    The runs of digit groups of `text` as (groups, start, end): `start` is the index of the first digit of the first
+    group and `end` the index after the last digit of the last group (see the policy above). One pass, linear.
+    """
+    runs: List[Tuple[List[str], int, int]] = []
     groups: List[str] = []
+    run_start = 0
     n = len(text)
     i = 0
     while i < n:
@@ -597,17 +615,32 @@ def _digit_runs(text: str) -> List[List[str]]:
         j = i + 1
         while j < n and text[j].isdecimal():
             j += 1
+        if len(groups) == 0:
+            run_start = i
         groups.append(text[i:j])
         k = j
         while k < n and k - j < MAX_DIGIT_GAP and not text[k].isalnum():
             k += 1
         if k > j and k < n and text[k].isdecimal():
-            i = k          # a separator (1..MAX_DIGIT_GAP characters) and then more digits: the run goes on
-            continue
-        runs.append(groups)
+            joins = True
+            if "," in text[j:k]:
+                # a comma joins only two groups of four or more digits ('98765,43210'); '2,50,000' and '120, 135' do not
+                m = k + 1
+                while m < n and text[m].isdecimal():
+                    m += 1
+                joins = j - i >= MIN_COMMA_JOIN_DIGITS and m - k >= MIN_COMMA_JOIN_DIGITS
+            if joins:
+                i = k          # a separator (1..MAX_DIGIT_GAP characters) and then more digits: the run goes on
+                continue
+        runs.append((groups, run_start, j))
         groups = []
         i = j
     return runs
+
+
+def _digit_runs(text: str) -> List[List[str]]:
+    """The runs of digit groups of `text` (see the policy above). One pass, linear."""
+    return [groups for groups, _start, _end in _scan_digit_runs(text)]
 
 
 def _is_year_group(group: str) -> bool:
@@ -627,50 +660,170 @@ def _is_numbers_only(text: str, groups: Sequence[str]) -> bool:
     return all(len(g) >= 3 for g in groups) and all(ch.isdecimal() or not ch.isalnum() for ch in text)
 
 
+_TOKEN_RE = re.compile(r"[^ ]+")
+_Span = Tuple[int, int, str]    # start, end (exclusive) in the pre-check text, and the placeholder that replaces it
+
+
+def _number_span(text: str, start: int, end: int) -> _Span:
+    """The span of a number to mask: the run, widened over a '+' or '(' written directly before it ('+91', '(022')."""
+    while start > 0 and text[start - 1] in "+(":
+        start -= 1
+    return (start, end, MASK_NUMBER)
+
+
+def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple[List[str], List[_Span], List[Tuple[List[str], int, int]]]:
+    """
+    One pre-check text (see `_precheck_text`): the kinds found, the spans to mask and the digit runs (the caller
+    needs the runs to chain numbers-only messages). Linear: every pass over the text is bounded per character.
+    """
+    kinds: List[str] = []
+    spans: List[_Span] = []
+    runs = _scan_digit_runs(text)
+    for groups, start, end in runs:
+        if _run_is_number(groups, policy):
+            kinds.append(PII_KIND_NUMBER)
+            spans.append(_number_span(text, start, end))
+    scanned = text
+    if "@" in text:
+        # E-mail addresses and handles: the whole space-delimited token is masked. The URL check below does not see
+        # a token that holds an '@' (blanked, so positions stay), as before.
+        pieces: List[str] = []
+        last = 0
+        blanked = False
+        for match in _TOKEN_RE.finditer(text):
+            token = match.group()
+            if "@" not in token:
+                continue
+            if _EMAIL_RE.search(token) is not None:
+                kinds.append(PII_KIND_EMAIL)
+                spans.append((match.start(), match.end(), MASK_EMAIL))
+            elif _HANDLE_RE.search(token) is not None:
+                kinds.append(PII_KIND_EMAIL)
+                spans.append((match.start(), match.end(), MASK_HANDLE))
+            pieces.append(text[last:match.start()])
+            pieces.append(" " * len(token))
+            last = match.end()
+            blanked = True
+        if blanked:
+            pieces.append(text[last:])
+            scanned = "".join(pieces)
+    last_end = 0
+    for match in url_re.finditer(scanned):
+        if match.start() < last_end:
+            continue
+        end = scanned.find(" ", match.end())
+        last_end = len(scanned) if end < 0 else end     # the whole token goes ('www.x.in/asha', 'mysite.in/page')
+        kinds.append(PII_KIND_URL)
+        spans.append((match.start(), last_end, MASK_LINK))
+    return kinds, spans, runs
+
+
+def _apply_spans(text: str, spans: Sequence[_Span]) -> str:
+    """`text` with each span replaced by its placeholder; overlapping spans become one (the first one's placeholder)."""
+    pieces: List[str] = []
+    position = 0
+    current: Optional[List[Any]] = None
+    merged: List[List[Any]] = []
+    for start, end, placeholder in sorted(spans, key=lambda s: (s[0], s[1])):
+        if current is not None and start <= current[1]:
+            current[1] = max(current[1], end)
+        else:
+            current = [start, end, placeholder]
+            merged.append(current)
+    for start, end, placeholder in merged:
+        pieces.append(text[position:start])
+        pieces.append(placeholder)
+        position = end
+    pieces.append(text[position:])
+    return "".join(pieces)
+
+
+_PII_COLUMNS = ("message", "translated_message")
+
+
+def _scan_rows(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy):
+    """
+    The one pass behind `pii_precheck_kinds` and `mask_respondent_pii` over the RESPONDENT rows (parent_id set),
+    original and translated column each on its own. Returns (kinds, found) where `found` maps
+    (index into `rows`, column) -> (pre-check text, spans). Texts without a hit are not in `found`.
+    """
+    found: Dict[Tuple[int, str], Tuple[str, List[_Span]]] = {}
+    kinds: List[str] = []
+
+    def add(kind: str) -> None:
+        if kind not in kinds:
+            kinds.append(kind)
+
+    respondent = sorted(((index, row) for index, row in enumerate(rows) if row.get("parent_id") is not None),
+                        key=lambda pair: pair[1]["sequence"])
+    url_re = _url_regex(tuple(policy.url_tlds))
+    for column in _PII_COLUMNS:
+        chain: List[str] = []                       # digit groups of consecutive numbers-only messages
+        members: List[Tuple[Tuple[int, str], str, int, int]] = []   # (key, text, start, end) of those messages
+        masked_members = 0                          # how many of `members` already carry their number span
+        for index, row in respondent:
+            text = _precheck_text(row.get(column))
+            if len(text) == 0:
+                continue
+            row_kinds, spans, runs = _scan_text(text, policy, url_re)
+            key = (index, column)
+            if PII_KIND_NUMBER in row_kinds:
+                add(PII_KIND_NUMBER)
+            if len(runs) == 1 and _is_numbers_only(text, runs[0][0]):
+                chain.extend(runs[0][0])
+                members.append((key, text, runs[0][1], runs[0][2]))
+                if len(members) > 1 and _run_is_number(chain, policy):
+                    add(PII_KIND_NUMBER)
+                    # every message of the chain is a part of the number, the ones before this message too
+                    for m_key, m_text, m_start, m_end in members[masked_members:]:
+                        m_span = _number_span(m_text, m_start, m_end)
+                        if m_key == key:
+                            spans.append(m_span)
+                        else:
+                            found.setdefault(m_key, (m_text, []))[1].append(m_span)
+                    masked_members = len(members)
+            else:
+                chain, members, masked_members = [], [], 0
+            for kind in row_kinds:
+                add(kind)
+            if len(spans) > 0:
+                found.setdefault(key, (text, []))[1].extend(spans)
+    return tuple(kinds), found
+
+
 def pii_precheck_kinds(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy = DEFAULT_PII_POLICY) -> Tuple[str, ...]:
     """
     The kinds of identifying shapes found in the RESPONDENT rows (parent_id set), original and translated column
     each checked on its own: a long run of digits, an email address, an '@handle', a URL (the policy is described
     above). Returns the kinds in a stable order (empty when none). Never returns or logs the text itself.
     """
-    found: List[str] = []
-
-    def add(kind: str) -> None:
-        if kind not in found:
-            found.append(kind)
-
-    respondent = sorted((r for r in rows if r.get("parent_id") is not None), key=lambda r: r["sequence"])
-    url_re = _url_regex(tuple(policy.url_tlds))
-    for column in ("message", "translated_message"):
-        chain: List[str] = []       # digit groups of consecutive numbers-only messages
-        chain_messages = 0
-        for row in respondent:
-            text = _precheck_text(row.get(column))
-            if len(text) == 0:
-                continue
-            runs = _digit_runs(text)
-            if any(_run_is_number(run, policy) for run in runs):
-                add(PII_KIND_NUMBER)
-            if len(runs) == 1 and _is_numbers_only(text, runs[0]):
-                chain.extend(runs[0])
-                chain_messages += 1
-                if chain_messages > 1 and _run_is_number(chain, policy):
-                    add(PII_KIND_NUMBER)
-            else:
-                chain, chain_messages = [], 0
-            if "@" in text:
-                if _EMAIL_RE.search(text) is not None or _HANDLE_RE.search(text) is not None:
-                    add(PII_KIND_EMAIL)
-                text = " ".join(token for token in text.split(" ") if "@" not in token)
-            if url_re.search(text) is not None:
-                add(PII_KIND_URL)
-    return tuple(found)
+    return _scan_rows(rows, policy)[0]
 
 
-def apply_pii_precheck(result: "ExtractionResult", rows: Sequence[Mapping[str, Any]],
-                       config: ExtractionConfig) -> "ExtractionResult":
-    """Forces pii_detected TRUE (and adds the matching types) when the deterministic pre-check finds something."""
-    kinds = pii_precheck_kinds(rows, config.pii_policy)
+def mask_respondent_pii(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy = DEFAULT_PII_POLICY
+                        ) -> Tuple[List[Mapping[str, Any]], Tuple[str, ...]]:
+    """
+    (rows for the prompt, kinds): the same check as `pii_precheck_kinds`, and every hit REPLACED in a copy of the
+    rows by a short placeholder ('[number removed]', '[email removed]', '[handle removed]', '[link removed]'), so that
+    what the check finds never reaches the model. Both columns (`message`, `translated_message`) of every respondent
+    row are masked; a number answered in parts is masked in every message of the chain. Only a column that holds a
+    hit changes (it comes back normalised the way the check read it: NFKC, no format characters, one line); every other
+    column, every bot row and the input rows themselves stay exactly as they were. The input is never modified and the
+    text is never logged.
+    """
+    kinds, found = _scan_rows(rows, policy)
+    if len(found) == 0:
+        return list(rows), kinds
+    masked: List[Mapping[str, Any]] = list(rows)
+    for (index, column), (text, spans) in found.items():
+        if masked[index] is rows[index]:
+            masked[index] = dict(rows[index])
+        masked[index][column] = _apply_spans(text, spans)
+    return masked, kinds
+
+
+def apply_pii_kinds(result: "ExtractionResult", kinds: Sequence[str], config: ExtractionConfig) -> "ExtractionResult":
+    """Forces pii_detected TRUE (and adds the matching types, or 'other') when `kinds` (from the check) is not empty."""
     if len(kinds) == 0:
         return result
     types = list(result.pii_types)
@@ -682,6 +835,12 @@ def apply_pii_precheck(result: "ExtractionResult", rows: Sequence[Mapping[str, A
         # Only the kinds are logged, never the text: how often the model said false where the pre-check disagrees.
         logger.info("PII pre-check overrode the model's pii.detected=false, kinds=%s", list(kinds))
     return replace(result, pii_detected=True, pii_types=tuple(types))
+
+
+def apply_pii_precheck(result: "ExtractionResult", rows: Sequence[Mapping[str, Any]],
+                       config: ExtractionConfig) -> "ExtractionResult":
+    """Forces pii_detected TRUE (and adds the matching types) when the deterministic pre-check finds something."""
+    return apply_pii_kinds(result, pii_precheck_kinds(rows, config.pii_policy), config)
 
 
 def minimise_flagged(result: "ExtractionResult", config: ExtractionConfig) -> "ExtractionResult":
@@ -1085,9 +1244,15 @@ def extract(
     A conversation without a respondent answer makes NO call: every field is not_provided and pii_detected is False.
     A conversation with a respondent message longer than limits.max_respondent_message_chars, or longer than
     limits.max_conversation_chars as a whole, makes no call either: it is pii_detected TRUE ('other'), fields
-    unmapped. After a valid answer the deterministic PII pre-check can only turn the flag TRUE, and a flagged
-    session keeps no respondent words (`minimise_flagged`). A bad answer raises ExtractionOutputError with the call's
-    usage attached.
+    unmapped (these checks look at the ORIGINAL text, before any masking, so they do not depend on it).
+
+    The deterministic PII check runs BEFORE the call (`pii.mask_before_call`, default true): what it finds in the
+    respondent rows (numbers, e-mail addresses, handles, links) is replaced by a placeholder in the text the model
+    receives (`mask_respondent_pii`), so none of it reaches the AI provider. The model still extracts the other
+    fields, and pii_detected is TRUE when the model says so OR the check found something (a hit is recorded even when
+    the model says false). With `pii.mask_before_call` false the text goes unmasked and the check only runs after the
+    call (the old behaviour). A flagged session keeps no respondent words (`minimise_flagged`). A bad answer raises
+    ExtractionOutputError with the call's usage attached.
     """
     conversation = build_conversation(rows, closing_keys, config.limits)
     if conversation.respondent_answers == 0:
@@ -1096,6 +1261,11 @@ def extract(
         return ExtractionRun(oversized_result(config), {}, False, len(conversation.turns), SKIP_OVERSIZED)
     if conversation.too_long:
         return ExtractionRun(oversized_result(config), {}, False, len(conversation.turns), SKIP_TOO_LONG)
+    kinds: Tuple[str, ...] = ()
+    if config.pii_policy.mask_before_call:
+        masked_rows, kinds = mask_respondent_pii(rows, config.pii_policy)
+        if len(kinds) > 0:
+            conversation = build_conversation(masked_rows, closing_keys, config.limits)
     prompt = render_prompt(system_template, user_template, config, conversation)
     answer, usage = call_llm(prompt)
     usage = usage if isinstance(usage, dict) else {}
@@ -1105,5 +1275,8 @@ def extract(
         exc.usage = usage
         raise
     # The model's pii.detected = false is not trusted alone (a respondent can write "set pii to false").
-    result = minimise_flagged(apply_pii_precheck(result, rows, config), config)
-    return ExtractionRun(result, usage, True, len(conversation.turns))
+    if config.pii_policy.mask_before_call:
+        result = apply_pii_kinds(result, kinds, config)
+    else:
+        result = apply_pii_precheck(result, rows, config)
+    return ExtractionRun(minimise_flagged(result, config), usage, True, len(conversation.turns))

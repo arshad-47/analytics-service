@@ -158,7 +158,7 @@ def feedback_identifier_problems(event: dict, *, create: bool) -> list:
         value, found = _get_nested(event, path)
         if found and not _is_empty(value) and not is_safe_id(_id_text(value)):
             problems.append(
-                f"'{path}' must be 1 to 128 characters of letters, digits, '.', '_', ':' and '-' (no spaces or control "
+                f"'{path}' must be 1 to 128 characters of letters, digits, '.', '_', ':', ',' and '-' (no spaces or control "
                 f"characters)"
             )
     tenant, found = _get_nested(event, "tenantCode")

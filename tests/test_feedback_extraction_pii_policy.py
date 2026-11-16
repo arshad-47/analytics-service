@@ -184,6 +184,69 @@ def test_a_gap_of_more_than_three_separator_characters_ends_the_run():
     assert _kinds("98765-.-.43210") == ()                       # four
 
 
+# ------------------------------------------------------------------------------------------------ commas: amounts and lists
+
+@pytest.mark.parametrize("text", [
+    "Fees 2,50,000-3,00,000",
+    "School got 1,50,00,000 grant",
+    "Students 120, 135, 150, 160",
+    "Rs 2,50,000 to 3,00,000 per year", "Rs 12,34,56,789 crore", "1,23,45,678", "12,345,678", "1,234,567,890",
+    "marks 120,135,150,160", "classes 6, 7, 8, 9, 10, 11, 12", "ages 10, 12, 14, 16, 18, 20",
+    "२,५०,०००-३,००,०००",                    # Devanagari digits with Indian grouping
+    "१,५०,००,०००",
+    "Fees 2,​50,​000-3,​00,​000",          # zero-width space after the commas
+    "Fees ２，５０，０００－３，００，０００",      # fullwidth digits and commas
+    "Students １２０，１３５，１５０，１６０",
+    "Students 120 ,135 ,150 ,160",           # a comma next to a space
+    "2500, 120, 3000, 150",                  # a short group on either side of the comma
+])
+def test_a_comma_next_to_a_group_of_one_to_three_digits_ends_the_run(text):
+    assert _kinds(text) == (), text
+
+
+@pytest.mark.parametrize("text", [
+    "98765,43210",
+    "call 98765,43210",
+    "98765, 43210",
+    "9876,54321",
+    "98765 , 43210",
+    "９８７６５，４３２１０",                   # fullwidth digits and comma
+    "९८७६५,४३२१०",                        # Devanagari digits
+    "98765,​43210",                        # zero-width space after the comma
+    "9876543210,9876543211",
+])
+def test_a_comma_between_two_groups_of_four_or_more_digits_still_joins_them(text):
+    assert fx.PII_KIND_NUMBER in _kinds(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "98765 43210", "+91-98765-43210", "98 76 54 32 10", "987 654 3210", "080 2345 6789", "9876543210",
+    "98765.43210", "98765/43210", "98765–43210", "98765—43210", "98765·43210", "(022) 2345 6789", "12/03/2010",
+    "९८७६५ ४३२१०", "９８７６５ ４３２１０", "98765​43210", "9 8 7 6 5 4 3 2 1 0",
+])
+def test_every_other_separator_still_joins_digit_groups(text):
+    assert fx.PII_KIND_NUMBER in _kinds(text), text
+
+
+def test_a_run_ended_by_a_comma_does_not_hide_a_real_number_next_to_it():
+    assert fx.PII_KIND_NUMBER in _kinds("Fees 2,50,000 and my phone 98765 43210")
+    assert fx.PII_KIND_NUMBER in _kinds("120, 135, 9876543210")
+    assert _kinds("2018-2022, 85 90 78 92") == ()
+
+
+def test_the_digit_runs_of_an_amount_and_of_a_number_with_a_comma():
+    assert fx._digit_runs("2,50,000-3,00,000") == [["2"], ["50"], ["000", "3"], ["00"], ["000"]]
+    assert fx._digit_runs("120, 135, 150") == [["120"], ["135"], ["150"]]
+    assert fx._digit_runs("98765,43210") == [["98765", "43210"]]
+    assert fx._digit_runs("98765, 43210 x 12") == [["98765", "43210"], ["12"]]
+    assert fx._digit_runs("1234,12") == [["1234"], ["12"]]
+
+
+def test_a_date_of_birth_is_still_flagged_as_a_number():
+    assert fx.PII_KIND_NUMBER in _kinds("12/03/2010")
+    assert fx.PII_KIND_NUMBER in _kinds("12-03-2010")
+
+
 # ------------------------------------------------------------------------------------------------ A12: config policy
 
 def _config_with(**extra):

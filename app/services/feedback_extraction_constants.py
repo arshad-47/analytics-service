@@ -61,12 +61,21 @@ MAX_PII_TYPES = 20   # structural: the most `pii.types` entries a model answer m
 # A run of digits (any characters that are neither letters nor digits between the groups, at most MAX_DIGIT_GAP in a
 # row) with at least `pii.min_digit_run` digits is treated as a phone or id number whatever the model says. A run made
 # only of groups of one or two digits (marks, ages, classes) needs `pii.min_digit_run_short_groups` digits instead; a
-# run whose groups are all years (1900-2099, '2018-2022') never counts. Ages, years, classes and 4-7 digit amounts pass.
+# run whose groups are all years (1900-2099, '2018-2022') never counts. Ages, years, classes and 4-7 digit amounts pass,
+# and a comma next to a group of one to three digits ends a run (MIN_COMMA_JOIN_DIGITS).
 DEFAULT_PII_MIN_DIGIT_RUN = 8
 DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS = 10
 PII_DIGIT_RUN_BOUNDS = (4, 30)
 MAX_DIGIT_GAP = 3
+# A comma joins two digit groups into one run only when both have at least this many digits ('98765,43210'); next to a
+# group of one to three digits it ends the run, so Indian-format amounts ('2,50,000') and lists ('120, 135') pass.
+MIN_COMMA_JOIN_DIGITS = 4
 YEAR_MIN, YEAR_MAX = 1900, 2099
+# What the PII masking puts in the text sent to the model in place of what the check found (pii.mask_before_call).
+MASK_NUMBER = "[number removed]"
+MASK_EMAIL = "[email removed]"
+MASK_HANDLE = "[handle removed]"
+MASK_LINK = "[link removed]"
 # A bare `name.tld` in respondent text is read as a web address when the tld is one of these (config pii.url_tlds).
 DEFAULT_PII_URL_TLDS: Tuple[str, ...] = (
     "com", "in", "org", "net", "co", "io", "me", "edu", "gov", "app", "link", "ly", "tv", "info")

@@ -196,8 +196,9 @@ class ConfigDrivenProcessingWorkflow:
 
                 elif step_name in FEEDBACK_PROCESS_STEP_NAMES:      # the registry the config validator uses (today: the extraction step)
                     # The activity budget follows the effective LLM timeout (the step's llm_timeout_seconds, else the
-                    # global one) plus a margin, bounded; the activity itself refuses a configured llm timeout that
-                    # does not fit (a deterministic, non-retryable failure).
+                    # global one) plus a margin, bounded (workflow code cannot read the extraction config); the activity
+                    # clamps a longer `llm.timeout_seconds` of that config to the budget and logs a warning. A step
+                    # that needs a longer call sets llm_timeout_seconds.
                     step_llm_timeout = llm_overrides["llm_timeout_seconds"]
                     effective_llm_timeout = step_llm_timeout if step_llm_timeout is not None else settings.LLM_TIMEOUT_SECONDS
                     res = await workflow.execute_activity(

@@ -228,7 +228,7 @@ a { color: var(--accent); }
       <ul>
         <li>The consumer checks the event again against <code>ingestion_schema</code> (cached for 60 seconds, so a burst does not query per event).</li>
         <li>It writes <code>submissions</code>, <code>feedback_submissions</code> and <code>feedbacks</code> in one transaction. A session that grew gets its <code>pii_detected</code> reset to NULL and goes back to pending.</li>
-        <li>It reads <code>process_steps</code>. An empty list marks the session <code>success</code> right away, which is the default. Extraction runs only for personas where the step is listed.</li>
+        <li>It reads <code>process_steps</code>. An empty list marks the session <code>success</code> right away. The seed lists the extraction step for every persona, so on a new database each ingested session starts the workflow; an existing database keeps the list it has.</li>
       </ul>
       <p class="reads"><b>Reads:</b> <code>ingestion_schema</code>, <code>process_steps</code></p>
     </div>
@@ -243,8 +243,8 @@ a { color: var(--accent); }
       <h3>Extract</h3><div class="steps">STEPS 11 TO 14</div>
       <ul>
         <li>The activity loads the whole conversation in order, the Youth extraction config, and the prompt named in that config.</li>
-        <li>One call to OpenRouter returns JSON with the persona's fields and a PII flag. Code validates it strictly: values must fit the configured bands or the integer range, placeholders such as "N/A" become not provided, anything else is stored as unmapped with the raw words kept.</li>
-        <li>Code adds a PII backstop: a long run of digits (8 or more; separators and Unicode digits normalised, year ranges and short lists of numbers excepted), an email, an @handle or a URL forces the flag on, whatever the model said. A flagged session keeps no respondent words.</li>
+        <li>Before the call, code looks in the respondent's text for numbers, emails, @handles and links and replaces each with a placeholder such as <code>[number removed]</code>, so none of them is sent to OpenRouter. One call to OpenRouter then returns JSON with the persona's fields and a PII flag. Code validates it strictly: values must fit the configured bands or the integer range, placeholders such as "N/A" become not provided, anything else is stored as unmapped with the raw words kept.</li>
+        <li>The same check is the PII backstop: a long run of digits (8 or more; separators and Unicode digits normalised; year ranges, amounts such as 2,50,000 and lists of small numbers excepted), an email, an @handle or a URL forces the flag on, whatever the model said. A flagged session keeps no respondent words.</li>
         <li>One transaction writes <code>feedback_extracted_data</code>, <code>pii_detected</code>, <code>meta_data.extraction</code> and <code>llm_logs</code>. If the conversation changed during the call, nothing is written and the step retries.</li>
       </ul>
       <p class="reads"><b>Reads:</b> <code>fields</code>, <code>pii.types</code>, <code>llm</code>, <code>prompt_name</code>, the prompt text</p>
@@ -401,6 +401,7 @@ a { color: var(--accent); }
     <div><b>Bad session in a file</b>Goes to the DLQ topic with its identifiers. The other sessions continue.</div>
     <div><b>Config missing or invalid</b>The event is dead-lettered with a hint to run <code>feedback_config.py migrate</code> (or <code>migrate-legacy</code> for a database created before <code>session_type</code> existed) and replay it. A stored session is marked failed, not retried in a loop.</div>
     <div><b>Session grew during the model call</b>The write is refused and the step retries on the new content. The PII flag is never left from older text.</div>
+    <div><b>LLM timeout longer than the activity allows</b>A timeout set in the extraction config that does not fit the activity time limit is shortened to fit (a warning names both numbers); the run is not refused. Set <code>llm_timeout_seconds</code> on the workflow step for a longer call.</div>
     <div><b>Model or provider error</b>Provider text is stripped from errors and logs. Temporal retries up to 3 times, then the step fails.</div>
     <div><b>Very long respondent message</b>Over the configured limit (default 20,000 characters per message, 200,000 per conversation): no model call, the session is flagged PII and its fields are stored as unmapped.</div>
   </div>

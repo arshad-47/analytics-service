@@ -12,6 +12,7 @@ import csv
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
@@ -23,7 +24,17 @@ from unittest.mock import AsyncMock, MagicMock
 # own values. `setdefault` keeps a value that was set on purpose in the shell (for example a different AUTH_TOKEN).
 # DATABASE_URL is a DSN nothing listens on, so a unit test can never reach a real database by accident (the opt-in
 # PG tests use the scratch databases of tests/pg_support.py instead).
+#
+# One exception: the old harness (tests/unit_testing.py) has three tests (test_storage_015, test_upload_003,
+# test_upload_013) that go through the upload route and reach the database of the DATABASE_URL the developer
+# configured (.env or shell). When the invocation targets that file, DATABASE_URL is left alone so they keep working
+# exactly as before; every other default still applies. KEEP_DATABASE_URL_ENV_VAR=1 does the same for any run.
 # ---------------------------------------------------------------------------
+KEEP_DATABASE_URL_ENV_VAR = "ANALYTICS_TEST_KEEP_DATABASE_URL"
+OLD_HARNESS_FILE = "unit_testing.py"
+# pytest options whose NEXT argument is a path / test id that must not count as "the invocation targets this file"
+_OPTIONS_TAKING_A_PATH_TO_LEAVE_OUT = ("--ignore", "--ignore-glob", "--deselect")
+
 TEST_ENVIRONMENT = {
     "AUTH_TOKEN": "test-token",
     "DATABASE_URL": "postgresql://test:test@127.0.0.1:1/unit_tests_never_connect",
@@ -48,7 +59,37 @@ TEST_ENVIRONMENT = {
     "STORAGE_PRIVATE_BUCKET": "",
     "LOG_LEVEL": "INFO",
 }
-for _name, _value in TEST_ENVIRONMENT.items():
+
+
+def invocation_targets_old_harness(argv, environ=None) -> bool:
+    """
+    True when the pytest invocation selects tests/unit_testing.py: an argument (a path, optionally `::test_id`) whose
+    file name is unit_testing.py, other than the value of --ignore / --ignore-glob / --deselect (so
+    `pytest tests --ignore=tests/unit_testing.py` is NOT such an invocation), or KEEP_DATABASE_URL_ENV_VAR set to 1.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get(KEEP_DATABASE_URL_ENV_VAR) == "1":
+        return True
+    previous = ""
+    for arg in argv:
+        value_of_a_leave_out_option = previous in _OPTIONS_TAKING_A_PATH_TO_LEAVE_OUT
+        previous = arg
+        if arg.startswith("-") or value_of_a_leave_out_option:
+            continue
+        if os.path.basename(arg.split("::", 1)[0]) == OLD_HARNESS_FILE:
+            return True
+    return False
+
+
+def environment_defaults_for(argv, environ=None) -> dict:
+    """The defaults to `setdefault` for this invocation: TEST_ENVIRONMENT, without DATABASE_URL for the old harness."""
+    defaults = dict(TEST_ENVIRONMENT)
+    if invocation_targets_old_harness(argv, environ):
+        del defaults["DATABASE_URL"]
+    return defaults
+
+
+for _name, _value in environment_defaults_for(sys.argv[1:]).items():
     os.environ.setdefault(_name, _value)
 
 import pytest

@@ -3,7 +3,8 @@ Real-Postgres tests of the SCOPING of the feedback lookups and operator tools (a
 everything is keyed on (tenant, program, session_type, source), because a persona key (session_type) is not unique
 across the programs of a tenant, a source is a free label and a tenant can reuse a persona name. A lookup that matches
 more than one row refuses (AmbiguousFeedbackConfigError, a ValueError) instead of guessing, and nothing silently falls
-back to another program's, tenant's or source's config.
+back to another program's, tenant's or source's config. The ONE fallback is the tenant's PROGRAM-LESS default config
+for the same source and persona, when the session's own program has no config (tests/test_feedback_config_fallback_pg.py).
 
 Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards). The file applies schema.sql, creates the tenant 'mitra', runs the real seed, and builds the fictitious
 second program / second tenant / second source of each case with plain INSERTs. Synthetic data only.
@@ -45,7 +46,8 @@ pytestmark = pytest.mark.skipif(
 PARENT = PERSONAS["Parent"]
 YOUTH = PERSONAS["Youth"]
 EDUCATOR = PERSONAS["Educator"]
-STEP = [{"name": FEEDBACK_METADATA_EXTRACTION_STEP}]
+STEP = [{"name": FEEDBACK_METADATA_EXTRACTION_STEP, "max_tokens": 777}]   # a second program's own steps: differ from the seed
+SEEDED_PARENT_STEPS = load_seed_config("feedback_upload", "mitra", "Parent_Voice")["process_steps"]
 V2_TEXT = "2026-11-03T00:00:00+00:00"
 
 
@@ -220,20 +222,33 @@ def test_process_steps_come_from_the_submissions_own_program_and_never_from_anot
         p1, p2, _, _ = await _two_programs_one_persona(conn)
         s1 = await _session(conn, p1, "Parent_Voice", "mitra", "V1", _at(2026, 11, 5, 9, 0, 0))
         s2 = await _session(conn, p2, "Parent_Voice", "mitra", "V1", _at(2026, 11, 5, 9, 0, 0))
-        assert await get_feedback_process_steps(conn, s1, "mitra") == []
+        assert await get_feedback_process_steps(conn, s1, "mitra") == SEEDED_PARENT_STEPS
         assert await get_feedback_process_steps(conn, s2, "mitra") == STEP
 
-        # a third program of the same tenant with the same persona key but NO config of its own: it used to run the
-        # steps of some other program's config; now it is an operator error that names the program
+        # a third program of the same tenant with the same persona key but NO config of its own and no program-less
+        # default of the tenant: it used to run the steps of some other program's config; now it is an operator error
+        # that names the program and the missing default
         p3 = await _program(conn, "mitra", "Unconfigured", "Parent")
         s3 = await _session(conn, p3, "Parent_Voice", "mitra", "V1", _at(2026, 11, 5, 9, 0, 0))
-        with pytest.raises(ValueError, match="No active mitra feedback_upload config .*" + p3["program_id"]):
+        with pytest.raises(ValueError, match="No active mitra feedback_upload config .*" + p3["program_id"]
+                           + ".*no program-less default"):
             await get_feedback_process_steps(conn, s3, "mitra")
 
         # the same for a program whose program row was deleted (submissions.program_id SET NULL)
         await conn.execute("UPDATE submissions SET program_id = NULL WHERE submission_id = $1", s3)
         with pytest.raises(ValueError, match="No active mitra feedback_upload config"):
             await get_feedback_process_steps(conn, s3, "mitra")
+
+        # ... and once the tenant has a program-less default for the persona, that default (never another program's
+        # config) serves the programs without one of their own
+        default_id = factories.uid()
+        await conn.execute(
+            "INSERT INTO config (id, config_source, name, config_type, program_id, tenant_code, session_type) "
+            "VALUES ($1::uuid, 'mitra', 'default', 'feedback_upload', NULL, 'mitra', 'Parent_Voice')", default_id)
+        await conn.execute(
+            "INSERT INTO config_version (config_id, version, is_active, config) VALUES ($1::uuid, 1, TRUE, $2::jsonb)",
+            default_id, json.dumps(_config(process_steps=STEP)))
+        assert await get_feedback_process_steps(conn, s3, "mitra") == STEP
     _run(body)
 
 
@@ -243,7 +258,7 @@ def test_the_persona_memo_is_keyed_by_program_too():
         s1 = await _session(conn, p1, "Parent_Voice", "mitra", "V1", _at(2026, 11, 5, 9, 0, 0))
         s2 = await _session(conn, p2, "Parent_Voice", "mitra", "V1", _at(2026, 11, 5, 9, 0, 0))
         memo = {}
-        assert await get_feedback_process_steps(conn, s1, "mitra", memo) == []
+        assert await get_feedback_process_steps(conn, s1, "mitra", memo) == SEEDED_PARENT_STEPS
         assert await get_feedback_process_steps(conn, s2, "mitra", memo) == STEP
         assert len(memo) == 2
     _run(body)

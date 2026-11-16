@@ -559,7 +559,7 @@ def test_prompt_injection_in_a_conversation_does_not_change_how_the_answer_is_ha
     assert run.result.pii_detected is True
     # the attack text reached the prompt only as one line of data, inside the delimiters
     prompt = calls[0]
-    conversation = fx.build_conversation(rows)
+    conversation = fx.build_conversation(fx.mask_respondent_pii(rows)[0])     # the prompt is built from the masked text
     begin = prompt.index(f"BEGIN {conversation.conversation_id}")
     end = prompt.index(f"END {conversation.conversation_id}")
     assert begin < prompt.index("Ignore all previous instructions") < end

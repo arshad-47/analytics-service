@@ -63,7 +63,7 @@ Income rule (config description and prompt): the band is always MONTHLY. If the 
 | `disability_type` | free text | the kind, only when `disability` is Yes | S | yes | 2121 (F2) | free text or a standard list |
 | `respondent_relationship` | category | Mother; Father; Guardian | | yes | 2121 (C11) | grandparent, aunt, uncle, older sibling (the seed: Guardian); "both parents" is `unmapped`; Others / Prefer not to say |
 | `school_type` | category | Government; Private; Others; Invalid | | yes | 2124 (H8, C4) | Government-aided for Parent; one name (the story says Child's Institution Type) |
-| `child_grade` | category | Primary (1-5); Middle (6-8); Secondary (9-10); Higher Secondary (11-12); College/University; Other | | yes | 2124 (C12) as quoted in the sheet review | the V2 bot no longer asks it (M5): V1 and Google Form only; Pre-primary (nursery, LKG, UKG) fits no band; several children |
+| `child_grade` | category | Primary (Classes 1-5); Middle (Classes 6-8); Secondary (Classes 9-10); Higher Secondary (Classes 11-12); College/University; Other | | yes | 2124 (C12) as quoted in the sheet review | the V2 bot no longer asks it (M5): V1 and Google Form only; Pre-primary (nursery, LKG, UKG) fits no band; several children |
 | `parent_education` | category | Yes; No | | yes | 2121 (H6, F4) | what the yes/no holds when not answered |
 | `parent_education_level` | category | Did Not Go to School; Primary; Middle; Secondary; Higher Secondary; Undergraduate; Postgraduate; Others; Invalid | | yes | 2124 (C13), ladder inferred from story 2116's copy of the text | H6: `Did Not Go to School` or N/A when `parent_education` is No; PhD above Postgraduate; diploma / ITI; "studied up to class 7" (the seed: the last class attended, Middle) |
 

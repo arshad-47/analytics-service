@@ -19,7 +19,7 @@ import pytest
 import pg_support
 
 from app.config import settings
-from seed_support import SEED_UPLOAD_CONFIG_COUNT, seed_config
+from seed_support import SEED_UPLOAD_CONFIG_COUNT, load_seed_config, seed_config
 
 _TOOL = Path(__file__).resolve().parent.parent / "tools" / "feedback_config.py"
 _spec = importlib.util.spec_from_file_location("feedback_config_cli", _TOOL)
@@ -295,7 +295,8 @@ def test_show_prints_the_seeded_settings(scratch, capsys):
     configs = _json(capsys)["configs"]
     assert [(c["source"], c["config_version"]) for c in configs] == [("google_forms", 1), ("mitra", 1)]
     for c in configs:
-        assert c["max_csv_upload_bytes"] == 104857600 and c["process_steps"] == []
+        assert c["max_csv_upload_bytes"] == 104857600
+        assert c["process_steps"] == load_seed_config("feedback_upload", c["source"], "Youth_Voice")["process_steps"]
         assert c["problems"] == {} and c["expect_stages"] is None
     assert cli.main(["show"]) == 0
     assert len(_json(capsys)["configs"]) == SEED_UPLOAD_CONFIG_COUNT

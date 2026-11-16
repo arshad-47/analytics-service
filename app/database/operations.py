@@ -811,7 +811,7 @@ async def insert_or_update_submission(
         if sub_date_str:
             submission_date = datetime.fromisoformat(sub_date_str.replace("Z", "+00:00"))
         elif event_type != "update":
-            submission_date = datetime.utcnow()
+            submission_date = datetime.now(timezone.utc)
         else:
             submission_date = None
 
@@ -1684,6 +1684,17 @@ async def copy_parent_analysis_results(
         return 0
 
 
+def _as_datetime(value: Any) -> Any:
+    """An ISO-8601 string (a trailing 'Z' means UTC, which datetime.fromisoformat only accepts from Python 3.11) as a
+    datetime; anything else (a datetime, None) unchanged."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    return value
+
+
 async def fetch_retryable_submissions(
     conn: asyncpg.Connection,
     tenant_code: Optional[str] = None,
@@ -1705,10 +1716,10 @@ async def fetch_retryable_submissions(
         from app.config import settings
         stuck_processing_min_age_minutes = settings.STUCK_PROCESSING_MIN_AGE_MINUTES
 
-    cutoff_dt = datetime.fromisoformat(failed_before) if isinstance(failed_before, str) else failed_before
-    # BulkStepRetryWorkflow hands the cursor back as the ISO string of the last page's `updated_at` (activity results
-    # are JSON); asyncpg only accepts a datetime for a timestamptz parameter.
-    cursor_dt = datetime.fromisoformat(cursor_updated_at) if isinstance(cursor_updated_at, str) else cursor_updated_at
+    # The cutoff and the keyset cursor may arrive as ISO strings (an API / JSON hand-off); asyncpg only accepts a
+    # datetime for a timestamptz parameter.
+    cutoff_dt = _as_datetime(failed_before)
+    cursor_dt = _as_datetime(cursor_updated_at)
     rows = await conn.fetch(
         """
         SELECT submission_id, session_id, tenant_code, submission_type, status,

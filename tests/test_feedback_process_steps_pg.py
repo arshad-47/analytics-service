@@ -27,7 +27,7 @@ from app.database.feedback_operations import (
     set_questionnaire_version,
 )
 from app.database.operations import insert_or_update_submission
-from seed_support import FEEDBACK_PROGRAM_NAME, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, load_seed_config, seed_config
 from app.services.feedback_constants import (
     DEFAULT_INGESTION_SCHEMA,
     DEFAULT_MAX_CSV_UPLOAD_BYTES,
@@ -40,7 +40,7 @@ pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
 YOUTH = PERSONAS["Youth"]
-STEPS = []  # the seed / migrate default: extraction is opt-in (an LLM call per submission)
+STEPS = load_seed_config("feedback_upload", "mitra", "Youth_Voice")["process_steps"]  # what the seed ships (the extraction step)
 SEEDED_CONFIGS = SEED_UPLOAD_CONFIG_COUNT   # the upload configs of the seed (one per persona and source)
 
 
@@ -115,6 +115,8 @@ async def _strip_keys(conn, *keys):
 
 from app.database.feedback_config_health import check_feedback_configs
 import app.temporal.activities as activities
+import app.services.retry as retry_service
+from unittest.mock import AsyncMock, MagicMock
 
 
 async def _insert_story(conn, submission_id, created_at):
@@ -156,7 +158,7 @@ def test_batch_sweep_still_returns_feedback_rows_of_healthy_personas_and_isolate
         await insert_or_update_submission(conn, parent_event)                      # Parent, broken below
         await _remove_key_from_active_config(conn, "Parent_Voice", "mitra", "process_steps")
         rows = await activities.fetch_pending_submissions_activity({"limit": 10})
-        assert [(r["submission_id"], r["process_steps"]) for r in rows] == [(good, [])]
+        assert [(r["submission_id"], r["process_steps"]) for r in rows] == [(good, STEPS)]
         statuses = {r["submission_id"]: r["status"] for r in await conn.fetch("SELECT submission_id, status FROM submissions")}
         assert statuses[good] == "pending" and statuses[parent_event["submissionId"]] == "failed"
     _run(body)
@@ -168,9 +170,20 @@ def test_failed_sweep_skips_a_feedback_row_with_a_bad_config_and_keeps_the_story
         bad = await _store(conn)
         await conn.execute("UPDATE submissions SET status = 'failed', updated_at = now() - interval '1 day'")
         await _remove_key_from_active_config(conn, "Youth_Voice", "mitra", "process_steps")
-        rows = await activities.fetch_failed_submissions_activity({"limit": 10})
-        assert [r["submission_id"] for r in rows] == ["story-failed"]
-        assert bad not in [r["submission_id"] for r in rows]
+        client = MagicMock()
+        client.start_workflow = AsyncMock()
+        original = retry_service.get_temporal_client
+        retry_service.get_temporal_client = AsyncMock(return_value=client)
+        try:
+            result = await retry_service.dispatch_all_retry_workflows(None)
+        finally:
+            retry_service.get_temporal_client = original
+        started = [c.args[1]["submission_id"] for c in client.start_workflow.await_args_list]
+        assert started == ["story-failed"]
+        assert bad not in started
+        assert result["started"] == 1 and result["skipped"] == 1
+        # the bad row stays failed (looked at again by the next sweep, once the config is fixed)
+        assert await conn.fetchval("SELECT status FROM submissions WHERE submission_id = $1", bad) == "failed"
     _run(body)
 
 

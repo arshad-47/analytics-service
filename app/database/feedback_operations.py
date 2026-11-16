@@ -5,10 +5,14 @@ detect a new version from the questions the stored sessions were asked).
 
 `feedback` is a generic report type: many programs, many sources. The key of everything here is
 (tenant, program, session_type, source): a session_type (the persona key) is NOT unique across the programs of a
-tenant and a source is a free label, so no lookup may fall back to "any other program's config" and no tool may act
-on a persona it was not told exactly. The lookups return None for a miss (never fabricated) and raise
-AmbiguousFeedbackConfigError (a ValueError) when the key they were given matches more than one row; the tools accept
---tenant-code / --program-id / --program-name / --source to say which one is meant and refuse otherwise.
+tenant and a source is a free label. ONE RULE finds the config of a session or an upload (the same one the extraction
+uses, app/database/feedback_extraction_operations.py): the config of the session's OWN program wins; when the program
+has none, the tenant's PROGRAM-LESS default config (program_id NULL) for that source and persona is used; a config of
+ANOTHER program is never used. When more than one candidate is left at the winning level the lookup raises
+AmbiguousFeedbackConfigError instead of guessing. The tools that EDIT a config (set / migrate / the version `set`) stay
+strictly exact: they act on the one config row they were told and never on a fallback. The lookups return None for a
+miss (never fabricated); the tools accept --tenant-code / --program-id / --program-name / --source to say which one is
+meant and refuse otherwise.
 
 Unlike the story/discussion lookup in app/api/services/uploads.py, both the leader category and the
 program are matched by NAME AND TENANT in ONE join (get_program_and_leader).
@@ -240,32 +244,43 @@ async def get_active_feedback_config(
     session_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Load the ACTIVE config_version of the `config` row for (config_source, 'feedback_upload', program_id). The source
-    is always named (it is a free label, there is no default). tenant_code / session_type narrow the lookup when
-    given (the Kafka consumer knows both from the event).
+    Load the ACTIVE config_version of the feedback_upload `config` row that serves `program_id` for `config_source`
+    (the source is always named: it is a free label, there is no default). tenant_code / session_type narrow the
+    lookup when given (the Kafka consumer knows both from the event).
+
+    THE RULE (shared with the extraction and the process steps): the config of the program's OWN row wins; when the
+    program has none, the tenant's PROGRAM-LESS default config (program_id NULL, same tenant as the program) for that
+    source (and session_type when given) is used; a config of ANOTHER program is never used. A default of another
+    tenant never applies: the tenant is the program's tenant (and must equal `tenant_code` when that is given).
 
     A program is normally one persona with one session_type, but the schema allows several (one config per
-    session_type): when `session_type` is not given and more than one config of the program matches, this raises
-    AmbiguousFeedbackConfigError instead of returning an arbitrary one.
+    session_type), and a tenant can hold the defaults of several personas: when `session_type` is not given and more
+    than one config is left at the winning level, this raises AmbiguousFeedbackConfigError instead of returning an
+    arbitrary one.
 
-    Returns {"config_id", "config_version_id", "version", "session_type", "config": {...}} (ids as str) or
-    None when no such config / no active version exists.
+    Returns {"config_id", "config_version_id", "version", "session_type", "program_id", "config": {...}} (ids as
+    str; `program_id` is None for the program-less default) or None when no such config / no active version exists.
     """
     if not db.pool:
         await db.connect()
 
     async with db.pool.acquire() as conn:
+        # Own configs first, then the defaults of the program's tenant. At most two rows are needed to tell whether
+        # the winning level is unique: the first row says which level wins, a second row of the same level is the
+        # ambiguity.
         rows = await conn.fetch(
             """
-            SELECT c.id AS config_id, c.session_type, v.id AS config_version_id, v.version, v.config
+            SELECT c.id AS config_id, c.session_type, c.program_id, v.id AS config_version_id, v.version, v.config
             FROM config c
             JOIN config_version v ON v.config_id = c.id AND v.is_active
             WHERE c.config_source = $1
               AND c.config_type = $2
-              AND c.program_id = $3::uuid
               AND ($4::text IS NULL OR c.tenant_code = $4)
               AND ($5::text IS NULL OR c.session_type = $5)
-            ORDER BY c.session_type, c.id
+              AND (c.program_id = $3::uuid
+                   OR (c.program_id IS NULL
+                       AND c.tenant_code = (SELECT p.tenant_code FROM programs p WHERE p.id = $3::uuid)))
+            ORDER BY (c.program_id IS NOT NULL) DESC, c.session_type, c.id
             LIMIT 2
             """,
             config_source,
@@ -276,10 +291,12 @@ async def get_active_feedback_config(
         )
     if len(rows) == 0:
         return None
-    if len(rows) > 1:
+    if len(rows) > 1 and (rows[0]["program_id"] is None) == (rows[1]["program_id"] is None):
+        level = "for program " + str(program_id) if rows[0]["program_id"] is not None else (
+            f"as program-less default for the tenant of program {program_id}")
         raise AmbiguousFeedbackConfigError(
-            f"more than one active {config_source} {CONFIG_TYPE_FEEDBACK_UPLOAD} config exists for program "
-            f"{program_id} ({', '.join(sorted(r['session_type'] for r in rows))}); pass session_type to pick one"
+            f"more than one active {config_source} {CONFIG_TYPE_FEEDBACK_UPLOAD} config exists {level} "
+            f"({', '.join(sorted(r['session_type'] for r in rows))}); pass session_type to pick one"
         )
     row = rows[0]
     return {
@@ -287,15 +304,17 @@ async def get_active_feedback_config(
         "config_version_id": str(row["config_version_id"]),
         "version": row["version"],
         "session_type": row["session_type"],
+        "program_id": None if row["program_id"] is None else str(row["program_id"]),
         "config": _as_dict(row["config"]),
     }
 
 
 async def _persona_process_steps(conn, source: str, session_type: str, tenant_code: str, program_id) -> List[Dict[str, Any]]:
-    """The validated process_steps of the ACTIVE feedback_upload config of one persona: the config of exactly
-    (source, session_type, tenant, program) of the submission. There is NO fallback to another program's config
-    (a session_type is not unique across programs, so that would run another program's steps), and a submission
-    without a program only matches a program-less config. Raises ValueError when there is no active config or its
+    """The validated process_steps of the ACTIVE feedback_upload config of one persona, found by THE RULE (see
+    get_active_feedback_config): the config of exactly (source, session_type, tenant, program) of the submission, else
+    the tenant's program-less default for (source, session_type). Another program's config is never used (a
+    session_type is not unique across programs, so that would run another program's steps); a submission without a
+    program only matches a program-less config. Raises ValueError when there is no active config or its
     process_steps is missing / invalid. The message carries identifiers only, no submission content."""
     row = await conn.fetchrow(
         """
@@ -303,14 +322,16 @@ async def _persona_process_steps(conn, source: str, session_type: str, tenant_co
         FROM config c
         JOIN config_version v ON v.config_id = c.id AND v.is_active
         WHERE c.config_type = $1 AND c.config_source = $2 AND c.session_type = $3 AND c.tenant_code = $4
-          AND c.program_id IS NOT DISTINCT FROM $5::uuid
+          AND (c.program_id = $5::uuid OR c.program_id IS NULL)
+        ORDER BY (c.program_id IS NOT NULL) DESC, c.id
+        LIMIT 1
         """,
         CONFIG_TYPE_FEEDBACK_UPLOAD, source, session_type, tenant_code, program_id,
     )
     if row is None:
         raise ValueError(
             f"No active {source} feedback_upload config for session_type {session_type!r}, program {program_id} "
-            f"(tenant {tenant_code!r}); cannot resolve the process steps"
+            f"(tenant {tenant_code!r}) and no program-less default; cannot resolve the process steps"
         )
     config = _as_dict(row["config"])
     if CONFIG_KEY_PROCESS_STEPS not in config:
@@ -332,7 +353,8 @@ async def get_feedback_process_steps(
     success at ingestion. Raises ValueError when the submission is not a stored feedback submission, its persona
     has no active upload config, or the config lacks / has invalid process_steps.
 
-    The config is the one of exactly the submission's (tenant, program, session_type, source); another program's
+    The config is found by THE RULE of get_active_feedback_config: the one of the submission's own (tenant, program,
+    session_type, source), else the tenant's program-less default for (session_type, source); another program's
     config is never used. `memo` (a dict the caller owns for ONE sweep) remembers the persona lookup keyed by
     (session_type, source, tenant, program), errors included, so a sweep over many submissions of the same persona
     reads the config once.
@@ -479,25 +501,43 @@ def _note(change_note: Optional[str], default: str) -> str:
     return change_note
 
 
+def _sessions_of_config_sql(config_program: str, config_type: str) -> str:
+    """
+    SQL condition (over `fs` = feedback_submissions and `s` = submissions) that selects the stored sessions a config
+    ROW governs, by THE RULE: the sessions of exactly its program; and, for a PROGRAM-LESS default config
+    (`config_program` is NULL), also the sessions of every program that has no config of its own for the session's
+    (tenant, session_type, source). A session whose program has its own config (even one without questionnaire
+    windows, even one without an active version) is never governed by the default. `config_program` / `config_type`
+    are the placeholders ("$4::uuid", "$6") of the caller's query.
+    """
+    return (
+        f"(s.program_id IS NOT DISTINCT FROM {config_program} OR ({config_program} IS NULL AND NOT EXISTS ("
+        f"SELECT 1 FROM config own WHERE own.config_type = {config_type} AND own.tenant_code = fs.tenant_code "
+        f"AND own.session_type = fs.session_type AND own.config_source = fs.source AND own.program_id = s.program_id)))"
+    )
+
+
 async def _restamp_sessions(conn, cfg: Mapping[str, Any], versions) -> Dict[str, Any]:
     """
     Relabel the stored sessions of ONE config (`cfg`: a row of _find_upload_configs) from the given version windows
     (the list parsed by parse_versions) using each session's start (submissions.submission_date, its first real
-    message). Only the sessions of exactly the config's (tenant, program, session_type, source) are read or written;
-    a config without a program only covers sessions that have none. Writes through `conn` (the caller owns the
-    transaction). Returns {"sessions", "changed", "versions"}.
+    message). Only the sessions the config governs (see _sessions_of_config_sql) are read or written: those of
+    exactly the config's (tenant, program, session_type, source); a config without a program (the tenant's default)
+    also governs the sessions of the programs that have no config of their own for that (session_type, source), and
+    never those of a program that has one. Writes through `conn` (the caller owns the transaction). Returns
+    {"sessions", "changed", "versions"}.
     """
     from app.services.feedback_versions import stamp_version
 
     rows = await conn.fetch(
-        """
+        f"""
         SELECT fs.submission_id, fs.tenant_code, fs.questionnaire_version, s.submission_date
         FROM feedback_submissions fs
         JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
         WHERE fs.source = $1 AND fs.session_type = $2 AND fs.tenant_code = $3
-          AND s.program_id IS NOT DISTINCT FROM $4::uuid AND s.submission_date IS NOT NULL
+          AND {_sessions_of_config_sql("$4::uuid", "$5")} AND s.submission_date IS NOT NULL
         """,
-        cfg["config_source"], cfg["session_type"], cfg["tenant_code"], cfg["program_id"],
+        cfg["config_source"], cfg["session_type"], cfg["tenant_code"], cfg["program_id"], CONFIG_TYPE_FEEDBACK_UPLOAD,
     )
     counts: Dict[str, int] = {}
     changed_ids: List[str] = []
@@ -536,7 +576,9 @@ async def restamp_questionnaire_versions(
     (config.questionnaire_versions), for every source whose config has questionnaire versions (a config without
     them is not touched). Needed after anything that changes the windows outside set_questionnaire_version (that one
     relabels by itself), because re-uploading an unchanged session is a no-op and never refreshes the label. Each
-    config relabels only the sessions of exactly its (tenant, program, session_type, source).
+    config relabels only the sessions it governs: those of exactly its (tenant, program, session_type, source); a
+    program-less default config also those of the programs that have no config of their own for that (session_type,
+    source), never those of a program that has one.
 
     The selectors (tenant_code, program_id / program_name, source) narrow the configs. With NO session_type this
     is the explicit sweep over every matching config; WITH a session_type it must identify exactly one config
@@ -591,8 +633,9 @@ async def list_questionnaire_versions(
 ) -> Dict[str, Any]:
     """
     Read-only. The recorded questionnaire versions of each persona's active upload config (every source whose config
-    has questionnaire versions), with the number of stored sessions per label, counted over exactly the config's
-    (tenant, program, session_type, source): {key: {"config_version": n, "versions": [{"key", "effective_from"}],
+    has questionnaire versions), with the number of stored sessions per label, counted over the sessions the config
+    governs (its tenant, program, session_type, source; for a program-less default also the sessions of the programs
+    that have no config of their own for it): {key: {"config_version": n, "versions": [{"key", "effective_from"}],
     "sessions": {label: n}, tenant_code, program_id, program_name, session_type, source}}. `key` is the session_type,
     or tenant/program/session_type/source when the session_type alone would collide.
     """
@@ -607,15 +650,16 @@ async def list_questionnaire_versions(
         keys = _result_keys(configs)
         for cfg in configs:
             counts = await conn.fetch(
-                """
+                f"""
                 SELECT fs.questionnaire_version, count(*) AS n
                 FROM feedback_submissions fs
                 JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
                 WHERE fs.source = $1 AND fs.session_type = $2 AND fs.tenant_code = $3
-                  AND s.program_id IS NOT DISTINCT FROM $4::uuid
+                  AND {_sessions_of_config_sql("$4::uuid", "$5")}
                 GROUP BY 1
                 """,
                 cfg["config_source"], cfg["session_type"], cfg["tenant_code"], cfg["program_id"],
+                CONFIG_TYPE_FEEDBACK_UPLOAD,
             )
             result[keys[cfg["config_id"]]] = {
                 "config_version": cfg["version"],
@@ -627,25 +671,27 @@ async def list_questionnaire_versions(
 
 
 async def _fetch_session_questions(conn, cfg: Mapping[str, Any], closing_keys: List[str]):
-    """The main (not probe, not closing) bot questions of every stored session of ONE config's persona (exactly its
-    tenant, program, session_type and source)."""
+    """The main (not probe, not closing) bot questions of every stored session ONE config governs (exactly its
+    tenant, program, session_type and source; for a program-less default also the sessions of the programs without a
+    config of their own, see _sessions_of_config_sql)."""
     from app.services.feedback_version_detect import SessionQuestions
 
     rows = await conn.fetch(
-        """
+        f"""
         SELECT fb.submission_id, s.submission_date, fs.questionnaire_version, fb.message, fb.translated_message,
                fs.meta_data ->> 'bot_id' AS bot_id
         FROM feedbacks fb
         JOIN feedback_submissions fs ON fs.submission_id = fb.submission_id AND fs.tenant_code = fb.tenant_code
         JOIN submissions s ON s.submission_id = fb.submission_id AND s.tenant_code = fb.tenant_code
         WHERE fs.source = $1 AND fs.session_type = $2 AND fs.tenant_code = $3
-          AND s.program_id IS NOT DISTINCT FROM $5::uuid
+          AND {_sessions_of_config_sql("$5::uuid", "$6")}
           AND s.submission_date IS NOT NULL
           AND fb.parent_id IS NULL AND NOT fb.is_follow_up
           AND (fb.question_key IS NULL OR NOT (fb.question_key = ANY($4::text[])))
         ORDER BY fb.submission_id, fb.sequence
         """,
         cfg["config_source"], cfg["session_type"], cfg["tenant_code"], closing_keys, cfg["program_id"],
+        CONFIG_TYPE_FEEDBACK_UPLOAD,
     )
     grouped: Dict[str, Dict[str, Any]] = {}
     for row in rows:
@@ -680,8 +726,8 @@ async def detect_questionnaire_versions(
 ) -> Dict[str, Any]:
     """
     Read-only. For each persona's active upload config (every source whose config has questionnaire versions),
-    compare the main questions the stored sessions of exactly that config's (tenant, program, session_type, source)
-    were asked with what each recorded version is known to ask (app/services/feedback_version_detect.py) and
+    compare the main questions the stored sessions that config governs (its tenant, program, session_type, source;
+    a program-less default also governs the programs that have no config of their own) were asked with what each recorded version is known to ask (app/services/feedback_version_detect.py) and
     propose a new version and its start when a new question set appeared. Nothing is written: a person records the
     proposal with set_questionnaire_version. Returns {key: detect() result + "next_step" + the config's identity};
     `key` is the session_type, or tenant/program/session_type/source when the session_type alone would collide.
@@ -734,7 +780,7 @@ async def set_questionnaire_version(
     need no code); an EXISTING key (not the first) gets its date moved. The windows live in the persona's upload
     config: this writes a new config_version (the previous one is deactivated, so it stays as history and can be
     re-activated to roll back) and, unless restamp is False, relabels the stored sessions of the persona in the same
-    transaction (only those of exactly the config's tenant, program, session_type and source). With dry_run
+    transaction (only the sessions that config governs, see restamp_questionnaire_versions). With dry_run
     everything is computed and rolled back.
 
     The persona is identified by session_type plus the selectors (tenant_code, program_id / program_name, source),

@@ -242,11 +242,17 @@ def test_story_and_discussion_without_process_steps_still_left_pending(monkeypat
 def test_feedback_with_process_steps_starts_workflow_not_success(monkeypatch):
     async def run():
         steps = [{"name": "pii_and_abusive"}]
-        consumer, _, status_mock = _trigger_setup(monkeypatch, steps)
+        consumer, conn, status_mock = _trigger_setup(monkeypatch, steps)
         await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")
         consumer.temporal_client.start_workflow.assert_awaited_once()
-        # only the 'processing' transition, never a direct 'success'
-        assert [c.args[3] for c in status_mock.await_args_list] == ["processing"]
+        # never a direct 'success' through update_submission_status; the 'processing' transition is the consumer's own
+        # guarded UPDATE (upstream release-1.4.0: only a row that is still 'pending' moves, so a workflow that
+        # already finished or failed is not overwritten)
+        status_mock.assert_not_awaited()
+        conn.execute.assert_awaited_once()
+        sql, *params = conn.execute.await_args.args
+        assert "SET status = 'processing'" in sql and "status = 'pending'" in sql
+        assert params == ["184884", "mitra"]
     asyncio.run(run())
 
 

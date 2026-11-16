@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 import app.api.routes.uploads as uploads_routes
+import app.services.retry as retry_service
 import app.temporal.activities as activities
 from app.api.models.submissions import StepRetryRequest
 from app.config import settings
@@ -22,13 +23,15 @@ from conftest import FakeConn, FakePool, install_fake_db
 # --------------------------------------------------------------------------------------------------------------------
 
 def _failed_row(sub_type):
-    return {"submission_id": "f1", "session_id": "x", "status": "failed", "submission_type": sub_type,
-            "process_status": None}
+    return {"submission_id": "f1", "session_id": "x", "tenant_code": "mitra", "status": "failed",
+            "submission_type": sub_type, "process_status": None}
 
 
 def _retry_one(monkeypatch, sub_type):
-    monkeypatch.setattr(uploads_routes, "fetch_failed_submission_for_retry", AsyncMock(return_value=_failed_row(sub_type)))
-    monkeypatch.setattr(uploads_routes, "get_process_steps", AsyncMock(return_value=[]))
+    """retry_step through the shared retry service (app/services/retry.py, which the route delegates to)."""
+    monkeypatch.setattr(uploads_routes, "fetch_retryable_submission_for_retry", AsyncMock(return_value=_failed_row(sub_type)))
+    monkeypatch.setattr(retry_service, "get_process_steps", AsyncMock(return_value=[]))
+    monkeypatch.setattr(retry_service, "claim_submission_for_retry", AsyncMock(return_value={"retry_attempt": 1}))
     client = MagicMock()
     client.start_workflow = AsyncMock()
     monkeypatch.setattr(uploads_routes, "get_temporal_client", AsyncMock(return_value=client))
@@ -56,23 +59,41 @@ def test_cr1_retry_step_still_rejects_an_unsupported_type_without_steps(monkeypa
     client.start_workflow.assert_not_awaited()
 
 
+def test_cr1_a_feedback_retry_reads_the_persona_config_never_settings(monkeypatch):
+    """Regression for the upstream merge: the shared retry service called settings.get_process_config for every
+    type, which raises for feedback (its steps live in the persona's upload config), so no feedback retry worked."""
+    steps = [{"name": "feedback_metadata_extraction"}]
+    client, run = _retry_one(monkeypatch, "feedback")
+    persona = AsyncMock(return_value=steps)
+    monkeypatch.setattr(retry_service, "get_process_steps", persona)
+    guard = MagicMock()
+    guard.get_process_config.side_effect = AssertionError("settings must not be read for feedback")
+    guard.TEMPORAL_QUEUE = "queue"
+    monkeypatch.setattr(retry_service, "settings", guard)
+    asyncio.run(run())
+    persona.assert_awaited_once()
+    assert persona.await_args.args[1:4] == ("feedback", "f1", "mitra")
+    assert client.start_workflow.await_args.args[1]["process_steps"] == steps
+
+
 def test_cr1_bulk_retry_sweep_dispatches_feedback_rows_with_an_empty_step_list_and_skips_other_empty_types(monkeypatch):
     rows = [
         {"submission_id": "f1", "session_id": "x", "tenant_code": "mitra", "submission_type": "feedback",
-         "process_status": None, "updated_at": 1},
+         "status": "failed", "process_status": None, "updated_at": 1},
         {"submission_id": "u1", "session_id": "y", "tenant_code": "mitra", "submission_type": "unknown_kind",
-         "process_status": None, "updated_at": 2},
+         "status": "failed", "process_status": None, "updated_at": 2},
     ]
     monkeypatch.setattr(settings, "BATCH_SIZE", 100)
-    monkeypatch.setattr(uploads_routes, "fetch_retryable_failed_submissions", AsyncMock(side_effect=[rows]))
-    monkeypatch.setattr(uploads_routes, "get_process_steps", AsyncMock(return_value=[]))
+    monkeypatch.setattr(retry_service, "fetch_retryable_submissions", AsyncMock(side_effect=[rows]))
+    monkeypatch.setattr(retry_service, "get_process_steps", AsyncMock(return_value=[]))
+    monkeypatch.setattr(retry_service, "claim_submission_for_retry", AsyncMock(return_value={"retry_attempt": 1}))
     client = MagicMock()
     client.start_workflow = AsyncMock()
-    monkeypatch.setattr(uploads_routes, "get_temporal_client", AsyncMock(return_value=client))
+    monkeypatch.setattr(retry_service, "get_temporal_client", AsyncMock(return_value=client))
 
     async def run():
-        install_fake_db(monkeypatch, uploads_routes)
-        await uploads_routes._dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
+        install_fake_db(monkeypatch, retry_service)
+        await retry_service.dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
     asyncio.run(run())
     started = [call.args[1]["submission_id"] for call in client.start_workflow.await_args_list]
     assert started == ["f1"]
@@ -96,68 +117,60 @@ class _Source:
         self.calls = []
 
     async def __call__(self, conn, tenant_code, limit, failed_before=None, cursor_updated_at=None,
-                       cursor_submission_id=None, max_retry_attempts=5):
+                       cursor_submission_id=None, max_retry_attempts=5, stuck_processing_min_age_minutes=None):
         self.calls.append((limit, cursor_submission_id))
-        if isinstance(cursor_updated_at, str):   # the workflow hands the cursor back as an ISO string
-            cursor_updated_at = dt.datetime.fromisoformat(cursor_updated_at)
+        assert cursor_updated_at is None or isinstance(cursor_updated_at, dt.datetime)  # what asyncpg accepts
         rest = [r for r in self.rows
                 if cursor_submission_id is None or (r["updated_at"], r["submission_id"]) > (cursor_updated_at, cursor_submission_id)]
         return rest[:limit]
 
 
-def _page_through(monkeypatch, source, bad_ids, limit):
-    """Runs the activity the way BulkStepRetryWorkflow does (cursor from the last returned row, stop on a short page)."""
-    import app.database.operations as operations
-    monkeypatch.setattr(operations, "fetch_retryable_failed_submissions", source)
+def _sweep(monkeypatch, source, bad_ids, limit):
+    """Runs the bulk retry sweep (dispatch_all_retry_workflows) against `source`; a row in `bad_ids` has a persona
+    config that cannot give steps. Returns the ids of the dispatched workflows."""
+    monkeypatch.setattr(settings, "BATCH_SIZE", limit)
+    monkeypatch.setattr(retry_service, "fetch_retryable_submissions", source)
 
     async def steps(conn, sub_type, submission_id, tenant, memo=None):
         if submission_id in bad_ids:
             raise ValueError("config invalid")
         return [{"name": "feedback_metadata_extraction"}]
-    monkeypatch.setattr(activities, "get_process_steps", steps)
-    seen = []
+    monkeypatch.setattr(retry_service, "get_process_steps", steps)
+    monkeypatch.setattr(retry_service, "claim_submission_for_retry", AsyncMock(return_value={"retry_attempt": 1}))
+    client = MagicMock()
+    client.start_workflow = AsyncMock()
+    monkeypatch.setattr(retry_service, "get_temporal_client", AsyncMock(return_value=client))
 
     async def run():
-        install_fake_db(monkeypatch, activities)
-        cursor_updated_at = cursor_submission_id = None
-        while True:
-            page = await activities.fetch_failed_submissions_activity({
-                "limit": limit, "cursor_updated_at": cursor_updated_at, "cursor_submission_id": cursor_submission_id})
-            if len(page) == 0:
-                break
-            seen.extend(r["submission_id"] for r in page)
-            cursor_updated_at = page[-1]["updated_at"]
-            cursor_submission_id = page[-1]["submission_id"]
-            if len(page) < limit:
-                break
+        install_fake_db(monkeypatch, retry_service)
+        await retry_service.dispatch_all_retry_workflows("mitra", "2026-01-01T00:00:00+00:00", "sweep")
     asyncio.run(run())
-    return seen
+    return [call.args[1]["submission_id"] for call in client.start_workflow.await_args_list]
 
 
-def test_cr8_a_page_with_one_invalid_config_is_refilled_so_the_sweep_does_not_stop_early(monkeypatch):
-    rows = [_failed_db_row(n) for n in range(25)]
-    seen = _page_through(monkeypatch, _Source(rows), {"s0003"}, limit=10)
-    assert seen == [r["submission_id"] for r in rows if r["submission_id"] != "s0003"]
+def _failed_rows(n, sub_type="feedback"):
+    return [{**_failed_db_row(i, sub_type), "status": "failed"} for i in range(n)]
+
+
+def test_cr8_a_page_with_one_invalid_config_does_not_stop_the_sweep_early(monkeypatch):
+    rows = _failed_rows(25)
+    started = _sweep(monkeypatch, _Source(rows), {"s0003"}, limit=10)
+    assert sorted(started) == sorted(r["submission_id"] for r in rows if r["submission_id"] != "s0003")
 
 
 def test_cr8_an_entirely_invalid_page_does_not_hide_the_later_rows(monkeypatch):
-    rows = [_failed_db_row(n) for n in range(25)]
+    rows = _failed_rows(25)
     bad = {f"s{n:04d}" for n in range(10)}
-    seen = _page_through(monkeypatch, _Source(rows), bad, limit=10)
-    assert seen == [r["submission_id"] for r in rows if r["submission_id"] not in bad]
+    started = _sweep(monkeypatch, _Source(rows), bad, limit=10)
+    assert sorted(started) == sorted(r["submission_id"] for r in rows if r["submission_id"] not in bad)
 
 
-def test_cr8_a_page_is_never_longer_than_the_limit(monkeypatch):
-    rows = [_failed_db_row(n) for n in range(40)]
-    import app.database.operations as operations
-    monkeypatch.setattr(operations, "fetch_retryable_failed_submissions", _Source(rows))
-    monkeypatch.setattr(activities, "get_process_steps",
-                        AsyncMock(side_effect=lambda *a, **k: [{"name": "feedback_metadata_extraction"}]))
-
-    async def run():
-        install_fake_db(monkeypatch, activities)
-        return await activities.fetch_failed_submissions_activity({"limit": 10})
-    assert len(asyncio.run(run())) == 10
+def test_cr8_a_page_is_never_longer_than_the_limit_and_the_cursor_follows_the_scanned_rows(monkeypatch):
+    rows = _failed_rows(40)
+    source = _Source(rows)
+    _sweep(monkeypatch, source, {"s0003"}, limit=10)
+    assert [limit for limit, _ in source.calls] == [10, 10, 10, 10, 10]   # four full pages, then the empty one
+    assert [cursor for _, cursor in source.calls] == [None, "s0009", "s0019", "s0029", "s0039"]
 
 
 def test_cr8_the_pending_sweep_is_refilled_after_invalid_rows_are_marked_failed(monkeypatch):
@@ -191,15 +204,29 @@ def test_cr8_the_pending_sweep_is_refilled_after_invalid_rows_are_marked_failed(
     assert [r["submission_id"] for r in out] == ["p000", "p004", "p005", "p006", "p007"]
 
 
-def test_cr8_the_workflow_cursor_is_an_iso_string_and_reaches_the_query_as_a_datetime():
-    """The keyset cursor of BulkStepRetryWorkflow is JSON (an ISO string); asyncpg refuses a str for timestamptz."""
+def test_cr8_an_iso_string_cursor_reaches_the_query_as_a_datetime():
+    """The keyset cursor may be handed over as an ISO string (the retired BulkStepRetryWorkflow did; any JSON
+    hand-off does); asyncpg refuses a str for timestamptz. Kept after the upstream rename to
+    fetch_retryable_submissions."""
     import app.database.operations as operations
     conn = FakeConn()
-    asyncio.run(operations.fetch_retryable_failed_submissions(
+    asyncio.run(operations.fetch_retryable_submissions(
         conn, "mitra", 5, failed_before="2026-01-01T00:00:00+00:00",
         cursor_updated_at="2026-01-01T00:00:05+00:00", cursor_submission_id="s5"))
     args = conn.fetch.await_args.args
     assert isinstance(args[3], dt.datetime) and isinstance(args[4], dt.datetime)
+
+
+def test_cr8_a_trailing_z_is_read_as_utc_on_python_310():
+    """datetime.fromisoformat only accepts 'Z' from Python 3.11; the service image runs Python 3.10."""
+    import app.database.operations as operations
+    conn = FakeConn()
+    asyncio.run(operations.fetch_retryable_submissions(
+        conn, "mitra", 5, failed_before="2026-11-05T12:00:00Z", cursor_updated_at="2026-11-05T11:00:00Z",
+        cursor_submission_id="s5"))
+    args = conn.fetch.await_args.args
+    assert args[3] == dt.datetime(2026, 11, 5, 12, tzinfo=dt.timezone.utc)
+    assert args[4] == dt.datetime(2026, 11, 5, 11, tzinfo=dt.timezone.utc)
 
 
 # --------------------------------------------------------------------------------------------------------------------

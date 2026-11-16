@@ -27,7 +27,7 @@ from app.database.feedback_operations import (
     set_questionnaire_version,
 )
 from app.database.operations import insert_or_update_submission
-from seed_support import FEEDBACK_PROGRAM_NAME, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, load_seed_config, seed_config
 from app.services.feedback_constants import (
     DEFAULT_INGESTION_SCHEMA,
     DEFAULT_MAX_CSV_UPLOAD_BYTES,
@@ -40,8 +40,9 @@ pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
 YOUTH = PERSONAS["Youth"]
-STEPS = []  # the seed / migrate default: extraction is opt-in (an LLM call per submission)
-EXTRACTION = [{"name": "feedback_metadata_extraction"}]  # extraction switched on for a persona
+STEPS = load_seed_config("feedback_upload", "mitra", "Youth_Voice")["process_steps"]  # what the seed ships (the extraction step); `migrate` adds [] to an OLD config instead
+MIGRATED_STEPS = []   # what `migrate` adds to an OLD config that lacks the key (no extraction until someone turns it on)
+EXTRACTION = [{"name": "feedback_metadata_extraction", "max_tokens": 1024}]  # differs from the seeded steps
 SEEDED_CONFIGS = SEED_UPLOAD_CONFIG_COUNT   # the upload configs of the seed (one per persona and source)
 
 
@@ -247,7 +248,7 @@ def test_migrate_adds_the_missing_keys_as_a_new_version_and_keeps_history():
         v1, v2 = await _versions(conn, "Youth_Voice")
         assert (v1["version"], v1["is_active"], v1["config"]) == (1, False, before)  # history untouched
         assert v2["is_active"] and v2["created_by"] == "cli"
-        assert v2["config"]["process_steps"] == STEPS and v2["config"]["max_csv_upload_bytes"] == DEFAULT_MAX_CSV_UPLOAD_BYTES
+        assert v2["config"]["process_steps"] == MIGRATED_STEPS and v2["config"]["max_csv_upload_bytes"] == DEFAULT_MAX_CSV_UPLOAD_BYTES
         # every other key is carried over unchanged
         assert {k: v for k, v in v2["config"].items() if k not in REQUIRED_FEEDBACK_CONFIG_KEYS} == before
         assert await conn.fetchval("SELECT count(*) FROM config_version WHERE is_active") == SEEDED_CONFIGS
@@ -291,7 +292,7 @@ def test_migrate_never_overwrites_an_existing_key_and_reports_an_invalid_one():
         parent = (await _versions(conn, "Parent_Voice"))[-1]["config"]
         assert youth["max_csv_upload_bytes"] == "lots"      # reported, not overwritten
         assert parent["max_csv_upload_bytes"] == 777        # a valid custom value survives
-        assert parent["process_steps"] == STEPS and parent["ingestion_schema"] == DEFAULT_INGESTION_SCHEMA
+        assert parent["process_steps"] == MIGRATED_STEPS and parent["ingestion_schema"] == DEFAULT_INGESTION_SCHEMA
     _run(body)
 
 
@@ -312,7 +313,7 @@ def test_questionnaire_version_change_after_migrate_keeps_the_new_settings():
         await set_questionnaire_version("Youth_Voice", "V2", "2026-11-03T18:23:03+05:30")
         latest = (await _versions(conn, "Youth_Voice"))[-1]
         assert latest["version"] == 3 and latest["is_active"]
-        assert latest["config"]["process_steps"] == STEPS and len(latest["config"]["questionnaire_versions"]) == 2
+        assert latest["config"]["process_steps"] == MIGRATED_STEPS and len(latest["config"]["questionnaire_versions"]) == 2
     _run(body)
 
 
@@ -424,7 +425,7 @@ def test_concurrent_sets_serialise_on_the_config_row_and_leave_one_active_versio
     async def body(conn):
         results = await asyncio.gather(
             set_feedback_config_value("Youth_Voice", "mitra", "max_csv_upload_bytes", 11),
-            set_feedback_config_value("Youth_Voice", "mitra", "process_steps", EXTRACTION),  # differs from the [] default
+            set_feedback_config_value("Youth_Voice", "mitra", "process_steps", EXTRACTION),  # differs from the seeded steps
             set_feedback_config_value("Youth_Voice", "mitra", "expect_stages", ["X"]),
         )
         assert sorted(r["config_version"] for r in results) == [2, 3, 4] and all(r["changed"] for r in results)

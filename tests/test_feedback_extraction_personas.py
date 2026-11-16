@@ -143,7 +143,13 @@ def test_parent_child_fields_are_about_the_child_and_parent_fields_about_the_par
     by_name = {f.name: f for f in _config("Parent").fields}
     assert "CHILD" in by_name["child_gender"].description and "not of the parent" in by_name["child_gender"].description
     assert by_name["child_grade"].categories == (
-        "Primary", "Middle", "Secondary", "Higher Secondary", "College/University", "Other")
+        "Primary (Classes 1-5)",
+        "Middle (Classes 6-8)",
+        "Secondary (Classes 9-10)",
+        "Higher Secondary (Classes 11-12)",
+        "College/University",
+        "Other",
+    )
     assert by_name["respondent_relationship"].categories == ("Mother", "Father", "Guardian")
     assert by_name["school_type"].categories == ("Government", "Private", "Others", "Invalid")
     for name in ("parent_education", "parent_education_level"):
@@ -330,9 +336,9 @@ def test_each_persona_accepts_an_answer_with_every_configured_field_and_rejects_
 def test_parent_child_grade_and_educator_level_bands_map_and_others_do_not_coerce():
     parent = _config("Parent")
     fields = {f.field_name: f for f in fx.parse_model_response(
-        _answer(parent, {"child_grade": ("Middle", "6th"), "parent_education_level": ("Did Not Go to School", "never"),
+        _answer(parent, {"child_grade": ("Middle (Classes 6-8)", "6th"), "parent_education_level": ("Did Not Go to School", "never"),
                          "respondent_relationship": ("Aunt", "aunt")}), parent).fields}
-    assert fields["child_grade"].value == "Middle"
+    assert fields["child_grade"].value == "Middle (Classes 6-8)"
     assert fields["parent_education_level"].value == "Did Not Go to School"
     assert (fields["respondent_relationship"].status, fields["respondent_relationship"].raw_value) == ("unmapped", "aunt")
     educator = _config("Educator")

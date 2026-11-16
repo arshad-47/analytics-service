@@ -65,9 +65,9 @@ SOURCE_LABEL_RE = r"[a-z0-9_]{1,40}"
 MAX_SOURCE_LENGTH = 40
 # Tenant codes and persona keys (session_type) of an event: letters, digits, '.', '_', '-', at most 64 characters.
 SAFE_CODE_RE = r"[A-Za-z0-9._-]{1,64}"
-# Conversation / session ids: as above plus ':', at most 128 characters (Mitra ids are numeric or 32 hex; a form
+# Conversation / session ids: as above plus ':' and ',', at most 128 characters (Mitra ids are numeric, possibly comma-separated, or 32 hex; a form
 # response id is a UUID). Whitespace, CR/LF and every other control character are refused.
-SAFE_ID_RE = r"[A-Za-z0-9._:-]{1,128}"
+SAFE_ID_RE = r"[A-Za-z0-9._:,-]{1,128}"
 
 # Ceiling of ONE upload request body (bytes) for POST /v1/upload/, applied before the body is read (the persona's own
 # `max_csv_upload_bytes` is still the cap of its upload). 512 MiB: far above a real export, small enough that no
@@ -116,8 +116,10 @@ DEFAULT_MAX_CSV_UPLOAD_BYTES = 104857600  # 100MB
 
 # The name of the post-processing step is fixed: the Temporal activity of that name does the metadata extraction.
 FEEDBACK_METADATA_EXTRACTION_STEP = "feedback_metadata_extraction"
-# Extraction is OPT-IN (every extraction is a paid LLM call per submission): the seed (seed_config.sql) and `migrate` write NO steps,
-# so a submission is complete (success) at ingestion. Turn it on per persona with
+# The seed (seed_config.sql) ships `[{"name": "feedback_metadata_extraction"}]` for every upload config, so on a NEW database
+# extraction starts right after each session is ingested (every extraction is one paid LLM call per submission).
+# `migrate` / `migrate-legacy` add the key to an OLD config with NO steps, so an upgrade never starts paid calls by itself
+# (the submission is then complete, success, at ingestion). Turn extraction on for an existing config with
 #   python tools/feedback_config.py set --session-type Youth_Voice --source mitra --key process_steps \
 #       --json '[{"name": "feedback_metadata_extraction"}]'
 DEFAULT_PROCESS_STEPS: list = []

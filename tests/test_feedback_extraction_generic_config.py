@@ -401,9 +401,7 @@ def test_the_workflow_derives_the_extraction_timeout_instead_of_a_fixed_five_min
     assert 'step_name == "feedback_metadata_extraction"' not in source           # the registry, not a literal
 
 
-def test_an_llm_timeout_that_does_not_fit_the_activity_budget_is_a_setup_error_before_any_call(monkeypatch):
-    config = _config(llm={"timeout_seconds": 1000})
-
+def _patch_inputs(monkeypatch, config):
     async def fake_inputs(conn, submission_id, tenant_code):
         return {"session_type": "Parent_Voice", "questionnaire_version": "V1", "rows": [_row(1, "x")],
                 "fingerprint": "f", "loaded_at": None, "config_row": {"id": "cv", "config": config}, "closing_keys": []}
@@ -413,8 +411,65 @@ def test_an_llm_timeout_that_does_not_fit_the_activity_budget_is_a_setup_error_b
 
     monkeypatch.setattr(ops, "load_submission_inputs", fake_inputs)
     monkeypatch.setattr(ops, "load_prompt_for_config", fake_prompt)
+
+
+def _run_with_budget(monkeypatch, config, budget, overrides=None):
+    """Runs a dry-run extraction under an activity budget; returns the keyword arguments the fake LLM received."""
+    _patch_inputs(monkeypatch, config)
+    seen = []
+
+    def llm(prompt, **kwargs):
+        seen.append(kwargs)
+        return _answer(), {}
+
+    asyncio.run(ops.extract_submission(_Pool(object()), "s1", "t", llm_function=llm, write=False,
+                                       llm_overrides=overrides, activity_budget_seconds=budget))
+    return seen
+
+
+def test_a_configured_timeout_that_does_not_fit_the_activity_budget_is_clamped_and_the_call_runs(monkeypatch, caplog):
+    """The reviewer's case: config 200 s, no step override: the budget is 300 s, so 200 + 120 does not fit. It used to
+    fail EVERY submission with a non-retryable setup error; now the call runs with 300 - 120 = 180 s."""
+    caplog.set_level("WARNING", logger="analytics_service.feedback_extraction")
+    seen = _run_with_budget(monkeypatch, _config(llm={"timeout_seconds": 200}), 300)
+    assert len(seen) == 1 and seen[0]["timeout"] == 180
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "200" in warnings[0] and "180" in warnings[0]
+
+
+def test_a_configured_timeout_that_fits_the_budget_is_untouched_and_not_reported(monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="analytics_service.feedback_extraction")
+    assert _run_with_budget(monkeypatch, _config(llm={"timeout_seconds": 180}), 300)[0]["timeout"] == 180
+    assert _run_with_budget(monkeypatch, _config(llm={"timeout_seconds": 60}), 300)[0]["timeout"] == 60
+    assert _run_with_budget(monkeypatch, _config(llm={"timeout_seconds": 1000}), None)[0]["timeout"] == 1000   # CLI: no budget
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+def test_the_step_override_still_wins_and_a_bigger_budget_keeps_a_longer_call(monkeypatch):
+    config = _config(llm={"timeout_seconds": 200})
+    assert _run_with_budget(monkeypatch, config, 720, {"llm_timeout_seconds": 600})[0]["timeout"] == 600
+    assert _run_with_budget(monkeypatch, config, 320)[0]["timeout"] == 200        # 200 + 120 fits exactly
+    # the override is clamped as well when it somehow exceeds the budget
+    assert _run_with_budget(monkeypatch, config, 300, {"llm_timeout_seconds": 600})[0]["timeout"] == 180
+
+
+def test_the_llm_settings_precedence_is_unchanged_by_the_clamp():
+    config = _config(llm={"model": "cfg/model", "max_tokens": 111, "timeout_seconds": 200})
+    assert ops.resolve_llm_settings(config, {}) == {"model": "cfg/model", "max_tokens": 111, "timeout": 200}
+    assert ops.resolve_llm_settings(config, {"llm_model": "step/model", "max_tokens": 5, "llm_timeout_seconds": 9}) == {
+        "model": "step/model", "max_tokens": 5, "timeout": 9}
+
+
+@pytest.mark.parametrize("budget", [constants.ACTIVITY_MARGIN_SECONDS, constants.ACTIVITY_MARGIN_SECONDS - 1, 0, -5])
+def test_only_a_budget_with_nothing_left_for_the_call_is_a_setup_error(monkeypatch, budget):
+    _patch_inputs(monkeypatch, _config(llm={"timeout_seconds": 200}))
     calls = []
-    with pytest.raises(ops.ExtractionSetupError, match="does not fit the activity budget"):
+    with pytest.raises(ops.ExtractionSetupError, match="activity budget"):
         asyncio.run(ops.extract_submission(_Pool(object()), "s1", "t", llm_function=lambda *a, **k: calls.append(1),
-                                           write=False, activity_budget_seconds=300))
+                                           write=False, activity_budget_seconds=budget))
     assert calls == []
+
+
+def test_the_default_activity_budget_always_holds_the_default_llm_timeout():
+    """The workflow's floor of 300 s leaves 180 s: the clamp is only ever hit by a config timeout above 180 s."""
+    assert constants.extraction_activity_timeout_seconds(None) - constants.ACTIVITY_MARGIN_SECONDS == 180
