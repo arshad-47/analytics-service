@@ -41,7 +41,7 @@ def test_every_mitra_seed_carries_the_three_settings(persona):
         assert key in config
     validate_feedback_config_keys(config)
     assert config["max_csv_upload_bytes"] == 104857600  # the value the .env default had
-    assert config["process_steps"] == []  # extraction is opt-in (an LLM call per submission)
+    assert config["process_steps"] == [{"name": "feedback_metadata_extraction"}]
     assert "expect_stages" not in config  # optional, never seeded
 
 
@@ -49,7 +49,7 @@ def test_every_mitra_seed_carries_the_three_settings(persona):
 def test_every_google_forms_seed_carries_the_three_settings(persona):
     config = gforms_config_v1(persona)
     validate_feedback_config_keys(config)
-    assert config["process_steps"] == []
+    assert config["process_steps"] == [{"name": "feedback_metadata_extraction"}]
     assert config["ingestion_schema"] == DEFAULT_INGESTION_SCHEMA
 
 

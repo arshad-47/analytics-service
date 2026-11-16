@@ -217,7 +217,11 @@ SELECT '864bd1a7-3f34-473e-8578-65c801908657'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '864bd1a7-3f34-473e-8578-65c801908657'::uuid)
@@ -464,7 +468,11 @@ SELECT '957b809a-028a-4139-8455-881d24696eb7'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '957b809a-028a-4139-8455-881d24696eb7'::uuid)
@@ -594,7 +602,11 @@ SELECT 'aa3bf372-219a-405f-b13d-caef9becad68'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = 'aa3bf372-219a-405f-b13d-caef9becad68'::uuid)
@@ -816,7 +828,11 @@ SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid)
@@ -946,7 +962,11 @@ SELECT 'c19ca45c-7cc5-4fea-a157-c8f508b4c592'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = 'c19ca45c-7cc5-4fea-a157-c8f508b4c592'::uuid)
@@ -1136,7 +1156,11 @@ SELECT '6543fdb5-8d6e-4929-ae6e-576d7237f38a'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '6543fdb5-8d6e-4929-ae6e-576d7237f38a'::uuid)
@@ -1266,7 +1290,11 @@ SELECT '4bc09524-71e3-4f0e-95b9-9d936e6e8697'::uuid, 1, TRUE, $cfg$
       ]
     }
   },
-  "process_steps": []
+  "process_steps": [
+    {
+      "name": "feedback_metadata_extraction"
+    }
+  ]
 }
 $cfg$::jsonb, 'seed', 'Initial format'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '4bc09524-71e3-4f0e-95b9-9d936e6e8697'::uuid)
@@ -1735,18 +1763,18 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
       "kind": "category",
       "description": "The class the respondent's CHILD studies in, as a band. Only the older questionnaire asks it: empty when never asked. A class given as a word ('fifth', '5th') is the number. Several children in different bands, or a class that fits no band (for example nursery), fit no band (value null, put the words in raw).",
       "categories": [
-        "Primary",
-        "Middle",
-        "Secondary",
-        "Higher Secondary",
+        "Primary (Classes 1-5)",
+        "Middle (Classes 6-8)",
+        "Secondary (Classes 9-10)",
+        "Higher Secondary (Classes 11-12)",
         "College/University",
         "Other"
       ],
       "guidance": {
-        "Primary": "classes 1 to 5",
-        "Middle": "classes 6 to 8",
-        "Secondary": "classes 9 and 10",
-        "Higher Secondary": "classes 11 and 12",
+        "Primary (Classes 1-5)": "classes 1 to 5",
+        "Middle (Classes 6-8)": "classes 6 to 8",
+        "Secondary (Classes 9-10)": "classes 9 and 10",
+        "Higher Secondary (Classes 11-12)": "classes 11 and 12",
         "College/University": "any degree or college course",
         "Other": "out of school, not studying, home schooling"
       },
