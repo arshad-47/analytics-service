@@ -109,7 +109,7 @@ def is_safe_code(value: Any) -> bool:
 
 
 def is_safe_id(value: Any) -> bool:
-    """A submission / session id: 1..128 characters of [A-Za-z0-9._:-] (no whitespace, no control character)."""
+    """A submission / session id: 1..128 characters of [A-Za-z0-9._:,-] (no whitespace, no control character)."""
     return isinstance(value, str) and _SAFE_ID.fullmatch(value) is not None
 
 

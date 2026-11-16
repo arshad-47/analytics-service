@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 from confluent_kafka import Producer, KafkaException
 from fastapi import BackgroundTasks
@@ -204,7 +204,7 @@ def format_datetime(val, with_ms=True, fallback_to_now=True) -> Optional[str]:
     if pd.isna(val) or val is None:
         if not fallback_to_now:
             return None
-        val = datetime.utcnow()
+        val = datetime.now(timezone.utc)
     if isinstance(val, str):
         try:
             val = pd.to_datetime(val)
@@ -579,7 +579,7 @@ async def process_csv_inline(
             "stage": "CSV Fetching",
             "error": "Failed to fetch/load CSV",
             "exception": str(exc),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await operations.update_status(record_id, "on_hold", error_meta)
         return
@@ -593,7 +593,7 @@ async def process_csv_inline(
                 "stage": "CSV Column Validation",
                 "error": "Invalid CSV schema",
                 "validation_errors": errors,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             await operations.update_status(record_id, "on_hold", error_meta)
             return
@@ -736,7 +736,7 @@ async def process_csv_inline(
                 "stage": "Kafka Publishing",
                 "error": "Failed to publish record",
                 "exception": str(exc),
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             # Use "on_hold" — NOT "pending" — so that handle_push (which only
             # accepts status="pending") will reject any retry attempt.  Setting
@@ -750,7 +750,7 @@ async def process_csv_inline(
             return
 
     # --- 6. Update status to success ---
-    final_meta = {"rows_pushed": len(payloads), "processed_at": datetime.utcnow().isoformat() + "Z"}
+    final_meta = {"rows_pushed": len(payloads), "processed_at": datetime.now(timezone.utc).isoformat()}
     if schema_errors:
         final_meta["schema_validation_errors"] = schema_errors
 
@@ -991,7 +991,7 @@ def _build_dlq_messages(skipped: List[dict], record_id: int, tenant_code: str, s
     could not be built has no event, and answers may come from children). The original file is in
     the bucket (csv_uploads.cloud_storage_path) for replay after the fix.
     """
-    skipped_at = datetime.utcnow().isoformat() + "Z"
+    skipped_at = datetime.now(timezone.utc).isoformat()
     messages = []
     for entry in skipped:
         problems = entry["problems"]
@@ -1277,7 +1277,7 @@ async def _process_feedback_inline(
             "stage": "Feedback Config Resolution",
             "error": str(exc),
             "validation_errors": exc.errors,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         return
     except Exception as exc:
@@ -1285,7 +1285,7 @@ async def _process_feedback_inline(
         await operations.update_status(record_id, "on_hold", {
             "stage": "Feedback Config Resolution",
             "error": str(exc),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         return
 
@@ -1317,7 +1317,7 @@ async def _process_feedback_inline(
             "stage": "CSV Fetching",
             "error": "Failed to fetch/load CSV",
             "exception": str(exc),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await operations.update_status(record_id, "on_hold", error_meta)
         return
@@ -1336,7 +1336,7 @@ async def _process_feedback_inline(
             "stage": "Feedback Config Resolution",
             "error": str(exc),
             "validation_errors": exc.errors,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         return
     except Exception as exc:
@@ -1344,7 +1344,7 @@ async def _process_feedback_inline(
         await operations.update_status(record_id, "on_hold", {
             "stage": "Feedback Config Resolution",
             "error": str(exc),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         return
 
@@ -1359,7 +1359,7 @@ async def _process_feedback_inline(
             "stage": failure.stage,
             "error": failure.error,
             "exception": str(failure.cause),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         return
 
@@ -1380,7 +1380,7 @@ async def _process_feedback_inline(
                 "stage": "Kafka Publishing",
                 "error": "Failed to publish record",
                 "exception": str(exc),
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             return
 
@@ -1390,7 +1390,7 @@ async def _process_feedback_inline(
         "sessions_skipped": len(skipped),
         **report,
         "config_version_id": ctx["config_version_id"],
-        "processed_at": datetime.utcnow().isoformat() + "Z",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
     }
     if skipped:
         try:
