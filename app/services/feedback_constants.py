@@ -65,9 +65,9 @@ SOURCE_LABEL_RE = r"[a-z0-9_]{1,40}"
 MAX_SOURCE_LENGTH = 40
 # Tenant codes and persona keys (session_type) of an event: letters, digits, '.', '_', '-', at most 64 characters.
 SAFE_CODE_RE = r"[A-Za-z0-9._-]{1,64}"
-# Conversation / session ids: as above plus ':', at most 128 characters (Mitra ids are numeric or 32 hex; a form
+# Conversation / session ids: as above plus ':' and ',', at most 128 characters (Mitra ids are numeric, possibly comma-separated, or 32 hex; a form
 # response id is a UUID). Whitespace, CR/LF and every other control character are refused.
-SAFE_ID_RE = r"[A-Za-z0-9._:-]{1,128}"
+SAFE_ID_RE = r"[A-Za-z0-9._:,-]{1,128}"
 
 # Ceiling of ONE upload request body (bytes) for POST /v1/upload/, applied before the body is read (the persona's own
 # `max_csv_upload_bytes` is still the cap of its upload). 512 MiB: far above a real export, small enough that no

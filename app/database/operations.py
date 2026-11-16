@@ -811,7 +811,7 @@ async def insert_or_update_submission(
         if sub_date_str:
             submission_date = datetime.fromisoformat(sub_date_str.replace("Z", "+00:00"))
         elif event_type != "update":
-            submission_date = datetime.utcnow()
+            submission_date = datetime.now(timezone.utc)
         else:
             submission_date = None
 
