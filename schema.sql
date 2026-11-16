@@ -449,9 +449,9 @@ CREATE INDEX idx_llm_logs_analysis_type ON llm_logs (analysis_type);
 -- Dynamic metric filtering
 CREATE INDEX idx_submission_metrics_code ON submission_metrics (metric_code);
 
--- Keyset pagination index for bulk retry sweep: efficiently fetches failed submissions
+-- Keyset pagination index for bulk retry sweep: efficiently fetches failed and stale processing submissions
 -- ordered by (updated_at, submission_id) without a sequential scan.
-CREATE INDEX IF NOT EXISTS idx_submissions_failed ON submissions (updated_at, submission_id) WHERE status = 'failed';
+CREATE INDEX IF NOT EXISTS idx_submissions_retryable ON submissions (updated_at, submission_id) WHERE status IN ('failed', 'processing');
 
 -- -- =========================================================================
 -- -- EXPANDED VIEWS (To bypass JOINs in BI tools like Metabase)

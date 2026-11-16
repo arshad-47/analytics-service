@@ -10,13 +10,13 @@ from app.database.db import db
 from app.temporal.workflows import (
     ConfigDrivenProcessingWorkflow,
     BatchProcessingWorkflow,
-    BulkStepRetryWorkflow,
     MigrationWorkflow,
+    TriggerBulkRetryWorkflow,
 )
 from app.temporal.activities import (
     update_status_activity,
     fetch_pending_submissions_activity,
-    fetch_failed_submissions_activity,
+    trigger_bulk_retry_activity,
 )
 from app.temporal.migration_activity import run_migration_activity
 from app.temporal.deface_blur_activity import deface_blur_activity
@@ -73,8 +73,8 @@ async def start_worker():
     workflows = [
         ConfigDrivenProcessingWorkflow,
         BatchProcessingWorkflow,
-        BulkStepRetryWorkflow,
         MigrationWorkflow,
+        TriggerBulkRetryWorkflow,
     ]
     activities = [
         pii_and_abusive_language_detection_activity,
@@ -86,8 +86,8 @@ async def start_worker():
         feedback_metadata_extraction_activity,
         update_status_activity,
         fetch_pending_submissions_activity,
-        fetch_failed_submissions_activity,
         run_migration_activity,
+        trigger_bulk_retry_activity,
     ]
 
     worker = Worker(
@@ -155,8 +155,8 @@ async def start_worker():
     if settings.ENABLE_RETRY_CRON:
         retry_schedule = Schedule(
             action=ScheduleActionStartWorkflow(
-                BulkStepRetryWorkflow.run,
-                {"tenant_code": None, "batch_size": settings.BATCH_SIZE},
+                TriggerBulkRetryWorkflow.run,
+                {"tenant_code": None},
                 id="automated-daily-retry-sweep",
                 task_queue=settings.TEMPORAL_QUEUE,
             ),

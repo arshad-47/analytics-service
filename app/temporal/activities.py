@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -9,6 +10,7 @@ from app.database.db import db
 from app.database.feedback_operations import get_process_steps, mark_submission_config_failed
 from app.database.operations import insert_llm_log, get_submission_type_and_payload
 from app.services.feedback_constants import FEEDBACK_REPORT_TYPE
+from app.services.retry import dispatch_all_retry_workflows
 
 logger = logging.getLogger("analytics_service.temporal.activities")
 
@@ -101,77 +103,18 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
 
 
 @activity.defn
-async def fetch_failed_submissions_activity(params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+async def trigger_bulk_retry_activity(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Retrieves failed submissions for bulk retry.
+    Called by the Temporal cron schedule (TriggerBulkRetryWorkflow) to run the same
+    bulk retry sweep as POST /v1/retry-step/all — liveness check, reconciliation,
+    claim, and client.start_workflow — all inside this activity (no HTTP call needed).
     """
     params = params or {}
-    tenant_code = params.get("tenant_code")  # None = all tenants
-    limit = params.get("limit", settings.BATCH_SIZE)
-    failed_before = params.get("failed_before")
-    cursor_updated_at = params.get("cursor_updated_at")
-    cursor_submission_id = params.get("cursor_submission_id")
-    max_retry_attempts = params.get("max_retry_attempts", 5)
+    tenant_code = params.get("tenant_code")
+    result = await dispatch_all_retry_workflows(tenant_code, on_page=activity.heartbeat)
+    logger.info("Cron bulk retry sweep complete: sweep_id=%s", result.get("sweep_id"))
+    return result
 
-    persona_memo: Dict[Any, Any] = {}
-    async with db.pool.acquire() as conn:
-        from app.database.operations import fetch_retryable_failed_submissions
-
-        # BulkStepRetryWorkflow stops at the first page shorter than `limit` and moves its cursor to the last
-        # RETURNED row, so a feedback row left out here (its persona config cannot give steps) must not shorten the
-        # page, nor may a page of such rows come back empty while later failures remain: the page is refilled from
-        # the rows behind the cursor. The skipped rows stay failed and are looked at again by the next sweep.
-        results = []
-        while True:
-            remaining = limit - len(results)
-            rows = await fetch_retryable_failed_submissions(
-                conn,
-                tenant_code,
-                remaining,
-                failed_before=failed_before,
-                cursor_updated_at=cursor_updated_at,
-                cursor_submission_id=cursor_submission_id,
-                max_retry_attempts=max_retry_attempts,
-            )
-            for row in rows:
-                process_status = row.get("process_status")
-                if isinstance(process_status, str):
-                    try:
-                        process_status = json.loads(process_status)
-                    except Exception:
-                        process_status = {}
-
-                existing_steps = (process_status or {}).get("steps", [])
-                sub_type = row["submission_type"]
-                try:
-                    process_steps = await get_process_steps(conn, sub_type, row["submission_id"], row["tenant_code"], persona_memo)
-                except ValueError as exc:
-                    if FEEDBACK_REPORT_TYPE not in str(sub_type).lower():
-                        raise
-                    # A feedback persona whose config cannot give steps: leave the submission failed (it is
-                    # retried after the config is fixed) and keep sweeping the others.
-                    logger.error(
-                        "Cannot resolve the process steps of submission '%s' (tenant '%s', type '%s'): %s",
-                        row["submission_id"], row["tenant_code"], sub_type, exc,
-                    )
-                    continue
-
-                results.append({
-                    "submission_id": row["submission_id"],
-                    "session_id": row.get("session_id"),
-                    "tenant_code": row["tenant_code"],
-                    "submission_type": sub_type,
-                    "process_steps": process_steps,
-                    "existing_steps": existing_steps,
-                    "process_status": process_status,
-                    "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-                })
-            if len(rows) < remaining or len(results) >= limit or len(rows) == 0:
-                break
-            # the whole scanned page was not dispatchable (or only part of it): continue after the last scanned row
-            cursor_updated_at = rows[-1]["updated_at"]
-            cursor_submission_id = rows[-1]["submission_id"]
-        return results
 
 
 
