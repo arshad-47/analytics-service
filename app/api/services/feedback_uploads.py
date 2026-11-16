@@ -1,5 +1,7 @@
 """
-Pure parsing, validation and event building for `feedback` uploads (Mitra raw conversation CSVs).
+Pure parsing, validation and event building for the `conversation_rows` adapter of `feedback` uploads (one CSV row per
+message: a bot conversation export such as Mitra's). The config's `adapter` selects this module; the CSV column names
+come from the config's optional `column_map` (default: the role names), never from code.
 
 No DB, Kafka, network or settings access here: everything the functions need is passed in, so the
 module can be tested in isolation. The Kafka event shape and the version-1 config JSON are defined
@@ -19,27 +21,48 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from app.services.feedback_adapter_config import (
+    config_adapter,
+    is_safe_id,
+    required_column_headers,
+    resolve_column_map,
+    resolve_completion_map,
+    validate_adapter_config,
+)
 from app.services.feedback_config_validation import validate_feedback_config_keys
+from app.services.feedback_extraction_constants import DEFAULT_PII_MIN_DIGIT_RUN
 from app.services.feedback_versions import parse_versions, stamp_version
 from app.services.feedback_constants import (
+    ADAPTER_CONVERSATION_ROWS,
     CONFIG_KEY_EXPECT_STAGES,
     FEEDBACK_REPORT_TYPE,
+    MAX_SEQUENCE,
     SYNTHESISED_FIRST_QUESTION_SEQUENCE,
 )
 
 _INT_RE = re.compile(r"^[0-9]+$")
 _ISO_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+# Row numbers listed in a problem message (the rest is only counted). Problems carry counts, row numbers and column
+# names, NEVER a cell value: a misaligned or hostile file can hold respondent text in any column, and the problems go to
+# the DLQ, the logs, csv_uploads.meta_data and the 400 body.
 _SAMPLE_SIZE = 3
 # Distinct unexpected stage names listed in a stage report (the rest is only counted).
 _MAX_REPORTED_STAGES = 200
 # Only a value shaped like a stage key (AGE_IDENTIFICATION) may be named in the stage report; see report_unexpected_stages.
 _STAGE_KEY_PATTERN = re.compile(r"[A-Za-z0-9_]{1,64}")
 
-# Roles the builder reads from the CSV. translated_message is optional (English sessions may omit it).
-_ROLE_COLUMNS = (
-    "submission_id", "session", "session_status", "session_type", "language",
-    "sequence", "message", "created_at", "stage", "sender_id",
-)
+
+def _may_be_named_in_a_report(stage: str) -> bool:
+    """
+    A stage value is named in the report only when it is shaped like a stage key AND does not carry an identifying
+    number: a misaligned cell can hold a phone or id number (`9876543210` fits the key pattern). The numeric check is
+    the PII digit threshold of the extraction (DEFAULT_PII_MIN_DIGIT_RUN) applied to the digits of the whole value, so
+    a separator (`98765_43210`) or a letter prefix does not hide it; a real stage key has a handful of digits at most.
+    """
+    if _STAGE_KEY_PATTERN.fullmatch(stage) is None:
+        return False
+    return sum(1 for ch in stage if ch.isdigit()) < DEFAULT_PII_MIN_DIGIT_RUN
+
 
 
 # ---------------------------------------------------------------------------------------------
@@ -82,35 +105,36 @@ def check_feedback_file(df: pd.DataFrame, config: Dict[str, Any], expected_sessi
     """
     File-level checks. Returns error strings; an empty list means the file may be processed.
 
-    - every required column (config["columns"]["required"], case-insensitive) is present;
+    - every required role (config["column_map"] over the default role names; session_type, session_status, session,
+      submission_id, language, sequence, message, created_at, stage, sender_id) has its CSV column, matched
+      case-insensitively;
     - every row's session_type is present and equals `expected_session_type` (a file holding another
-      persona is rejected whole; the offending values are reported). The bot id is NOT checked: one
+      persona is rejected whole; only counts are reported, never the cell values). The bot id is NOT checked: one
       persona runs several bots over time and the same file may hold V1 and V2 sessions.
     Blank submission_id / session cells are session-level problems (see build_feedback_events), not
     file-level ones. Extra columns are fine.
     """
     errors: List[str] = []
     lookup = _column_lookup(df)
+    headers = required_column_headers(config)
 
-    required = config["columns"]["required"]
-    missing = [col for col in required if col.strip().lower() not in lookup]
+    missing = [header for header in headers.values() if header.lower() not in lookup]
     if missing:
         errors.append("Missing required column(s): " + ", ".join(missing))
 
-    type_col = lookup.get("session_type")
+    type_col = lookup.get(headers["session_type"].lower())
     if type_col is None:
-        if "session_type" not in [c.strip().lower() for c in required]:
-            errors.append("Missing required column(s): session_type")
         return errors
 
     expected = str(expected_session_type).strip()
     session_types = df[type_col].astype(str).str.strip()
     blank_rows = int((session_types == "").sum())
-    other_types = sorted({t for t in session_types.unique().tolist() if t != "" and t != expected})
-    if other_types:
-        shown = ", ".join(other_types[:10]) + (" ..." if len(other_types) > 10 else "")
+    other_rows = int(((session_types != "") & (session_types != expected)).sum())
+    if other_rows > 0:
+        distinct = len({t for t in session_types.unique().tolist() if t != "" and t != expected})
         errors.append(
-            f"File contains rows for session_type {shown}, but only session_type {expected} is allowed for this upload"
+            f"{other_rows} row(s) carry a session_type other than {expected} ({distinct} other value(s)); only "
+            f"session_type {expected} is allowed for this upload"
         )
     if blank_rows > 0:
         errors.append(f"session_type is blank in {blank_rows} row(s); every row must carry session_type {expected}")
@@ -127,7 +151,8 @@ def report_unexpected_stages(df: pd.DataFrame, config: Dict[str, Any]) -> Option
     (at most _MAX_REPORTED_STAGES stages listed, the most frequent first; "truncated": True when more exist).
     Blank stages (the opening row) are ignored; a session is (submission_id, session).
 
-    Privacy: only values that look like a stage KEY (_STAGE_KEY_PATTERN) are listed by name. A misaligned file whose
+    Privacy: only values that look like a stage KEY (_STAGE_KEY_PATTERN) and carry no identifying number
+    (_may_be_named_in_a_report) are listed by name. A misaligned file whose
     stage column holds message text would otherwise copy respondent text into the upload response and
     csv_uploads.meta_data, so every other distinct value is only counted, under "other_stage_values" (a count, no
     text; present only when it is above 0). Those sessions still count in "sessions_with_unexpected_stages".
@@ -136,7 +161,8 @@ def report_unexpected_stages(df: pd.DataFrame, config: Dict[str, Any]) -> Option
         return None
     known = set(config[CONFIG_KEY_EXPECT_STAGES]) | set(config.get("closing_keys", []))
     lookup = _column_lookup(df)
-    stage_col, sub_col, sess_col = lookup.get("stage"), lookup.get("submission_id"), lookup.get("session")
+    roles = resolve_column_map(config)
+    stage_col, sub_col, sess_col = (lookup.get(roles[r].lower()) for r in ("stage", "submission_id", "session"))
     if stage_col is None or sub_col is None or sess_col is None:
         return {"sessions": 0, "sessions_with_unexpected_stages": 0, "unexpected_stage_count": 0,
                 "unexpected_stages": {}, "note": "stage, submission_id or session column is missing"}
@@ -148,7 +174,7 @@ def report_unexpected_stages(df: pd.DataFrame, config: Dict[str, Any]) -> Option
     sessions = len(frame[["sub", "sess"]].drop_duplicates())
     unknown = frame[(frame["stage"] != "") & (~frame["stage"].isin(known))].drop_duplicates()
     counts = unknown["stage"].value_counts()
-    key_like = [(stage, int(n)) for stage, n in counts.items() if _STAGE_KEY_PATTERN.fullmatch(stage) is not None]
+    key_like = [(stage, int(n)) for stage, n in counts.items() if _may_be_named_in_a_report(stage)]
     other_stage_values = len(counts) - len(key_like)
     ordered = sorted(key_like, key=lambda item: (-item[1], item[0]))
     report: Dict[str, Any] = {
@@ -172,9 +198,10 @@ def _is_blank(value: Optional[str]) -> bool:
     return value is None or value.strip() == ""
 
 
-def _sample(values: List[Any]) -> str:
-    shown = ", ".join(repr(v) for v in values[:_SAMPLE_SIZE])
-    return shown + (" ..." if len(values) > _SAMPLE_SIZE else "")
+def _rows(positions: List[int]) -> str:
+    """'data row(s) 3, 7, 9 ...' from 0-based frame positions (1-based data row numbers, header not counted)."""
+    numbers = ", ".join(str(i + 1) for i in positions[:_SAMPLE_SIZE])
+    return f"data row(s) {numbers}" + (" ..." if len(positions) > _SAMPLE_SIZE else "")
 
 
 def _distinct(values: List[str]) -> List[str]:
@@ -216,6 +243,10 @@ def _parse_datetime(value: str, fallback_tz) -> Optional[datetime]:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=fallback_tz)
+    try:
+        dt.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None  # year 0001 / 9999 at an offset: not representable in UTC, so it is an unparsable date
     return dt
 
 
@@ -224,7 +255,11 @@ def _normalise_answer(text: str) -> str:
 
 
 def _check_config(config: Dict[str, Any]) -> None:
-    for key in ("session_type", "bot_sender_ids", "message_map", "sequence_offset", "completion_values", "questions",
+    if config_adapter(config) != ADAPTER_CONVERSATION_ROWS:
+        raise ValueError(
+            f"Feedback config adapter must be {ADAPTER_CONVERSATION_ROWS!r} for this builder, got {config['adapter']!r}"
+        )
+    for key in ("session_type", "bot_sender_ids", "message_map", "sequence_offset", "questions",
                 "questionnaire_versions"):
         if key not in config:
             raise ValueError(f"Feedback config is missing '{key}'")
@@ -240,8 +275,9 @@ def _check_config(config: Dict[str, Any]) -> None:
             raise ValueError(f"Feedback config message_map.{kind} must map 'message' and 'translated_message'")
     if len(config["questions"]) == 0:
         raise ValueError("Feedback config has an empty 'questions' catalog")
-    # max_csv_upload_bytes / ingestion_schema / process_steps (+ optional expect_stages) live in the config too
+    # adapter / max_csv_upload_bytes / ingestion_schema / process_steps (+ optional expect_stages) live in the config too
     validate_feedback_config_keys(config)
+    validate_adapter_config(config)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -286,7 +322,8 @@ def build_feedback_events(
     """
     _check_config(config)
     lookup = _column_lookup(df)
-    missing = [role for role in _ROLE_COLUMNS if role not in lookup]
+    roles = resolve_column_map(config)
+    missing = [header for header in required_column_headers(config).values() if header.lower() not in lookup]
     if missing:
         raise ValueError("Feedback CSV is missing required column(s): " + ", ".join(missing))
 
@@ -294,7 +331,9 @@ def build_feedback_events(
     published = published_at if published_at is not None else _format_utc(datetime.now(timezone.utc))
 
     def column(name: str) -> List[str]:
-        actual = lookup.get(name)
+        """The cells of a role (its header comes from column_map); any other name is read as a CSV column name."""
+        header = roles[name] if name in roles else name
+        actual = lookup.get(header.strip().lower())
         if actual is None:
             return [""] * len(df)
         return df[actual].astype(str).tolist()
@@ -338,7 +377,7 @@ def build_feedback_events(
     versions = parse_versions(config)
     expected_session_type = str(config["session_type"]).strip()
     bot_sender_ids = {str(s).strip() for s in config["bot_sender_ids"]}
-    completion_values = list(config["completion_values"])
+    completion_map = resolve_completion_map(config)
     closing_keys = set(config.get("closing_keys", []))
     offset = int(config["sequence_offset"])
     catalog = {q["key"]: q for q in config["questions"]}
@@ -360,10 +399,18 @@ def build_feedback_events(
         if sess == "":
             problems.append(f"session is blank in {len(idx)} row(s)")
         if sub != "" and len(sessions_of_submission.get(sub, [])) > 1:
-            problems.append(f"submission_id {sub!r} maps to {len(sessions_of_submission[sub])} different sessions")
+            problems.append(f"submission_id maps to {len(sessions_of_submission[sub])} different sessions")
         if sess != "" and len(submissions_of_session.get(sess, [])) > 1:
-            problems.append(f"session {sess!r} maps to {len(submissions_of_session[sess])} different submission_ids")
-        if sub == "" or sess == "":
+            problems.append(f"session maps to {len(submissions_of_session[sess])} different submission_ids")
+        # Ids reach DLQ headers, log lines and cache keys: a value outside [A-Za-z0-9._:-]{1,128} is refused
+        # and never echoed (it could be respondent text from a misaligned file, or a forged log line).
+        if sub != "" and not is_safe_id(sub):
+            problems.append(f"submission_id has unsupported characters or is too long in {len(idx)} row(s)")
+            sub_id = None
+        if sess != "" and not is_safe_id(sess):
+            problems.append(f"session has unsupported characters or is too long in {len(idx)} row(s)")
+            sess_id = None
+        if sub == "" or sess == "" or sub_id is None or sess_id is None:
             skipped.append({"submissionId": sub_id, "sessionId": sess_id, "problems": problems})
             continue
 
@@ -371,29 +418,39 @@ def build_feedback_events(
         seq_by_pos: Dict[int, int] = {}
         blank_seq = 0
         bad_seq: List[str] = []
-        non_positive: List[str] = []
+        non_positive: List[int] = []
+        too_large: List[int] = []
         for i in idx:
             raw = sequences[i]
             if raw == "":
                 blank_seq += 1
-            elif not _INT_RE.match(raw):
-                bad_seq.append(raw)
+            elif _INT_RE.match(raw) is None:
+                bad_seq.append(i)
+            elif len(raw.lstrip("0")) > 10 or int(raw) > MAX_SEQUENCE:
+                too_large.append(i)  # beyond the 32-bit stored column (also avoids int() on a huge digit string)
             elif int(raw) < 1:
-                non_positive.append(raw)
+                non_positive.append(i)
             else:
                 seq_by_pos[i] = int(raw)
         if blank_seq > 0:
             problems.append(f"sequence is missing in {blank_seq} row(s)")
         if len(bad_seq) > 0:
-            problems.append(f"sequence is not an integer in {len(bad_seq)} row(s): {_sample(bad_seq)}")
+            problems.append(f"sequence is not an integer in {len(bad_seq)} row(s) ({_rows(bad_seq)})")
         if len(non_positive) > 0:
-            problems.append(f"sequence must be 1 or greater: {_sample(non_positive)}")
+            problems.append(f"sequence must be 1 or greater in {len(non_positive)} row(s) ({_rows(non_positive)})")
+        if len(too_large) > 0:
+            problems.append(
+                f"sequence is above {MAX_SEQUENCE} (the largest stored sequence) in {len(too_large)} row(s) "
+                f"({_rows(too_large)})"
+            )
+        if len(seq_by_pos) > 0 and max(seq_by_pos.values()) + max(offset, 0) > MAX_SEQUENCE:
+            problems.append(f"sequence plus the configured sequence_offset is above {MAX_SEQUENCE}")
         seen_seq: Dict[int, int] = {}
         for seq in seq_by_pos.values():
             seen_seq[seq] = seen_seq.get(seq, 0) + 1
         duplicates = sorted(s for s, n in seen_seq.items() if n > 1)
         if len(duplicates) > 0:
-            problems.append(f"duplicate sequence(s) in the session: {_sample(duplicates)}")
+            problems.append(f"duplicate sequence(s) in the session ({len(duplicates)} sequence number(s) repeated)")
 
         # The opening row: sequence 1 with blank sender_id, stage and created_at (new-shape export).
         opening_pos: Optional[int] = None
@@ -404,12 +461,11 @@ def build_feedback_events(
                 opening_pos = at_one[0]
 
         # ---- text ----
-        empty_rows = [sequences[i] for i in idx
+        empty_rows = [i for i in idx
                       if _is_blank(csv_text["message"][i]) and _is_blank(csv_text["translated_message"][i])]
         if len(empty_rows) > 0:
             problems.append(
-                f"message and translated_message are both empty in {len(empty_rows)} row(s) "
-                f"(sequence {_sample(empty_rows)})"
+                f"message and translated_message are both empty in {len(empty_rows)} row(s) ({_rows(empty_rows)})"
             )
 
         # ---- sender ----
@@ -420,47 +476,46 @@ def build_feedback_events(
         # ---- constant-within-session columns ----
         status_values = _distinct([statuses[i] for i in idx])
         if len(status_values) > 1:
-            problems.append("session_status differs within the session: " + _sample(status_values))
-        invalid_status = [v for v in status_values if v not in completion_values]
+            problems.append(f"session_status differs within the session ({len(status_values)} distinct values)")
+        invalid_status = [v for v in status_values if v not in completion_map]
         if len(invalid_status) > 0:
             problems.append(
-                f"session_status {_sample(invalid_status)} is not one of: " + ", ".join(completion_values)
+                f"session_status has {len(invalid_status)} value(s) that are not in the config's completion_map "
+                f"(accepted: " + ", ".join(completion_map) + ")"
             )
         language_values = _distinct([languages[i] for i in idx])
         if "" in language_values:
             problems.append(f"language is blank in {sum(1 for i in idx if languages[i] == '')} row(s)")
         non_blank_languages = [v for v in language_values if v != ""]
         if len(non_blank_languages) > 1:
-            problems.append("language differs within the session: " + _sample(non_blank_languages))
+            problems.append(f"language differs within the session ({len(non_blank_languages)} distinct values)")
         # The bot is informational: blank cells (a row without a bot id) are ignored, only two different
         # non-blank bot ids inside one session are a problem.
         bot_values = _distinct([bot_ids[i] for i in idx if bot_ids[i] != ""])
         if len(bot_values) > 1:
-            problems.append("bot_id differs within the session: " + _sample(bot_values))
+            problems.append(f"bot_id differs within the session ({len(bot_values)} distinct values)")
         type_values = _distinct([session_types[i] for i in idx])
         if "" in type_values:
             problems.append(f"session_type is blank in {sum(1 for i in idx if session_types[i] == '')} row(s)")
         non_blank_types = [v for v in type_values if v != ""]
         if len(non_blank_types) > 1:
-            problems.append("session_type differs within the session: " + _sample(non_blank_types))
+            problems.append(f"session_type differs within the session ({len(non_blank_types)} distinct values)")
         elif len(non_blank_types) == 1 and non_blank_types[0] != expected_session_type:
-            problems.append(
-                f"session_type {non_blank_types[0]!r} does not match the config's {expected_session_type!r}"
-            )
+            problems.append(f"session_type does not match the config's {expected_session_type!r}")
 
         # ---- created_at ----
         parsed_at: Dict[int, datetime] = {}
-        bad_dates: List[str] = []
+        bad_dates: List[int] = []
         for i in idx:
             if i == opening_pos:
                 continue  # the opening row has no time by design
             dt = _parse_datetime(created[i], fallback_tz)
             if dt is None:
-                bad_dates.append(created[i])
+                bad_dates.append(i)
             else:
                 parsed_at[i] = dt
         if len(bad_dates) > 0:
-            problems.append(f"created_at is missing or unparsable in {len(bad_dates)} row(s): {_sample(bad_dates)}")
+            problems.append(f"created_at is missing or unparsable in {len(bad_dates)} row(s) ({_rows(bad_dates)})")
 
         if len(problems) > 0:
             skipped.append({"submissionId": sub_id, "sessionId": sess_id, "problems": problems})
@@ -480,7 +535,7 @@ def build_feedback_events(
 
         language = languages[first]
         is_english = language.lower() in english_languages
-        completion_status = statuses[first]
+        completion_status = completion_map[statuses[first]]
 
         def row_texts(i: int, is_bot: bool) -> Tuple[str, Optional[str]]:
             """(text in the conversation language, English text) of a row; bot rows swap the CSV columns."""
@@ -526,7 +581,7 @@ def build_feedback_events(
             if question is None:
                 skipped.append({
                     "submissionId": sub_id, "sessionId": sess_id,
-                    "problems": [f"first row's stage {first_key!r} has no entry in the questions catalog "
+                    "problems": [f"the first row's stage has no entry in the questions catalog "
                                  f"(expected one of: {', '.join(sorted(catalog))})"],
                 })
                 continue
@@ -595,6 +650,7 @@ def build_feedback_events(
             },
             "data": {
                 "source": source,
+                "adapter": ADAPTER_CONVERSATION_ROWS,
                 "sessionType": expected_session_type,
                 "questionnaireVersion": stamp_version(versions, session_start),
                 "botId": bot_values[0] if bot_values else None,

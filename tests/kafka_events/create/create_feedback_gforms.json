@@ -16,6 +16,7 @@
   },
   "data": {
     "source": "google_forms",
+    "adapter": "wide_form",
     "sessionType": "Youth_Voice",
     "questionnaireVersion": "V1",
     "language": "en",

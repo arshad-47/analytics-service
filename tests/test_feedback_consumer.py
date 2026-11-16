@@ -6,6 +6,7 @@ success-at-ingest rule, and that story/discussion paths are untouched. The real-
 """
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,7 +17,7 @@ import pytest
 import app.kafka.consumer as consumer_module
 from app.database import operations
 from app.database.operations import FeedbackUpdateNotSupportedError, insert_or_update_submission
-from seed_support import gforms_config_v1, mitra_config_v1
+from seed_support import FEEDBACK_PROGRAM_NAME, gforms_config_v1, mitra_config_v1
 from conftest import FakeConn, install_fake_db
 
 FIXTURES = Path(__file__).resolve().parent / "kafka_events"
@@ -32,10 +33,11 @@ def _feedback_event(event_type="create", **overrides):
     event = {
         "submissionId": "184884", "submissionType": "feedback", "sessionId": "s" * 32,
         "tenantCode": "mitra", "eventType": event_type, "eventPublishedAt": "2026-10-15T08:54:43.000Z",
-        "tags": {"programId": PROGRAM_ID, "programName": "1M Voice", "leaderCategoryId": LEADER_ID,
+        "tags": {"programId": PROGRAM_ID, "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": LEADER_ID,
                  "leaderCategoryName": "Youth", "state": None, "district": None, "source": "mitra"},
         "data": {
-            "source": "mitra", "sessionType": "Youth_Voice", "questionnaireVersion": "V2",
+            "source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice",
+            "questionnaireVersion": "V2",
             "botId": "101", "botName": "Mitra Youth Test Bot",
             "language": "hi", "completionStatus": "IN_PROGRESS",
             "submissionDate": "2026-10-15T08:54:43.000Z",
@@ -265,7 +267,7 @@ def test_feedback_steps_come_from_the_persona_config_story_from_settings(monkeyp
 
 def test_feedback_steps_lookup_failure_is_not_read_as_no_steps(monkeypatch):
     """A persona config without usable process_steps never means 'no steps' (never marked success): the stored row
-    is marked failed (tests/test_feedback_review_fixes.py), no workflow starts; a database error propagates."""
+    is marked failed (see below, the real-time trigger tests), no workflow starts; a database error propagates."""
     async def run():
         consumer, _, status_mock = _trigger_setup(monkeypatch, [])
         consumer.steps_mock.side_effect = ValueError("missing 'process_steps'")
@@ -516,7 +518,11 @@ def test_feedback_update_event_raises_before_any_write():
     (lambda e: e["data"]["messages"][1].update(parentSequence=2), "lower than its own sequence"),
     (lambda e: e["data"]["messages"][1].update(parentSequence="1"), "parentSequence must be an integer"),
     (lambda e: e["data"].update(completionStatus="DONE"), "completionStatus"),
-    (lambda e: e["data"].update(source="csv"), "data.source"),
+    (lambda e: e["data"].update(source="Bad Source"), "data.source"),
+    (lambda e: e["data"].pop("adapter"), "data.adapter"),
+    (lambda e: e["data"].update(adapter="excel"), "data.adapter"),
+    (lambda e: e["data"]["messages"][1].update(sequence=2147483648), "sequence must be an integer from 1 to 2147483647"),
+    (lambda e: e.update(submissionId="1\nFORGED"), "unsafe submissionId"),
     (lambda e: e.pop("sessionId"), "sessionId"),
     (lambda e: e["data"].pop("sessionType"), "data.sessionType must be a non-empty string"),
     (lambda e: e["data"].update(sessionType=None), "data.sessionType must be a non-empty string"),
@@ -655,8 +661,8 @@ STORED_ID = "0e9c8a77-1d2b-4c3d-8e4f-5a6b7c8d9e0f"
 def _gforms_event(**data_overrides):
     event = _feedback_event(submissionId=GF_ID, sessionId=GF_ID)
     event["tags"]["source"] = "google_forms"
-    event["data"].update(source="google_forms", language="en", completionStatus="COMPLETED", sourceRef=GF_REF,
-                         questionnaireVersion="V1")
+    event["data"].update(source="google_forms", adapter="wide_form", language="en", completionStatus="COMPLETED",
+                         sourceRef=GF_REF, questionnaireVersion="V1")
     event["data"].pop("botId"), event["data"].pop("botName")  # Google Forms carries no Mitra bot
     event["data"].update(data_overrides)
     return event
@@ -889,4 +895,78 @@ def test_consumer_already_stored_but_pending_gforms_response_is_processed_under_
             insert_result={"id": "u", "submission_id": STORED_ID, "status": "pending", "changed": False})
         await consumer.process_message(json.dumps(_gforms_event()))
         trigger_mock.assert_awaited_once_with(STORED_ID, "mitra", "feedback")  # not the event's fresh uuid
+    asyncio.run(run())
+
+
+# a bad persona config does not stall the real-time trigger; the DLQ reason; the programId check ------
+
+# real-time trigger: a bad config marks the row failed, a database error propagates -------------------
+
+def test_realtime_trigger_marks_the_stored_row_failed_when_the_config_is_bad(monkeypatch, caplog):
+    async def run():
+        consumer, conn, status_mock = _trigger_setup(monkeypatch, [])
+        consumer.steps_mock.side_effect = ValueError("missing 'process_steps'")
+        failed = AsyncMock()
+        monkeypatch.setattr(consumer_module.feedback_operations, "update_submission_status", failed)
+        with caplog.at_level(logging.ERROR):
+            await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")  # does not raise: no retry / DLQ
+        failed.assert_awaited_once()
+        assert failed.await_args.args[1:4] == ("184884", "mitra", "failed")
+        assert "missing 'process_steps'" in failed.await_args.args[4]["error_message"]
+        assert "184884" in caplog.text and "mitra" in caplog.text
+        status_mock.assert_not_awaited()
+        consumer.temporal_client.start_workflow.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_realtime_trigger_lets_a_database_error_propagate_for_the_retry(monkeypatch):
+    async def run():
+        consumer, _, _ = _trigger_setup(monkeypatch, [])
+        consumer.steps_mock.side_effect = ConnectionError("db down")
+        with pytest.raises(ConnectionError):
+            await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")
+    asyncio.run(run())
+
+
+# DLQ reason: operator error, replayable after the migrate -----------------------------------------------
+
+@pytest.mark.parametrize("loader", [
+    AsyncMock(return_value=None),
+    AsyncMock(side_effect=ValueError("Feedback config of session_type 'Youth_Voice' (mitra) is missing 'ingestion_schema'")),
+])
+def test_dlq_reason_for_a_missing_or_invalid_config_says_it_can_be_replayed_after_migrate(monkeypatch, loader):
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        _patch_active_config(monkeypatch, loader=loader)
+        await consumer.process_message(json.dumps(_feedback_event()))
+        insert_mock.assert_not_awaited()
+        args = dlq_mock.await_args.args
+        assert "python tools/feedback_config.py migrate" in args[1] and "replay" in args[1]
+        assert args[2] == {"submissionId": "184884", "tenantCode": "mitra", "sessionId": "s" * 32}
+    asyncio.run(run())
+
+
+def test_a_genuinely_bad_event_does_not_get_the_operator_hint(monkeypatch):
+    async def run():
+        consumer, _, _, _, _, dlq_mock = _consumer(monkeypatch)
+        consumer_module.validate_ingestion_schema.return_value = ["'data.language' is missing"]
+        await consumer.process_message(json.dumps(_feedback_event()))
+        assert "feedback_config.py migrate" not in dlq_mock.await_args.args[1]
+    asyncio.run(run())
+
+
+# tags.programId must be a UUID ---------------------------------------------------------------------------
+
+def test_non_uuid_program_id_goes_straight_to_the_dlq_with_identifiers_and_no_config_query(monkeypatch):
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        calls = _patch_active_config(monkeypatch)
+        event = _feedback_event()
+        event["tags"]["programId"] = "not-a-uuid"
+        await consumer.process_message(json.dumps(event))
+        assert calls == []  # the lookup (a uuid column: asyncpg.DataError) is never attempted
+        insert_mock.assert_not_awaited()
+        args = dlq_mock.await_args.args
+        assert "'tags.programId' must be a UUID" in args[1]
+        assert args[2] == {"submissionId": "184884", "tenantCode": "mitra", "sessionId": "s" * 32}
     asyncio.run(run())

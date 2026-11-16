@@ -7,7 +7,12 @@ import copy
 import pytest
 
 from app.services.feedback_config_validation import (
+    FEEDBACK_PROCESS_STEP_NAMES,
     MINIMUM_CREATE_REQUIRED,
+    MAX_CSV_UPLOAD_BYTES_LIMIT,
+    MINIMUM_DELETE_REQUIRED,
+    SETTABLE_CONFIG_KEYS,
+    config_setting_problems,
     validate_config_value,
     validate_expect_stages,
     validate_feedback_config_keys,
@@ -15,6 +20,7 @@ from app.services.feedback_config_validation import (
     validate_max_csv_upload_bytes,
     validate_process_steps,
 )
+from app.services.feedback_extraction_constants import MAX_LLM_TIMEOUT_SECONDS
 from app.services.feedback_constants import (
     DEFAULT_INGESTION_SCHEMA,
     DEFAULT_MAX_CSV_UPLOAD_BYTES,
@@ -130,7 +136,23 @@ def test_schema_create_needs_a_required_list():
         validate_ingestion_schema_config(schema)
 
 
-@pytest.mark.parametrize("path", MINIMUM_CREATE_REQUIRED)
+# The floor of a create event, written out HERE and not read from the module: iterating over the module's own tuple
+# would drop a case together with a path that someone removes from it. Each path is read by the writer without a
+# default (a missing programId would store a session that no persona config covers; a missing questionnaireVersion
+# stamps the wrong version; ...). A config may require more, never fewer.
+CREATE_FLOOR = (
+    "submissionId", "submissionType", "sessionId", "tenantCode", "tags.programId", "data.source", "data.sessionType",
+    "data.questionnaireVersion", "data.completionStatus", "data.submissionDate", "data.messages",
+)
+DELETE_FLOOR = ("submissionId", "tenantCode")
+
+
+def test_the_module_floor_contains_every_path_of_the_pinned_floor():
+    assert set(CREATE_FLOOR) <= set(MINIMUM_CREATE_REQUIRED)
+    assert set(DELETE_FLOOR) <= set(MINIMUM_DELETE_REQUIRED)
+
+
+@pytest.mark.parametrize("path", CREATE_FLOOR)
 def test_schema_must_keep_the_minimum_required_paths(path):
     schema = _schema()
     schema["create"]["required"].remove(path)
@@ -138,16 +160,18 @@ def test_schema_must_keep_the_minimum_required_paths(path):
         validate_ingestion_schema_config(schema)
 
 
+
 # process_steps --------------------------------------------------------------------------------
 
-def test_steps_accept_the_story_format():
-    steps = [
-        {"name": "feedback_metadata_extraction"},
-        {"name": "pii_and_abusive_language_detection", "columns": ["message"], "llm_model": "m",
-         "max_tokens": 2048, "llm_timeout_seconds": 60},
-        {"name": "x", "llm_timeout_seconds": 1.5},
-    ]
+def test_steps_accept_the_supported_step_with_its_overrides():
+    steps = [{"name": "feedback_metadata_extraction", "columns": ["message"], "llm_model": "m",
+              "max_tokens": 2048, "llm_timeout_seconds": 60}]
     assert validate_process_steps(steps) is steps
+    assert validate_process_steps([{"name": FEEDBACK_METADATA_EXTRACTION_STEP}])
+
+
+def test_the_step_registry_is_the_extraction_step():
+    assert FEEDBACK_PROCESS_STEP_NAMES == (FEEDBACK_METADATA_EXTRACTION_STEP,)
 
 
 def test_empty_steps_are_valid():
@@ -160,25 +184,76 @@ def test_steps_must_be_a_list(bad):
         validate_process_steps(bad)
 
 
+_STEP = FEEDBACK_METADATA_EXTRACTION_STEP
+
+
 @pytest.mark.parametrize("step,needle", [
     ("x", "must be an object"),
     ({}, "non-empty string 'name'"),
     ({"name": ""}, "non-empty string 'name'"),
     ({"name": "  "}, "non-empty string 'name'"),
     ({"name": 3}, "non-empty string 'name'"),
-    ({"name": "a", "columns": "x"}, "columns must be a list"),
-    ({"name": "a", "columns": [""]}, "columns must be a list"),
-    ({"name": "a", "llm_model": ""}, "llm_model"),
-    ({"name": "a", "max_tokens": 0}, "max_tokens"),
-    ({"name": "a", "max_tokens": True}, "max_tokens"),
-    ({"name": "a", "max_tokens": 1.5}, "max_tokens"),
-    ({"name": "a", "llm_timeout_seconds": 0}, "llm_timeout_seconds"),
-    ({"name": "a", "llm_timeout_seconds": "60"}, "llm_timeout_seconds"),
-    ({"name": "a", "colums": []}, "unknown key"),
+    ({"name": _STEP, "columns": "x"}, "columns must be a list"),
+    ({"name": _STEP, "columns": [""]}, "columns must be a list"),
+    ({"name": _STEP, "llm_model": ""}, "llm_model"),
+    ({"name": _STEP, "max_tokens": 0}, "max_tokens"),
+    ({"name": _STEP, "max_tokens": True}, "max_tokens"),
+    ({"name": _STEP, "max_tokens": 1.5}, "max_tokens"),
+    ({"name": _STEP, "llm_timeout_seconds": 0}, "llm_timeout_seconds"),
+    ({"name": _STEP, "llm_timeout_seconds": "60"}, "llm_timeout_seconds"),
+    ({"name": _STEP, "colums": []}, "unknown key"),
 ])
 def test_invalid_steps_are_rejected_with_their_position(step, needle):
-    with pytest.raises(ValueError, match=r"process_steps\[1\]'.*" + needle):
-        validate_process_steps([{"name": "ok"}, step])
+    with pytest.raises(ValueError, match=r"process_steps\[0\]'.*" + needle):
+        validate_process_steps([step])
+
+
+# C6: what the validator accepts must be what the runtime accepts ---------------------------------
+
+@pytest.mark.parametrize("name", ["feedback_metadata_extractoin", "pii_and_abusive_language_detection", "x", "Feedback_Metadata_Extraction"])
+def test_an_unsupported_step_name_is_rejected_when_written(name):
+    # the workflow would fail every later submission of the persona with "Unsupported step name"
+    with pytest.raises(ValueError, match=r"process_steps\[0\]'.*unsupported step name"):
+        validate_process_steps([{"name": name}])
+
+
+def test_a_duplicate_step_name_is_rejected():
+    with pytest.raises(ValueError, match=r"process_steps\[1\]'.*repeats the step name"):
+        validate_process_steps([{"name": _STEP}, {"name": _STEP}])
+
+
+@pytest.mark.parametrize("timeout", [30.5, 60.0, 1e2, True, "60", 0, -1, None])
+def test_the_step_timeout_must_be_a_positive_integer_like_the_runtime_requires(timeout):
+    # resolve_llm_settings raises "llm timeout must be a positive integer" for every one of these
+    with pytest.raises(ValueError, match="llm_timeout_seconds must be a positive integer"):
+        validate_process_steps([{"name": _STEP, "llm_timeout_seconds": timeout}])
+
+
+def test_the_step_timeout_is_capped_at_what_the_workflow_can_give_its_activity():
+    assert validate_process_steps([{"name": _STEP, "llm_timeout_seconds": MAX_LLM_TIMEOUT_SECONDS}])
+    with pytest.raises(ValueError, match=f"at most {MAX_LLM_TIMEOUT_SECONDS} seconds"):
+        validate_process_steps([{"name": _STEP, "llm_timeout_seconds": MAX_LLM_TIMEOUT_SECONDS + 1}])
+
+
+@pytest.mark.parametrize("path", ["sessionId", "submissionType", "data.completionStatus", "data.submissionDate"])
+def test_the_schema_floor_covers_what_the_ingest_needs(path):
+    # without these the consumer's ingest raises (sessionId, submissionType, completionStatus) or silently replaces
+    # the session's start with now() (submissionDate)
+    assert path in MINIMUM_CREATE_REQUIRED
+    schema = _schema()
+    schema["create"]["required"].remove(path)
+    with pytest.raises(ValueError, match=f"must include: {path}"):
+        validate_ingestion_schema_config(schema)
+
+
+def test_adapter_is_delegated_to_its_owner_and_the_settable_keys_are_listed():
+    config = mitra_config_v1("Youth")
+    config["adapter"] = "no_such_adapter"
+    with pytest.raises(ValueError, match="adapter"):
+        validate_feedback_config_keys(config)
+    assert "adapter" in config_setting_problems(config)
+    assert set(SETTABLE_CONFIG_KEYS) == {"adapter", "max_csv_upload_bytes", "ingestion_schema", "process_steps",
+                                         "expect_stages", "column_map", "completion_map"}
 
 
 # expect_stages --------------------------------------------------------------------------------
@@ -228,3 +303,35 @@ def test_validate_config_value_dispatches_by_key_and_rejects_unknown_keys():
         validate_config_value("max_csv_upload_bytes", "5")
     with pytest.raises(ValueError, match="'columns' is not one of"):
         validate_config_value("columns", {})
+
+
+# the delete section floor and the upper bound of the upload cap --------------------------------------
+
+
+@pytest.mark.parametrize("missing", ["submissionId", "tenantCode"])
+def test_delete_section_must_require_submission_id_and_tenant_code(missing):
+    schema = copy.deepcopy(DEFAULT_INGESTION_SCHEMA)
+    schema["delete"]["required"].remove(missing)
+    with pytest.raises(ValueError, match=f"delete.required' must include: {missing}"):
+        validate_ingestion_schema_config(schema)
+
+
+def test_delete_section_without_a_required_list_is_rejected_and_extra_paths_are_allowed():
+    schema = copy.deepcopy(DEFAULT_INGESTION_SCHEMA)
+    schema["delete"]["required"].append("sessionId")
+    assert validate_ingestion_schema_config(schema) is schema
+    del schema["delete"]["required"]
+    with pytest.raises(ValueError, match="delete' needs a 'required' list"):
+        validate_ingestion_schema_config(schema)
+
+
+def test_max_csv_upload_bytes_has_an_upper_bound():
+    from app.services.feedback_constants import MAX_UPLOAD_REQUEST_BYTES
+    assert MAX_CSV_UPLOAD_BYTES_LIMIT == MAX_UPLOAD_REQUEST_BYTES == 512 * 1024 * 1024   # one number, not two
+    assert validate_max_csv_upload_bytes(MAX_UPLOAD_REQUEST_BYTES) == MAX_UPLOAD_REQUEST_BYTES
+    with pytest.raises(ValueError, match="at most"):
+        validate_max_csv_upload_bytes(MAX_UPLOAD_REQUEST_BYTES + 1)     # the route would refuse such an upload anyway
+    with pytest.raises(ValueError, match="at most"):
+        validate_max_csv_upload_bytes(2 ** 40 + 1)
+    with pytest.raises(ValueError, match="at most"):
+        validate_max_csv_upload_bytes(10 ** 30)  # file.read(cap + 1) would overflow

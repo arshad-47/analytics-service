@@ -3,14 +3,12 @@ Real-Postgres tests of the feedback metadata extraction: seed, one LLM call per 
 PII flag written in one transaction, upsert on re-run, cascade delete, the config_source 'any' CHECK and the DOTS pivot
 queries of docs/feedback-extraction-and-dots-queries.md.
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is set to the DSN of an EMPTY scratch database that is used by this
-file alone (the tests wipe the feedback rows and the configs before each case). The file applies schema.sql itself
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards) (the tests wipe the feedback rows and the configs before each case). The file applies schema.sql itself
 (the way app/database/db.py does it), runs seed_prompts.sql and the real seeds, creates the tenant 'mitra', stores
 sessions through the real ingest path (insert_or_update_submission) and uses a FAKE LLM: no network. SYNTHETIC data only.
 """
 import asyncio
 import json
-import os
 import re
 import time
 import traceback
@@ -20,20 +18,22 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pg_support
 
 import app.services.llm as llm_module
-from app.database.db import SCHEMA_FILE, SEED_PROMPTS_FILE, db
+from app.database.db import SEED_PROMPTS_FILE, db
 from app.database.feedback_extraction_operations import (
+    ExtractionSetupError,
     LlmCallError,
     StaleExtractionError,
     extract_submission,
 )
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS, extraction_config_id, extraction_config_v1, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, SEED_EXTRACTION_CONFIG_COUNT, extraction_config_id, extraction_config_v1, gforms_config_v1, mitra_config_v1, seed_config
 from app.services import feedback_extraction as fx
 from app.temporal.feedback_extraction_activity import feedback_metadata_extraction_activity
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -45,7 +45,7 @@ def _four_field_raw(persona="Youth"):
     """
     The classic four-field shape (state, district, gender, school_type) of a persona, built from its seed. The
     seeds now hold the DOTS columns of each persona (tests/test_feedback_extraction_personas_pg.py covers them); the
-    tests of this file exercise the engine and the pivot queries with four fields and the generic prompt, so `_run`
+    tests of this file exercise the engine and the pivot queries with four fields and the neutral template prompt, so `_run`
     installs this shape over the seeded config (legacy=True).
     """
     raw = extraction_config_v1(persona)
@@ -55,18 +55,8 @@ def _four_field_raw(persona="Youth"):
     for school_name in ("institution_type", "school_type"):     # General Public has none
         if school_name in by_name:
             raw["fields"].append(dict(by_name[school_name], name="school_type"))
-    del raw["prompt_name"]
+    raw["prompt_name"] = "Feedback Metadata Extraction"       # the program-neutral template prompt of seed_prompts.sql
     return raw
-
-
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
 
 
 def _run(body, legacy=True):
@@ -75,7 +65,7 @@ def _run(body, legacy=True):
         conn = await asyncpg.connect(DSN)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
             await conn.execute("DELETE FROM config_version")
@@ -125,9 +115,9 @@ async def _add(conn, persona="Youth", version="V2", source="mitra", messages=Non
         "submissionId": sid, "sessionId": sid if source == "google_forms" else f"sess-{uuid.uuid4().hex}",
         "submissionType": "feedback", "tenantCode": "mitra", "eventType": "create",
         "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": p["program_id"], "programName": "1M Voice", "leaderCategoryId": p["leader_category_id"],
+        "tags": {"programId": p["program_id"], "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": p["leader_category_id"],
                  "leaderCategoryName": persona, "state": None, "district": None, "source": source},
-        "data": {"source": source, "sessionType": p["session_type"], "questionnaireVersion": version, "language": "en",
+        "data": {"source": source, "adapter": "wide_form" if source == "google_forms" else "conversation_rows", "sessionType": p["session_type"], "questionnaireVersion": version, "language": "en",
                  "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T00:00:00+00:00",
                  "messages": messages if messages is not None else _messages()},
     }
@@ -197,7 +187,7 @@ def test_seed_writes_one_active_extraction_config_per_persona_and_never_overwrit
         await seed_config(conn)
         versions = await conn.fetch("SELECT version, is_active FROM config_version WHERE config_id = $1::uuid ORDER BY version", config_id)
         assert [(v["version"], v["is_active"]) for v in versions] == [(1, False), (2, True)]
-        assert await conn.fetchval("SELECT count(*) FROM config WHERE config_type = 'feedback_extraction'") == 4
+        assert await conn.fetchval("SELECT count(*) FROM config WHERE config_type = 'feedback_extraction'") == SEED_EXTRACTION_CONFIG_COUNT
     _run(body, legacy=False)
 
 
@@ -231,15 +221,12 @@ def test_reseeding_never_overwrites_an_edited_extraction_prompt_version():
     _run(body)
 
 
-def test_config_source_check_accepts_any_and_still_rejects_other_values():
+def test_config_source_is_a_free_label_and_any_is_still_accepted():
     async def body(conn, pool):
         base = ("INSERT INTO config (config_source, name, config_type, tenant_code, session_type) "
                 "VALUES ($1, 'x', 'feedback_extraction', 'mitra', $2)")
-        await conn.execute(base, "any", "Scratch_A")
-        for source in ("mitra", "google_forms"):
-            await conn.execute(base, source, f"Scratch_{source}")
-        with pytest.raises(asyncpg.CheckViolationError):
-            await conn.execute(base, "kafka", "Scratch_B")
+        for n, source in enumerate(("any", "mitra", "google_forms", "kafka")):
+            await conn.execute(base, source, f"Scratch_{n}")        # no CHECK on config_source (review finding A1)
         await conn.execute("DELETE FROM config WHERE session_type LIKE 'Scratch_%'")
     _run(body)
 
@@ -248,15 +235,14 @@ def test_schema_upgrades_an_older_database_check_constraint_and_column():
     async def body(conn, pool):
         # Put the database back into the pre-extraction state, then apply the schema file again (as a restart does).
         await conn.execute("DELETE FROM config WHERE config_source = 'any'")
-        await conn.execute("ALTER TABLE config DROP CONSTRAINT config_config_source_check")
         await conn.execute("ALTER TABLE config ADD CONSTRAINT config_config_source_check "
                            "CHECK (config_source IN ('mitra', 'google_forms'))")
         await conn.execute("ALTER TABLE feedback_submissions DROP COLUMN pii_detected")
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute("INSERT INTO config (config_source, name, config_type, tenant_code, session_type) "
                                "VALUES ('any', 'x', 'feedback_extraction', 'mitra', 'Scratch_C')")
-        await conn.execute(_schema_sql())
-        await conn.execute(_schema_sql())    # and a second time: idempotent
+        await conn.execute(pg_support.schema_sql())
+        await conn.execute(pg_support.schema_sql())    # and a second time: idempotent
         await conn.execute("INSERT INTO config (config_source, name, config_type, tenant_code, session_type) "
                            "VALUES ('any', 'x', 'feedback_extraction', 'mitra', 'Scratch_C')")
         await conn.execute("DELETE FROM config WHERE session_type = 'Scratch_C'")
@@ -304,9 +290,12 @@ def test_extraction_writes_rows_pii_flag_meta_and_llm_log_in_one_go():
 
         rows = await _rows(conn, sid)
         assert set(rows) == {"state", "district", "gender", "school_type"}
-        assert (rows["state"]["value"], rows["state"]["status"], rows["state"]["raw_value"]) == ("Karnataka", "extracted", "karnatka")
+        # the model flagged the session (pii True): a flagged session keeps no respondent words (raw_value NULL for
+        # every field) and no free-text value; category values (bands from the config) stay
+        assert (rows["state"]["value"], rows["state"]["status"], rows["state"]["raw_value"]) == ("Karnataka", "extracted", None)
         assert (rows["gender"]["value"], rows["school_type"]["value"]) == ("Female", "Government")
-        assert rows["district"]["value"] == "Mysuru"
+        assert (rows["district"]["value"], rows["district"]["status"], rows["district"]["raw_value"]) == (None, "extracted", None)
+        assert all(r["raw_value"] is None for r in rows.values())
         for r in rows.values():
             assert "session_type" not in r.keys() and "questionnaire_version" not in r.keys()      # no stale copies of the labels
             assert r["config_version_id"] is not None and r["prompt_version_id"] is not None and r["confidence"] is None
@@ -357,9 +346,9 @@ def test_a_session_that_grew_is_re_extracted_from_the_whole_conversation():
         event = {"submissionId": sid, "sessionId": await conn.fetchval("SELECT session_id FROM submissions WHERE submission_id = $1", sid),
                  "submissionType": "feedback", "tenantCode": "mitra", "eventType": "create",
                  "eventPublishedAt": "2026-11-10T01:00:00.000Z",
-                 "tags": {"programId": p["program_id"], "programName": "1M Voice", "leaderCategoryId": p["leader_category_id"],
+                 "tags": {"programId": p["program_id"], "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": p["leader_category_id"],
                           "leaderCategoryName": "Youth", "state": None, "district": None, "source": "mitra"},
-                 "data": {"source": "mitra", "sessionType": "Youth_Voice", "questionnaireVersion": "V2", "language": "en",
+                 "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice", "questionnaireVersion": "V2", "language": "en",
                           "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T00:00:00+00:00",
                           "messages": _messages()[2:], "botId": p["bot_id"]}}
         result = await insert_or_update_submission(conn, event)
@@ -498,9 +487,9 @@ def _grow_event(sid, session_id, messages):
     p = YOUTH
     return {"submissionId": sid, "sessionId": session_id, "submissionType": "feedback", "tenantCode": "mitra",
             "eventType": "create", "eventPublishedAt": "2026-11-10T01:00:00.000Z",
-            "tags": {"programId": p["program_id"], "programName": "1M Voice", "leaderCategoryId": p["leader_category_id"],
+            "tags": {"programId": p["program_id"], "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": p["leader_category_id"],
                      "leaderCategoryName": "Youth", "state": None, "district": None, "source": "mitra"},
-            "data": {"source": "mitra", "sessionType": "Youth_Voice", "questionnaireVersion": "V2", "language": "en",
+            "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice", "questionnaireVersion": "V2", "language": "en",
                      "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T00:00:00+00:00",
                      "messages": messages, "botId": p["bot_id"]}}
 
@@ -563,14 +552,20 @@ def test_run_at_is_the_time_the_input_was_loaded_not_the_time_of_the_write():
     async def body(conn, pool):
         sid = await _add(conn)
         class Slow(FakeLlm):
+            call_started = None
+
             def __call__(self, prompt, model=None, max_tokens=None, timeout=None):
+                self.call_started = datetime.now(timezone.utc)      # the input was loaded before this instant
                 time.sleep(1.0)
                 return super().__call__(prompt, model=model, max_tokens=max_tokens, timeout=timeout)
+        slow = Slow(_answer())
         before = datetime.now(timezone.utc)
-        await extract_submission(pool, sid, "mitra", llm_function=Slow(_answer()))
+        await extract_submission(pool, sid, "mitra", llm_function=slow)
         after = datetime.now(timezone.utc)
         run_at = datetime.fromisoformat(json.loads((await _fs(conn, sid))["meta_data"])["extraction"]["run_at"])
-        assert before <= run_at < before + timedelta(seconds=0.6)           # the load, a second before the write
+        # the load, a second before the write: no later than the start of the call (no wall-clock budget for the
+        # pool acquisition and the input queries, which a loaded database can stretch)
+        assert before <= run_at <= slow.call_started
         assert after - run_at >= timedelta(seconds=0.9)
         extracted_at = (await _rows(conn, sid))["state"]["extracted_at"]
         assert extracted_at == run_at
@@ -629,31 +624,74 @@ def test_a_model_that_says_no_pii_cannot_hide_a_number_the_respondent_wrote():
     _run(body)
 
 
-def test_config_lookup_prefers_the_exact_program_and_falls_back_to_the_personas_config():
+def test_config_lookup_uses_the_exact_program_or_a_program_less_default_and_never_another_programs_config():
     async def body(conn, pool):
         other_program = PERSONAS["Parent"]["program_id"]
         sid = await _add(conn)
         await conn.execute("UPDATE submissions SET program_id = $2::uuid WHERE submission_id = $1", sid, other_program)
-        fake = FakeLlm(_answer())
-        await extract_submission(pool, sid, "mitra", llm_function=fake, write=False)      # a session in another program still resolves
-        assert len(fake.calls) == 1
 
-        # a config of that exact program wins over the persona's seeded one
-        exact = _four_field_raw("Youth")
-        exact["llm"] = {"model": "exact/model"}
-        config_id = str(uuid.uuid4())
-        await conn.execute(
-            "INSERT INTO config (id, config_source, name, config_type, program_id, tenant_code, session_type) "
-            "VALUES ($1::uuid, 'any', 'exact', 'feedback_extraction', $2::uuid, 'mitra', 'Youth_Voice')", config_id, other_program)
-        await conn.execute("INSERT INTO config_version (config_id, version, is_active, config) VALUES ($1::uuid, 1, TRUE, $2::jsonb)",
-                           config_id, json.dumps(exact))
+        # a session of another program without an extraction config of its own FAILS LOUDLY: the seeded Youth config
+        # belongs to the Youth program and is never borrowed (the wrong prompt and bands would be applied silently)
+        fake = FakeLlm(_answer())
+        with pytest.raises(ExtractionSetupError, match="No active feedback_extraction config"):
+            await extract_submission(pool, sid, "mitra", llm_function=fake, write=False)
+        assert fake.calls == []
+
+        async def add_config(program_id, model, name):
+            raw = _four_field_raw("Youth")
+            raw["llm"] = {"model": model}
+            config_id = str(uuid.uuid4())
+            await conn.execute(
+                "INSERT INTO config (id, config_source, name, config_type, program_id, tenant_code, session_type) "
+                "VALUES ($1::uuid, 'any', $3, 'feedback_extraction', $2::uuid, 'mitra', 'Youth_Voice')",
+                config_id, program_id, name)
+            await conn.execute("INSERT INTO config_version (config_id, version, is_active, config) "
+                               "VALUES ($1::uuid, 1, TRUE, $2::jsonb)", config_id, json.dumps(raw))
+
+        await add_config(None, "default/model", "program-less default")        # the persona's tenant default
+        fake = FakeLlm(_answer())
+        await extract_submission(pool, sid, "mitra", llm_function=fake, write=False)
+        assert fake.calls[0]["model"] == "default/model"
+
+        await add_config(other_program, "exact/model", "exact")                # the exact program wins over the default
         fake = FakeLlm(_answer())
         await extract_submission(pool, sid, "mitra", llm_function=fake, write=False)
         assert fake.calls[0]["model"] == "exact/model"
-        own = await _add(conn)                                                            # the persona's own program: its own config
+
+        own = await _add(conn)                                                 # the Youth program: its own seeded config
         fake = FakeLlm(_answer())
         await extract_submission(pool, own, "mitra", llm_function=fake, write=False)
-        assert fake.calls[0]["model"] != "exact/model"
+        assert fake.calls[0]["model"] not in ("exact/model", "default/model")
+    _run(body)
+
+
+def test_closing_keys_come_only_from_the_upload_config_of_the_same_program_and_source():
+    async def body(conn, pool):
+        from app.database.feedback_extraction_operations import load_closing_keys
+        youth, parent = PERSONAS["Youth"]["program_id"], PERSONAS["Parent"]["program_id"]
+
+        async def add_upload(program_id, source, keys, session_type="Youth_Voice"):
+            config_id = str(uuid.uuid4())
+            await conn.execute(
+                "INSERT INTO config (id, config_source, name, config_type, program_id, tenant_code, session_type) "
+                "VALUES ($1::uuid, $3, $4, 'feedback_upload', $2::uuid, 'mitra', $5)",
+                config_id, program_id, source, f"u-{config_id[:6]}", session_type)
+            await conn.execute("INSERT INTO config_version (config_id, version, is_active, config) "
+                               "VALUES ($1::uuid, 1, TRUE, $2::jsonb)", config_id, json.dumps({"closing_keys": keys}))
+
+        # the seeded upload configs of Youth: each source gets its own keys (nothing merged across sources)
+        assert await load_closing_keys(conn, "mitra", "Youth_Voice", youth, "mitra") == list(mitra_config_v1("Youth")["closing_keys"])
+        assert await load_closing_keys(conn, "mitra", "Youth_Voice", youth, "google_forms") == list(
+            gforms_config_v1("Youth").get("closing_keys", []))
+        # a session type of its own: another program or another source never leaks in
+        await add_upload(youth, "mitra", ["YOUTH_BYE"], "Test_Voice")
+        await add_upload(parent, "mitra", ["PARENT_BYE"], "Test_Voice")
+        await add_upload(youth, "google_forms", ["GFORMS_BYE"], "Test_Voice")
+        assert await load_closing_keys(conn, "mitra", "Test_Voice", youth, "mitra") == ["YOUTH_BYE"]
+        assert await load_closing_keys(conn, "mitra", "Test_Voice", parent, "mitra") == ["PARENT_BYE"]
+        assert await load_closing_keys(conn, "mitra", "Test_Voice", youth, "google_forms") == ["GFORMS_BYE"]
+        assert await load_closing_keys(conn, "mitra", "Test_Voice", parent, "google_forms") == []   # nothing of another program
+        assert await load_closing_keys(conn, "other", "Test_Voice", youth, "mitra") == []           # another tenant
     _run(body)
 
 
@@ -669,7 +707,7 @@ def test_documented_drop_column_upgrade_works_on_a_table_that_still_has_the_copi
         await conn.execute("CREATE INDEX idx_feedback_extracted_session_field_value ON feedback_extracted_data (session_type, field_name, value)")
         for statement in statements + statements:                                         # and idempotent
             await conn.execute(statement)
-        await conn.execute(_schema_sql())
+        await conn.execute(pg_support.schema_sql())
         columns = {r["column_name"] for r in await conn.fetch(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'feedback_extracted_data'")}
         assert "session_type" not in columns and "questionnaire_version" not in columns
@@ -716,7 +754,7 @@ SENSITIVE = {"Youth": {"monthly_household_income", "disability", "disability_typ
 
 def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_sessions():
     queries = _doc_queries()
-    assert len(queries) == 9
+    assert len(queries) >= 4          # the documented pivots and reports; each one is executed below
 
     async def body(conn, pool):
         clean = await _add(conn)

@@ -3,31 +3,30 @@ Real-Postgres tests for set_questionnaire_version / list_questionnaire_versions
 (app/database/feedback_operations.py): the questionnaire version windows of a persona are DATA in its Mitra upload
 config (config_version rows), recorded with set_questionnaire_version, no code involved.
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is set to the DSN of an EMPTY scratch database that is used by
-this file alone (the tests wipe the feedback rows and the configs before each case). The file applies schema.sql
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards) (the tests wipe the feedback rows and the configs before each case). The file applies schema.sql
 itself (the way app/database/db.py does it), creates the tenant 'mitra' and runs the real seed (config_version 1,
 only V1, for every persona), points db.pool at the scratch database and stores sessions through the real ingest
 path. Synthetic data only.
 """
 import asyncio
 import json
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import pytest
+import pg_support
 
-from app.database.db import SCHEMA_FILE, db
+from app.database.db import db
 from app.database.feedback_operations import (
     list_questionnaire_versions,
     restamp_questionnaire_versions,
     set_questionnaire_version,
 )
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, seed_config
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -40,29 +39,24 @@ V2_UTC = datetime(2026, 11, 3, 12, 53, 3, tzinfo=timezone.utc)
 V3_UTC = datetime(2026, 12, 1, 5, 0, 0, tzinfo=timezone.utc)
 
 
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-
-
 def _run(body):
-    """Runs `body(conn)` on a scratch database: schema applied, tenant 'mitra', clean seed, db.pool pointing at it."""
+    """
+    Runs `body(conn)` on the scratch database of the running module: schema applied, tenant 'mitra', clean seed,
+    db.pool pointing at it. Shared with the modules that import it (their own scratch database, hence current_dsn()).
+    """
+    dsn = pg_support.current_dsn()
+
     async def main():
-        conn = await asyncpg.connect(DSN)
+        conn = await asyncpg.connect(dsn)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
             await conn.execute("DELETE FROM config_version")
             await conn.execute("DELETE FROM config")
             await seed_config(conn)
-            pool = await asyncpg.create_pool(DSN, min_size=1, max_size=4)
+            pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
             db.pool = pool
             return await body(conn)
         finally:
@@ -94,10 +88,10 @@ async def _add(conn, persona, stored_version, started_at, source="mitra"):
         "submissionId": sid, "sessionId": sid if source == "google_forms" else f"sess-{uuid.uuid4().hex}",
         "submissionType": "feedback", "tenantCode": "mitra", "eventType": "create",
         "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": PERSONAS[persona]["program_id"], "programName": "1M Voice",
+        "tags": {"programId": PERSONAS[persona]["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": PERSONAS[persona]["leader_category_id"], "leaderCategoryName": persona,
                  "state": None, "district": None, "source": source},
-        "data": {"source": source, "sessionType": PERSONAS[persona]["session_type"],
+        "data": {"source": source, "adapter": "wide_form" if source == "google_forms" else "conversation_rows", "sessionType": PERSONAS[persona]["session_type"],
                  "questionnaireVersion": stored_version, "language": "en", "completionStatus": "COMPLETED",
                  "submissionDate": started_at.isoformat(), "messages": _messages()},
     }
@@ -387,8 +381,8 @@ REFUSALS = {
     "move_v3_before_v2": ("Youth_Voice", "V3", "2026-11-02T00:00:00+00:00", "strictly increasing"),
     "empty_key": ("Youth_Voice", "", "2026-12-05T00:00:00+00:00", "non-empty"),
     "blank_key": ("Youth_Voice", "   ", "2026-12-05T00:00:00+00:00", "non-empty"),
-    "unknown_persona": ("Nobody_Voice", "V2", "2026-12-05T00:00:00+00:00", "no active Mitra upload config"),
-    "persona_label_instead_of_session_type": ("Youth", "V2", "2026-12-05T00:00:00+00:00", "no active Mitra upload config"),
+    "unknown_persona": ("Nobody_Voice", "V2", "2026-12-05T00:00:00+00:00", "no active upload config with questionnaire versions"),
+    "persona_label_instead_of_session_type": ("Youth", "V2", "2026-12-05T00:00:00+00:00", "no active upload config with questionnaire versions"),
 }
 
 
@@ -416,7 +410,7 @@ def test_a_persona_with_only_a_google_forms_config_is_refused():
             "WHERE c.config_source = 'google_forms' AND c.session_type = 'General_Public_Voice'")
         assert len(gforms_before) == 1
         before = await _snapshot(conn)
-        with pytest.raises(ValueError, match="no active Mitra upload config"):
+        with pytest.raises(ValueError, match="no active upload config with questionnaire versions"):
             await set_questionnaire_version("General_Public_Voice", "V2", V2_TEXT)
         assert await _snapshot(conn) == before
     _run(body)
@@ -440,7 +434,7 @@ def test_google_forms_configs_and_sessions_are_never_touched():
 
 @pytest.mark.parametrize("name,stored", [
     ("empty_list", {"questionnaire_versions": []}),
-    ("missing", {}),
+    ("missing", {"adapter": "conversation_rows"}),  # the list is gone but the adapter says it is required
     ("duplicate_key", {"questionnaire_versions": [{"key": "V1", "effective_from": None},
                                                   {"key": "V1", "effective_from": "2026-11-03T00:00:00+00:00"}]}),
     ("naive_date", {"questionnaire_versions": [{"key": "V1", "effective_from": None},

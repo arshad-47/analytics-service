@@ -1,6 +1,10 @@
 """
-Shared constants and the cross-module contract for the `feedback` report type
-(Mitra raw conversations now, Google Forms later). See docs/feedback-upload-plan.md.
+Shared constants and the cross-module contract for the `feedback` report type. `feedback` is a GENERIC report type:
+a SOURCE is a free label (a program's data feed, for example 'mitra', 'google_forms', 'ptm_app'), and everything
+that is specific to a source, program or persona comes from its upload config (config / config_version rows), never
+from code. The only things in code are the ADAPTERS: the few ways a CSV can be shaped. A config names its adapter
+(`adapter`), and parsing, building and the identity rules are chosen by that, never by the source name.
+See docs/feedback-upload-plan.md.
 
 Everything that more than one module must agree on lives here: the names, sources and config keys of the
 feedback report type, the defaults of the required config settings, and the shape of the Kafka event
@@ -10,7 +14,7 @@ Google Forms upload, extraction) are SEED DATA in seed_config.sql, not code.
 Kafka event for one session (eventType "create"; "update"/"delete" reuse the envelope):
 
     {
-      "submissionId": "184884",            # str; Mitra chat-session id (Google Forms: a UUIDv4)
+      "submissionId": "184884",            # str, [A-Za-z0-9._:-]{1,128}; a conversation id (wide_form: a generated UUIDv4)
       "submissionType": "feedback",
       "sessionId": "<32-char session token>",
       "tenantCode": "mitra",
@@ -23,15 +27,17 @@ Kafka event for one session (eventType "create"; "update"/"delete" reuse the env
         "source": "mitra"
       },
       "data": {
-        "source": "mitra",                  # 'mitra' | 'google_forms'
+        "source": "mitra",                  # a free label, [a-z0-9_]{1,40}, that has an ACTIVE upload config
+        "adapter": "conversation_rows",     # the adapter of that config: 'conversation_rows' | 'wide_form'; required
         "sessionType": "Youth_Voice",       # persona key of the export (config.session_type); required
         "questionnaireVersion": "V2",       # stamped at ingest from the config's version windows; required
-        "botId": "101", "botName": "...",   # Mitra only, informational (recorded in meta_data, never matched)
+        "botId": "101", "botName": "...",   # conversation_rows only, informational (recorded in meta_data, never matched)
+        "sourceRef": "<natural key>",       # wide_form only (required there, absent or null for conversation_rows)
         "language": "hi",
         "completionStatus": "COMPLETED",    # 'COMPLETED' | 'IN_PROGRESS'
         "submissionDate": "2026-10-15T08:54:43.000Z",   # the session's first real message (not the opening row)
         "messages": [                        # ordered by sequence; only NEW rows on a delta upload
-          {"sequence": 1,                    # STORED sequence (Mitra: CSV sequence + 1)
+          {"sequence": 1,                    # STORED sequence, 1..2147483647 (conversation_rows: CSV sequence + offset)
            "questionKey": "AGE_IDENTIFICATION",
            "isFollowUp": false,
            "message": "...",                 # conversation language, never null
@@ -52,7 +58,37 @@ FEEDBACK_TENANT_CODE = "mitra"
 
 SOURCE_MITRA = "mitra"
 SOURCE_GOOGLE_FORMS = "google_forms"
-FEEDBACK_SOURCES = (SOURCE_MITRA, SOURCE_GOOGLE_FORMS)
+# A source is valid when it is a safe label AND an ACTIVE feedback_upload config exists for
+# (tenant, program, session_type, source). The label is lower-case letters, digits and underscore, 1..40 chars, so it
+# can never carry a newline or a control character into a log line, a cache key or an SQL identifier-like place.
+SOURCE_LABEL_RE = r"[a-z0-9_]{1,40}"
+MAX_SOURCE_LENGTH = 40
+# Tenant codes and persona keys (session_type) of an event: letters, digits, '.', '_', '-', at most 64 characters.
+SAFE_CODE_RE = r"[A-Za-z0-9._-]{1,64}"
+# Conversation / session ids: as above plus ':', at most 128 characters (Mitra ids are numeric or 32 hex; a form
+# response id is a UUID). Whitespace, CR/LF and every other control character are refused.
+SAFE_ID_RE = r"[A-Za-z0-9._:-]{1,128}"
+
+# Ceiling of ONE upload request body (bytes) for POST /v1/upload/, applied before the body is read (the persona's own
+# `max_csv_upload_bytes` is still the cap of its upload). 512 MiB: far above a real export, small enough that no
+# caller can make the service spool an unbounded body.
+MAX_UPLOAD_REQUEST_BYTES = 536870912
+
+# Largest stored sequence: feedbacks.sequence is a 32-bit INTEGER.
+MAX_SEQUENCE = 2147483647
+
+# ---- adapters: the CSV shapes the code knows. The upload config names one in `adapter` (REQUIRED). ----
+CONFIG_KEY_ADAPTER = "adapter"
+# One row per message (a bot conversation export). Sessions grow, so a re-upload adds the new rows (delta by session).
+ADAPTER_CONVERSATION_ROWS = "conversation_rows"
+# One row per respondent, one column per question (a form export). A response is immutable and has a natural key
+# (`sourceRef`), a generated UUID as its id, and is always COMPLETED.
+ADAPTER_WIDE_FORM = "wide_form"
+ADAPTERS = (ADAPTER_CONVERSATION_ROWS, ADAPTER_WIDE_FORM)
+# Adapters whose responses are identified by a natural key and are immutable once stored.
+NATURAL_KEY_ADAPTERS = (ADAPTER_WIDE_FORM,)
+# ONLY for rows that predate the `adapter` key (the migrate tool): the adapter the legacy source names implied.
+LEGACY_ADAPTER_BY_CONFIG_SOURCE = {SOURCE_MITRA: ADAPTER_CONVERSATION_ROWS, SOURCE_GOOGLE_FORMS: ADAPTER_WIDE_FORM}
 
 COMPLETION_COMPLETED = "COMPLETED"
 COMPLETION_IN_PROGRESS = "IN_PROGRESS"
@@ -69,7 +105,11 @@ CONFIG_KEY_MAX_CSV_UPLOAD_BYTES = "max_csv_upload_bytes"
 CONFIG_KEY_INGESTION_SCHEMA = "ingestion_schema"
 CONFIG_KEY_PROCESS_STEPS = "process_steps"
 CONFIG_KEY_EXPECT_STAGES = "expect_stages"  # optional: report-only, never rejects a session
-REQUIRED_FEEDBACK_CONFIG_KEYS = (CONFIG_KEY_MAX_CSV_UPLOAD_BYTES, CONFIG_KEY_INGESTION_SCHEMA, CONFIG_KEY_PROCESS_STEPS)
+REQUIRED_FEEDBACK_CONFIG_KEYS = (CONFIG_KEY_ADAPTER, CONFIG_KEY_MAX_CSV_UPLOAD_BYTES, CONFIG_KEY_INGESTION_SCHEMA,
+                                 CONFIG_KEY_PROCESS_STEPS)
+# `adapter` has NO default: it says how a source's file is shaped and only the config's author knows. The migrate tool
+# derives it for legacy rows from LEGACY_ADAPTER_BY_CONFIG_SOURCE; feedback_config_key_defaults() does not carry it.
+REQUIRED_KEYS_WITH_DEFAULT = (CONFIG_KEY_MAX_CSV_UPLOAD_BYTES, CONFIG_KEY_INGESTION_SCHEMA, CONFIG_KEY_PROCESS_STEPS)
 
 # One persona file is uploaded whole and the Parent file alone is ~43MB (the value must stay above it with headroom).
 DEFAULT_MAX_CSV_UPLOAD_BYTES = 104857600  # 100MB
@@ -106,7 +146,7 @@ DEFAULT_INGESTION_SCHEMA = {
 
 
 def feedback_config_key_defaults() -> Dict[str, Any]:
-    """The three required settings with their defaults (a fresh copy every call)."""
+    """The required settings that HAVE a default (not `adapter`), with their defaults (a fresh copy every call)."""
     return {
         CONFIG_KEY_MAX_CSV_UPLOAD_BYTES: DEFAULT_MAX_CSV_UPLOAD_BYTES,
         CONFIG_KEY_INGESTION_SCHEMA: copy.deepcopy(DEFAULT_INGESTION_SCHEMA),

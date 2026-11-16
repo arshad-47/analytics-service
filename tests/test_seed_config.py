@@ -57,7 +57,10 @@ def test_the_file_is_at_the_repo_root_next_to_the_other_seeds_and_the_app_reads_
     for name in ("schema.sql", "seed_prompts.sql", "seed_themes.sql", "seed_config.sql"):
         assert (root / name).is_file(), name
     assert db_module.SEED_CONFIG_FILE == SEED_CONFIG_FILE
-    assert "COPY main.py schema.sql seed_prompts.sql seed_themes.sql seed_config.sql" in (root / "Dockerfile").read_text()
+    # which files the image needs is derived from the repo in tests/test_feedback_upgrade.py (no literal COPY line is pinned)
+    dockerfile = (root / "Dockerfile").read_text()
+    for name in ("schema.sql", "seed_prompts.sql", "seed_themes.sql", "seed_config.sql"):
+        assert re.search(rf"^COPY [^\n]*\b{re.escape(name)}\b", dockerfile, re.M), name
 
 
 def test_the_file_starts_with_a_header_comment_that_explains_it():
@@ -219,7 +222,7 @@ def test_the_mitra_configs_carry_the_baseline_version_the_opening_row_rule_and_t
                          ids=lambda b: b["session_type"])
 def test_the_google_forms_configs_are_accepted_by_the_gforms_parser(block):
     config = block["config"]
-    assert config["layout"] == "wide" and config["forms"]
+    assert config["adapter"] == "wide_form" and config["forms"]
     for form in config["forms"].values():
         assert form["questionnaire_version"] == "V1" and len(form["questions"]) > 0
     feedback_gforms._check_config(config)          # raises on a config the Google Forms path would reject
@@ -231,5 +234,5 @@ def test_every_extraction_config_is_accepted_by_the_extraction_parser(block):
     parsed = fx.parse_extraction_config(block["config"])
     assert parsed.session_type == block["session_type"]
     assert parsed.prompt_name.startswith("Feedback Metadata Extraction - ")
-    assert block["config"]["llm"] == {} and block["config"]["pii"]["types"][-1] == "other"
+    assert block["config"]["llm"] == {} and block["config"]["pii"]["types"][-1]["name"] == "other"
     assert block["change_note"].startswith("Initial extraction config")

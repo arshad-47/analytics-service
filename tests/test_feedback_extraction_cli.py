@@ -1,33 +1,32 @@
 """
 Tests for tools/run_feedback_extraction.py (run the feedback metadata extraction without Temporal; show-config).
 
-Two parts: no database (the parser), and real Postgres (opt-in, FEEDBACK_TEST_DATABASE_URL = DSN of an EMPTY scratch
-database used by this file alone): main([...]) end to end with a FAKE LLM (no network). The CLI opens its own pool with
+Two parts: no database (the parser), and real Postgres (opt-in, FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards)): main([...]) end to end with a FAKE LLM (no network). The CLI opens its own pool with
 db.connect(), which reads settings.DATABASE_URL, so the tests point that setting at the scratch database. The CLI must
 print aggregates only: the synthetic marker text of the conversations never appears in its output. Synthetic data only.
 """
 import asyncio
 import importlib.util
 import json
-import os
 import uuid
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pg_support
 
 import app.services.llm as llm_module
 from app.config import settings
-from app.database.db import SCHEMA_FILE, SEED_PROMPTS_FILE
+from app.database.db import SEED_PROMPTS_FILE
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS, extraction_config_id, extraction_config_v1, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, extraction_config_id, extraction_config_v1, seed_config
 
 _TOOL = Path(__file__).resolve().parent.parent / "tools" / "run_feedback_extraction.py"
 _spec = importlib.util.spec_from_file_location("run_feedback_extraction_cli", _TOOL)
 cli = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cli)
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 needs_db = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -37,12 +36,14 @@ MARKER = "zzq-synthetic-marker"
 # ====================================================================================== no database
 
 def test_parser_accepts_the_documented_forms_with_defaults():
-    args = cli.build_parser().parse_args(["run", "--session-type", "Youth_Voice"])
+    with pytest.raises(SystemExit):   # the tenant is required: there is no default tenant
+        cli.build_parser().parse_args(["run", "--session-type", "Youth_Voice"])
+    args = cli.build_parser().parse_args(["run", "--session-type", "Youth_Voice", "--tenant-code", "t1"])
     assert (args.command, args.session_type, args.tenant_code, args.limit, args.submission_id) == (
-        "run", "Youth_Voice", "mitra", None, None)
+        "run", "Youth_Voice", "t1", None, None)
     assert (args.only_unprocessed, args.dry_run, args.concurrency, args.top) == (False, False, 4, 15)
     args = cli.build_parser().parse_args([
-        "run", "--session-type", "Parent_Voice", "--limit", "5", "--submission-id", "x1", "--only-unprocessed",
+        "run", "--session-type", "Parent_Voice", "--tenant-code", "t1", "--limit", "5", "--submission-id", "x1", "--only-unprocessed",
         "--dry-run", "--concurrency", "2", "--model", "m", "--max-tokens", "900", "--timeout", "30", "--top", "3"])
     assert (args.limit, args.submission_id, args.only_unprocessed, args.dry_run, args.concurrency) == (5, "x1", True, True, 2)
     assert (args.model, args.max_tokens, args.timeout, args.top) == ("m", 900, 30, 3)
@@ -64,16 +65,6 @@ def test_parser_rejects_everything_else(argv, capsys):
 
 # ====================================================================================== real Postgres
 
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-
-
 def _with_conn(body):
     async def main():
         conn = await asyncpg.connect(DSN)
@@ -88,7 +79,7 @@ def _four_field_raw(persona):
     """
     The classic four-field shape (state, district, gender, school_type) of a persona, built from its seed (the same
     helper idea as tests/test_feedback_extraction_pg.py). The seeds now hold each persona's DOTS columns and its own
-    prompt; the CLI tests that only need the engine run with four fields and the generic prompt.
+    prompt; the CLI tests that only need the engine run with four fields and the program-neutral template prompt.
     """
     raw = extraction_config_v1(persona)
     by_name = {f["name"]: f for f in raw["fields"]}
@@ -97,14 +88,14 @@ def _four_field_raw(persona):
     for school_name in ("institution_type", "school_type"):     # General Public has none
         if school_name in by_name:
             raw["fields"].append(dict(by_name[school_name], name="school_type"))
-    del raw["prompt_name"]
+    raw["prompt_name"] = "Feedback Metadata Extraction"       # the program-neutral template prompt of seed_prompts.sql
     return raw
 
 
 def _reset(legacy):
     """Fresh schema, tenant, prompts and seeds; with `legacy` the four-field config is installed over the seeded one."""
     async def reset(conn):
-        await conn.execute(_schema_sql())
+        await conn.execute(pg_support.schema_sql())
         await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
         await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
         await conn.execute("DELETE FROM config_version")
@@ -161,9 +152,9 @@ def _store(persona, flag="", answered=True, big=False):
     event = {
         "submissionId": sid, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback", "tenantCode": "mitra",
         "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": p["program_id"], "programName": "1M Voice", "leaderCategoryId": p["leader_category_id"],
+        "tags": {"programId": p["program_id"], "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": p["leader_category_id"],
                  "leaderCategoryName": persona, "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": p["session_type"], "questionnaireVersion": "V2", "language": "en",
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": p["session_type"], "questionnaireVersion": "V2", "language": "en",
                  "completionStatus": "COMPLETED", "botId": p["bot_id"], "submissionDate": "2026-11-10T00:00:00+00:00",
                  "messages": messages},
     }
@@ -175,6 +166,8 @@ def _store(persona, flag="", answered=True, big=False):
 
 
 def _call(capsys, argv):
+    if argv[:1] == ["run"] and "--tenant-code" not in argv:   # the tenant is required (no default tenant)
+        argv = argv + ["--tenant-code", "mitra"]
     code = cli.main(argv)
     captured = capsys.readouterr()
     return code, captured.out, captured.err
@@ -198,7 +191,7 @@ def test_run_writes_rows_prints_aggregates_only_and_never_respondent_text(scratc
     result = json.loads(out)
     assert result["session_type"] == "Youth_Voice" and result["mode"] == "write"
     assert result["submissions"] == {"selected": 4, "processed": 4, "failed": 0, "llm_calls": 3, "no_respondent_answer": 1,
-                                     "oversized_respondent_message": 0}
+                                     "oversized_respondent_message": 0, "conversation_too_long": 0}
     assert result["fields"]["state"]["status"] == {"extracted": 2, "not_provided": 1, "unmapped": 1}
     assert result["fields"]["state"]["top_values"] == {"Karnataka": 2}
     assert result["fields"]["school_type"]["status"] == {"not_provided": 4}
@@ -228,7 +221,7 @@ def test_only_unprocessed_limit_and_submission_id_select_the_right_sessions(scra
     assert json.loads(out)["submissions"]["selected"] == 1                         # the one without pii_detected
     code, out, _ = _call(capsys, ["run", "--session-type", "Youth_Voice", "--only-unprocessed"])
     assert json.loads(out)["submissions"] == {"selected": 0, "processed": 0, "failed": 0, "llm_calls": 0, "no_respondent_answer": 0,
-                                              "oversized_respondent_message": 0}
+                                              "oversized_respondent_message": 0, "conversation_too_long": 0}
     code, out, _ = _call(capsys, ["run", "--session-type", "Youth_Voice", "--submission-id", ids[0]])
     assert json.loads(out)["submissions"]["selected"] == 1
     # a re-run overwrites: still one row per field per session
@@ -275,8 +268,8 @@ def test_show_config_prints_the_active_versions_for_every_persona_or_one(seeded,
     assert all(c["config_source"] == "any" and c["version"] == 1 for c in shown)
     for entry in shown:
         seed = expected[entry["session_type"]]
-        # the summary follows the seeded config: its prompt name (or "generic") and every field with kind and flags
-        assert entry["summary"]["prompt_name"] == seed.get("prompt_name", "generic")
+        # the summary follows the seeded config: its prompt name and every field with kind and flags
+        assert entry["summary"]["prompt_name"] == seed["prompt_name"]
         assert entry["summary"]["fields"] == [
             {"name": f["name"], "kind": f["kind"], "sensitive": f.get("sensitive", False) is True,
              "provisional": f.get("provisional", False) is True} for f in seed["fields"]]
@@ -287,10 +280,10 @@ def test_show_config_prints_the_active_versions_for_every_persona_or_one(seeded,
 
 
 @needs_db
-def test_show_config_says_generic_for_a_config_without_a_prompt_name(scratch, capsys):
+def test_show_config_names_the_template_prompt_of_a_four_field_config(scratch, capsys):
     code, out, _ = _call(capsys, ["show-config", "--session-type", "Youth_Voice"])
     summary = json.loads(out)[0]["summary"]
-    assert code == 0 and summary["prompt_name"] == "generic"
+    assert code == 0 and summary["prompt_name"] == "Feedback Metadata Extraction"
     assert [f["name"] for f in summary["fields"]] == ["state", "district", "gender", "school_type"]
 
 

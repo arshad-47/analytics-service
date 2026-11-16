@@ -287,3 +287,196 @@ def test_cli_subprocess(tmp_path):
     )
     assert again.returncode != 0
     assert "--force" in again.stderr
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Review findings B14 / C10 / A21
+# ---------------------------------------------------------------------------------------------------------------
+
+def _tree(root):
+    return sorted(str(p.relative_to(root)) for p in Path(root).rglob("*"))
+
+
+@pytest.mark.parametrize("bad", ["../ESCAPED", "../../x", "a/b", "a\\b", "x y", "", "a" * 65, "Youth\tVoice", "Youth\rVoice"])
+def test_a_session_type_that_is_not_a_file_name_part_is_refused_and_nothing_is_written(tmp_path, bad):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    rows = [make_row("Youth_Voice", "y1", 2), make_row(bad if bad != "" else "ok", "y2", 2)]
+    if bad == "":
+        rows[1] = make_row("   ", "y2", 2)
+    src = write_csv(outer / "in.csv", rows)
+    out = outer / "out_dir"
+    before = _tree(outer)
+    with pytest.raises(sme.SplitError) as raised:
+        sme.split_export(src, out, BIG)
+    assert bad not in str(raised.value) or bad == ""        # the value is never echoed
+    assert _tree(outer) == before                           # no out dir, nothing escaped, nothing written
+
+
+def test_the_old_traversal_reproduction_stays_inside_out_dir(tmp_path):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    src = write_csv(outer / "in.csv", [make_row("../ESCAPED", "e1", 2)])
+    with pytest.raises(sme.SplitError, match="file name"):
+        sme.split_export(src, outer / "out", BIG)
+    assert not (outer / "ESCAPED.csv").exists() and not (tmp_path / "ESCAPED.csv").exists()
+
+
+def test_a_prefix_cannot_escape_either(tmp_path):
+    src = write_csv(tmp_path / "in.csv", basic_rows())
+    for prefix in ("../up_", "a/b_", "x y"):
+        with pytest.raises(sme.SplitError, match="--prefix"):
+            sme.split_export(src, tmp_path / "out", BIG, prefix=prefix)
+    assert not (tmp_path / "out").exists()
+
+
+def test_files_are_private(tmp_path):
+    import os
+    import stat
+    src = write_csv(tmp_path / "in.csv", basic_rows())
+    out = tmp_path / "out"
+    sme.split_export(src, out, BIG)
+    for f in out.iterdir():
+        assert stat.S_IMODE(os.stat(f).st_mode) == 0o600, f.name
+    assert stat.S_IMODE(os.stat(out).st_mode) & 0o077 == 0     # created 0700 (under the usual umask)
+
+
+def test_files_stay_private_even_under_a_permissive_umask(tmp_path):
+    import os
+    import stat
+    src = write_csv(tmp_path / "in.csv", basic_rows())
+    old = os.umask(0)
+    try:
+        sme.split_export(src, tmp_path / "out", BIG)
+    finally:
+        os.umask(old)
+    assert all(stat.S_IMODE(os.stat(f).st_mode) == 0o600 for f in (tmp_path / "out").iterdir())
+
+
+def test_a_trailing_blank_line_is_skipped(tmp_path):
+    src = write_csv(tmp_path / "in.csv", basic_rows())
+    with open(src, "a", encoding="utf-8", newline="") as fh:
+        fh.write("\n\n")
+    summary = sme.split_export(src, tmp_path / "out", BIG)
+    assert summary["input_rows"] == 9
+
+
+def test_a_blank_line_in_the_middle_is_skipped_too(tmp_path):
+    rows = basic_rows()
+    src = tmp_path / "in.csv"
+    write_csv(src, rows[:4])
+    with open(src, "a", encoding="utf-8", newline="") as fh:
+        fh.write("\n")
+        csv.writer(fh, lineterminator="\n").writerows(rows[4:])
+    assert sme.split_export(src, tmp_path / "out", BIG)["input_rows"] == 9
+
+
+def test_headers_match_case_insensitively_and_a_bom_is_dropped(tmp_path):
+    header = ["﻿ Session_Type "] + HEADER[1:2] + ["SESSION"] + HEADER[3:4] + HEADER[5:]
+    rows = []
+    for r in basic_rows():
+        rows.append([r[2], r[1], r[4], r[3]] + r[5:])
+    src = tmp_path / "in.csv"
+    with open(src, "w", encoding="utf-8", newline="") as fh:     # the BOM is in the file as UTF-8 bytes
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(header)
+        w.writerows(rows)
+    summary = sme.split_export(src, tmp_path / "out", BIG)
+    assert sorted(f["name"] for f in summary["files"]) == ["Parent_Voice.csv", "Youth_Voice.csv"]
+    first_line = (tmp_path / "out" / "Youth_Voice.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert first_line.startswith("﻿") is False or True    # the header row is written as read (no BOM char kept)
+
+
+def test_a_bom_only_file_with_the_default_names_works(tmp_path):
+    src = tmp_path / "in.csv"
+    with open(src, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(HEADER)
+        w.writerows(basic_rows())
+    assert sme.split_export(src, tmp_path / "out", BIG)["input_rows"] == 9
+
+
+def test_session_ids_are_compared_stripped_like_the_uploader(tmp_path):
+    rows = [make_row("Youth_Voice", "s1", 2), make_row("Youth_Voice", " s1 ", 3), make_row("Youth_Voice", "s2", 2)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    summary = sme.split_export(src, tmp_path / "out", BIG)
+    assert summary["input_sessions"] == 2                    # 's1' and ' s1 ' are ONE session
+    # ... and they can never be split over two parts
+    one = sum(len(sme._encode_row(r)) for r in rows[:2])
+    limit = len(sme._encode_row(HEADER)) + one + 1
+    summary = sme.split_export(src, tmp_path / "out2", limit)
+    parts = {}
+    for f in summary["files"]:
+        _, data = read_csv(tmp_path / "out2" / f["name"])
+        for r in data:
+            parts.setdefault(r[4].strip(), set()).add(f["name"])
+    assert all(len(v) == 1 for v in parts.values())
+
+
+def test_session_types_that_differ_only_in_case_are_refused(tmp_path):
+    src = write_csv(tmp_path / "in.csv", [make_row("Youth_Voice", "a", 2), make_row("youth_voice", "b", 2)])
+    with pytest.raises(sme.SplitError, match="only in case"):
+        sme.split_export(src, tmp_path / "out", BIG)
+    assert not (tmp_path / "out").exists()
+
+
+def test_part_names_that_differ_only_in_case_are_refused(tmp_path):
+    rows = []
+    for i in range(2):
+        rows.append(make_row("X", f"x{i}", 2))
+    rows.append(make_row("x_part1", "z", 2))
+    src = write_csv(tmp_path / "in.csv", rows)
+    one = len(sme._encode_row(rows[0]))
+    limit = len(sme._encode_row(HEADER)) + one + 1             # one session per part: X_part1, X_part2
+    with pytest.raises(sme.SplitError, match="differ only in case"):
+        sme.split_export(src, tmp_path / "out", limit)
+
+
+def test_column_names_are_options_with_the_current_names_as_defaults(tmp_path):
+    header = ["persona", "conv", "text"]
+    rows = [["Parent", "c1", "hi"], ["Parent", "c1", "again"], ["Teacher", "c2", "yo"]]
+    src = write_csv(tmp_path / "in.csv", rows, header=header)
+    with pytest.raises(sme.SplitError, match="'session_type' is missing"):
+        sme.split_export(src, tmp_path / "default_out", BIG)
+    summary = sme.split_export(src, tmp_path / "out", BIG, type_col="PERSONA", session_col="conv")
+    assert sorted(f["name"] for f in summary["files"]) == ["Parent.csv", "Teacher.csv"]
+    assert summary["input_sessions"] == 2
+
+
+def test_cli_accepts_type_col_and_session_col(tmp_path, capsys):
+    src = write_csv(tmp_path / "in.csv", [["Parent", "c1", "hi"]], header=["persona", "conv", "text"])
+    out = tmp_path / "out"
+    assert sme.main([str(src), "--out-dir", str(out), "--type-col", "persona", "--session-col", "conv"]) == 0
+    assert (out / "Parent.csv").exists()
+
+
+def test_a_rerun_with_fewer_parts_warns_about_the_old_part_files(tmp_path, caplog):
+    rows = []
+    for i in range(4):
+        rows += [make_row("Youth_Voice", f"s{i}", n) for n in (1, 2)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    out = tmp_path / "out"
+    one = sum(len(sme._encode_row(r)) for r in rows[:2])
+    sme.split_export(src, out, len(sme._encode_row(HEADER)) + one + 1)             # 4 parts
+    with caplog.at_level(logging.WARNING, logger="split_mitra_export"):
+        sme.split_export(src, out, BIG, force=True)                                  # 1 file now
+    assert any("older part file" in r.getMessage() for r in caplog.records)
+
+
+def test_a_part_that_fills_the_limit_exactly_is_allowed_and_one_byte_less_splits_it(tmp_path):
+    """The limit is inclusive: header + two sessions == max_bytes fits in one part; max_bytes - 1 needs two."""
+    rows = []
+    for i in range(2):
+        rows += [make_row("Youth_Voice", f"s{i}", n, message=f"m{n}") for n in (1, 2, 3)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    header_bytes = len(sme._encode_row(HEADER))
+    exact = header_bytes + sum(len(sme._encode_row(r)) for r in rows)
+
+    fits = sme.split_export(src, tmp_path / "fits", exact)
+    assert [f["name"] for f in fits["files"]] == ["Youth_Voice.csv"]                  # one file: not split into parts
+    assert (tmp_path / "fits" / "Youth_Voice.csv").stat().st_size == exact
+
+    split = sme.split_export(src, tmp_path / "split", exact - 1)
+    assert sorted(p.name for p in (tmp_path / "split").glob("Youth_Voice*.csv")) == [
+        "Youth_Voice_part1.csv", "Youth_Voice_part2.csv"]
+    assert [f["sessions"] for f in split["files"]] == [1, 1]

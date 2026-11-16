@@ -4,20 +4,19 @@ Real-Postgres tests for the per-bot feedback settings that live in the persona's
 a stored submission, the tenant / session_type filters of get_active_feedback_config, and list / migrate / set
 (app/database/feedback_operations.py), each change a NEW config_version with the old one kept as history.
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is set to the DSN of an EMPTY scratch database that is used by
-this file alone (the tests wipe the feedback rows and the configs before each case). The file applies schema.sql
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards) (the tests wipe the feedback rows and the configs before each case). The file applies schema.sql
 itself, creates the tenant 'mitra', runs the real seed and stores sessions through the real ingest path. Synthetic
 data only.
 """
 import asyncio
 import json
-import os
 import uuid
 
 import asyncpg
 import pytest
+import pg_support
 
-from app.database.db import SCHEMA_FILE, db
+from app.database.db import db
 from app.database.feedback_operations import (
     get_active_feedback_config,
     get_feedback_process_steps,
@@ -28,32 +27,22 @@ from app.database.feedback_operations import (
     set_questionnaire_version,
 )
 from app.database.operations import insert_or_update_submission
-from seed_support import seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, seed_config
 from app.services.feedback_constants import (
     DEFAULT_INGESTION_SCHEMA,
     DEFAULT_MAX_CSV_UPLOAD_BYTES,
     REQUIRED_FEEDBACK_CONFIG_KEYS,
 )
-from seed_support import PERSONAS
+from seed_support import PERSONAS, SEED_UPLOAD_CONFIG_COUNT
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
 YOUTH = PERSONAS["Youth"]
 STEPS = []  # the seed / migrate default: extraction is opt-in (an LLM call per submission)
 EXTRACTION = [{"name": "feedback_metadata_extraction"}]  # extraction switched on for a persona
-SEEDED_CONFIGS = 7  # 4 Mitra (Youth, Parent, General Public, Educator) + 3 Google Forms (no Educator form)
-
-
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
+SEEDED_CONFIGS = SEED_UPLOAD_CONFIG_COUNT   # the upload configs of the seed (one per persona and source)
 
 
 def _run(body):
@@ -62,7 +51,7 @@ def _run(body):
         conn = await asyncpg.connect(DSN)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
             await conn.execute("DELETE FROM config_version")
@@ -92,10 +81,10 @@ def _event(source="mitra", session_type=None):
         "submissionId": sid, "sessionId": sid if source == "google_forms" else f"sess-{uuid.uuid4().hex}",
         "submissionType": "feedback", "tenantCode": "mitra", "eventType": "create",
         "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": YOUTH["program_id"], "programName": "1M Voice",
+        "tags": {"programId": YOUTH["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": YOUTH["leader_category_id"], "leaderCategoryName": "Youth",
                  "state": None, "district": None, "source": source},
-        "data": {"source": source, "sessionType": session_type, "questionnaireVersion": "V1", "language": "en",
+        "data": {"source": source, "adapter": "wide_form" if source == "google_forms" else "conversation_rows", "sessionType": session_type, "questionnaireVersion": "V1", "language": "en",
                  "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T08:00:00.000Z", **ref,
                  "messages": [
                      {"sequence": 1, "questionKey": "AGE_IDENTIFICATION", "isFollowUp": False, "message": "Age?",
@@ -200,6 +189,29 @@ def test_steps_lookup_is_tenant_scoped():
     _run(body)
 
 
+def test_the_steps_of_a_persona_come_from_the_config_of_the_same_tenant_even_when_the_program_matches():
+    """
+    A config row of tenant 'other' that points at a MITRA program (plain SQL) with other steps: the lookup of the
+    steps for tenant 'other' returns ITS steps, the one for 'mitra' returns the mitra steps; neither borrows the
+    other's row.
+    """
+    async def body(conn):
+        foreign_steps = [{"name": "feedback_metadata_extraction", "columns": ["only-other"]}]
+        foreign_config = dict(await get_active_feedback_config(YOUTH["program_id"], "mitra", tenant_code="mitra"))["config"]
+        foreign_config["process_steps"] = foreign_steps
+        await pg_support.insert_foreign_config(
+            conn, tenant_code="other", program_id=YOUTH["program_id"], source="mitra", session_type="Youth_Voice",
+            config=foreign_config)
+        try:
+            from app.database.feedback_operations import _persona_process_steps
+            assert await _persona_process_steps(conn, "mitra", "Youth_Voice", "mitra", YOUTH["program_id"]) == STEPS
+            assert await _persona_process_steps(conn, "mitra", "Youth_Voice", "other", YOUTH["program_id"]) == foreign_steps
+        finally:
+            await conn.execute("DELETE FROM config WHERE tenant_code = 'other'")
+            await conn.execute("DELETE FROM tenant WHERE code = 'other'")
+    _run(body)
+
+
 # the config lookup the consumer uses ------------------------------------------------------------
 
 def test_active_config_lookup_can_be_narrowed_by_tenant_and_session_type():
@@ -230,7 +242,7 @@ def test_migrate_adds_the_missing_keys_as_a_new_version_and_keeps_history():
         result = await migrate_feedback_config()
         assert (result["configs"], result["migrated"], result["unchanged"], result["invalid"]) == (SEEDED_CONFIGS, SEEDED_CONFIGS, 0, [])
         assert all(d["added"] == list(REQUIRED_FEEDBACK_CONFIG_KEYS) and d["config_version"] == 2 for d in result["details"])
-        assert all(set(d) == {"session_type", "source", "added", "config_version"} for d in result["details"])  # no content
+        assert all(set(d) == {"session_type", "source", "tenant_code", "program_id", "added", "config_version"} for d in result["details"])  # no content
 
         v1, v2 = await _versions(conn, "Youth_Voice")
         assert (v1["version"], v1["is_active"], v1["config"]) == (1, False, before)  # history untouched
@@ -271,7 +283,8 @@ def test_migrate_never_overwrites_an_existing_key_and_reports_an_invalid_one():
             """UPDATE config_version SET config = jsonb_set(config, '{max_csv_upload_bytes}', '777')
                WHERE config_id = (SELECT id FROM config WHERE session_type = 'Parent_Voice' AND config_source = 'mitra')""")
         result = await migrate_feedback_config()
-        assert result["invalid"] == [{"session_type": "Youth_Voice", "source": "mitra", "key": "max_csv_upload_bytes",
+        assert result["invalid"] == [{"session_type": "Youth_Voice", "source": "mitra", "tenant_code": "mitra",
+                                      "program_id": YOUTH["program_id"], "key": "max_csv_upload_bytes",
                                       "problem": result["invalid"][0]["problem"]}]
         assert "positive integer" in result["invalid"][0]["problem"]
         youth = (await _versions(conn, "Youth_Voice"))[-1]["config"]
@@ -310,6 +323,7 @@ def test_set_writes_a_new_version_with_the_value_and_keeps_the_rest():
         result = await set_feedback_config_value("Youth_Voice", "mitra", "max_csv_upload_bytes", 50_000_000,
                                                  created_by="op", change_note="smaller files")
         assert result == {"session_type": "Youth_Voice", "source": "mitra", "key": "max_csv_upload_bytes",
+                          "tenant_code": "mitra", "program_id": YOUTH["program_id"], "program_name": YOUTH["program_name"],
                           "changed": True, "config_version": 2, "missing_keys": [], "dry_run": False}
         v1, v2 = await _versions(conn, "Youth_Voice")
         assert (v1["is_active"], v2["is_active"]) == (False, True)
@@ -381,8 +395,11 @@ def test_set_rejects_unknown_targets_and_unsetting_a_required_key():
     async def body(conn):
         with pytest.raises(ValueError, match="no mitra upload config for session_type 'Nobody_Voice'"):
             await set_feedback_config_value("Nobody_Voice", "mitra", "max_csv_upload_bytes", 5)
-        with pytest.raises(ValueError, match="source must be one of"):
+        # a source is a free label: an unknown one is just "no config", an unsafe / blank one is refused outright
+        with pytest.raises(ValueError, match="no whatsapp upload config for session_type 'Youth_Voice'"):
             await set_feedback_config_value("Youth_Voice", "whatsapp", "max_csv_upload_bytes", 5)
+        with pytest.raises(ValueError, match="source must be a non-empty string"):
+            await set_feedback_config_value("Youth_Voice", "  ", "max_csv_upload_bytes", 5)
         with pytest.raises(ValueError, match="required and cannot be unset"):
             await set_feedback_config_value("Youth_Voice", "mitra", "process_steps", None, unset=True)
         with pytest.raises(ValueError, match="no google_forms upload config for session_type 'Educator_Voice'"):

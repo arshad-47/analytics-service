@@ -4,7 +4,8 @@ from typing import List, Optional, Tuple
 import pandas as pd
 from app.api.exceptions import InvalidReportType, InvalidFileType, FileTooLarge, EmptyFile, InvalidFeedbackSource
 from app.config import settings
-from app.services.feedback_constants import FEEDBACK_REPORT_TYPE, FEEDBACK_SOURCES
+from app.services.feedback_adapter_config import is_safe_code, source_label_problem
+from app.services.feedback_constants import FEEDBACK_REPORT_TYPE
 
 logger = logging.getLogger("analytics_service.api.validators.uploads")
 
@@ -29,14 +30,31 @@ def max_upload_bytes(report_type: Optional[str] = None) -> int:
     return settings.MAX_CSV_UPLOAD_BYTES
 
 
-def validate_source(source: str) -> str:
-    """Validate the optional `source` form field of a feedback upload; returns the normalized value."""
-    normalized_source = source.lower().strip() if source is not None else ""
-    if normalized_source not in FEEDBACK_SOURCES:
-        raise InvalidFeedbackSource(
-            f"Invalid source {source!r}: allowed values are {', '.join(repr(s) for s in FEEDBACK_SOURCES)}."
-        )
+def validate_source(source: Optional[str]) -> str:
+    """
+    Validate the `source` form field of a feedback upload; returns the normalized (lower-cased, stripped) label.
+    A source is a free label: 1..40 characters of [a-z0-9_]. Whether it is usable is decided by data, not by a list in
+    code: the upload needs an ACTIVE feedback_upload config for (tenant, program, persona, source), which
+    load_feedback_target looks up (and rejects with a clear message when there is none).
+    """
+    if source is None:
+        raise InvalidFeedbackSource("source is required for a feedback upload.")
+    normalized_source = source.lower().strip()
+    problem = source_label_problem(normalized_source)
+    if problem is not None:
+        raise InvalidFeedbackSource(f"Invalid source: {problem}.")
     return normalized_source
+
+
+def validate_feedback_tenant_code(tenant_code: Optional[str]) -> str:
+    """Validate the `tenant_code` form field of a feedback upload (required, no default): 1..64 characters of
+    [A-Za-z0-9._-], so it can never carry a newline into a log line or a cache key. The value is not echoed."""
+    if tenant_code is None or len(tenant_code.strip()) == 0:
+        raise InvalidFeedbackSource("tenant_code is required for a feedback upload.")
+    normalized = tenant_code.strip()
+    if not is_safe_code(normalized):
+        raise InvalidFeedbackSource("Invalid tenant_code: 1 to 64 characters of letters, digits, '.', '_' and '-'.")
+    return normalized
 
 
 def validate_extension(filename: Optional[str]) -> None:

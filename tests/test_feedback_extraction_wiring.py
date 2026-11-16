@@ -5,6 +5,7 @@ workflow branch, the activity's parameter handling, the LLM settings precedence,
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from conftest import install_fake_workflow_context
@@ -68,10 +69,79 @@ def test_a_failing_extraction_marks_the_step_and_the_submission_failed_and_rerai
     asyncio.run(run())
 
 
-def test_worker_registers_the_activity():
-    source = (ROOT / "app" / "temporal" / "worker.py").read_text(encoding="utf-8")
-    assert "from app.temporal.feedback_extraction_activity import feedback_metadata_extraction_activity" in source
-    assert source.count("feedback_metadata_extraction_activity") == 2   # the import and the activities list
+def test_start_worker_registers_the_extraction_activity_and_the_workflow(monkeypatch):
+    """start_worker() with a fake Temporal client and a fake Worker: what it hands to Worker(...) is what runs."""
+    import app.temporal.worker as worker_module
+
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, client, **kwargs):
+            captured["client"] = client
+            captured.update(kwargs)
+
+        async def run(self):
+            captured["ran"] = True
+
+    client = MagicMock()
+    client.get_schedule_handle.return_value.delete = AsyncMock()
+    client.create_schedule = AsyncMock()
+    monkeypatch.setattr(worker_module.Client, "connect", AsyncMock(return_value=client))
+    monkeypatch.setattr(worker_module, "Worker", FakeWorker)
+    monkeypatch.setattr(worker_module.db, "connect", AsyncMock())
+    monkeypatch.setattr(worker_module.db, "disconnect", AsyncMock())
+    monkeypatch.setattr(worker_module.torch, "set_num_threads", MagicMock())
+
+    asyncio.run(worker_module.start_worker())
+
+    assert captured["ran"] is True and captured["client"] is client
+    assert activity_module.feedback_metadata_extraction_activity in captured["activities"]
+    assert len(captured["activities"]) == len(set(captured["activities"]))          # nothing registered twice
+    assert workflows_module.ConfigDrivenProcessingWorkflow in captured["workflows"]
+
+
+def test_the_activity_runs_inside_temporals_activity_environment_and_deterministic_failures_are_not_retried(monkeypatch):
+    """
+    temporalio.testing.ActivityEnvironment runs the REAL activity definition (decorator, activity.info(), the
+    ApplicationError it raises) in-process: no server, no download.
+    """
+    import dataclasses
+    from temporalio.exceptions import ApplicationError
+    from temporalio.testing import ActivityEnvironment
+
+    monkeypatch.setattr(activity_module, "db", SimpleNamespace(pool="POOL"))
+    params = {"submission_id": "s1", "tenant_code": "mitra", "analysis_type": STEP_NAME,
+              "llm_model": None, "max_tokens": None, "llm_timeout_seconds": None}
+
+    async def ok(pool, submission_id, tenant_code, **kwargs):
+        assert kwargs["activity_budget_seconds"] is None or kwargs["activity_budget_seconds"] > 0
+        result = fx.empty_result(fx.parse_extraction_config(extraction_config_v1("Youth")))
+        return SimpleNamespace(run=SimpleNamespace(result=result, llm_called=False))
+
+    monkeypatch.setattr(activity_module, "extract_submission", ok)
+    out = asyncio.run(ActivityEnvironment().run(activity_module.feedback_metadata_extraction_activity, params))
+    assert out["status"] == "success" and out["llm_called"] is False
+
+    async def no_config(*args, **kwargs):
+        raise ops.ExtractionSetupError("No extraction config for session_type 'Youth_Voice'")
+
+    monkeypatch.setattr(activity_module, "extract_submission", no_config)
+    with pytest.raises(ApplicationError) as caught:
+        asyncio.run(ActivityEnvironment().run(activity_module.feedback_metadata_extraction_activity, params))
+    assert caught.value.non_retryable is True and caught.value.type == "ExtractionSetupError"
+
+    async def bad_answer(*args, **kwargs):
+        raise fx.ExtractionOutputError("model answer is not valid JSON")
+
+    monkeypatch.setattr(activity_module, "extract_submission", bad_answer)
+    env = ActivityEnvironment()
+    with pytest.raises(fx.ExtractionOutputError):                                   # first attempt: the policy retries
+        asyncio.run(env.run(activity_module.feedback_metadata_extraction_activity, params))
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, attempt=2)
+    with pytest.raises(ApplicationError) as second:                                 # second attempt: give up
+        asyncio.run(env.run(activity_module.feedback_metadata_extraction_activity, params))
+    assert second.value.non_retryable is True
 
 
 def test_activity_passes_ids_and_overrides_and_marks_processing(monkeypatch):

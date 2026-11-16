@@ -28,6 +28,11 @@ RUN python -c "import os, deface.centerface as c; assert os.path.exists(c.defaul
 
 COPY app/ app/
 COPY main.py schema.sql seed_prompts.sql seed_themes.sql seed_config.sql run_all.sh ./
+# The operator tools the README and the app's own messages tell people to run inside the container
+# (python tools/feedback_config.py ..., questionnaire_versions.py, run_feedback_extraction.py). split_mitra_export.py
+# is NOT here: it prepares a CSV on the workstation that holds the export. tests/test_feedback_upgrade.py derives the
+# required list from the repo, so a tool named in a message or the README must be added to this line.
+COPY tools/feedback_config.py tools/questionnaire_versions.py tools/run_feedback_extraction.py tools/
 RUN chmod +x run_all.sh
 
 RUN mkdir -p logs downloads

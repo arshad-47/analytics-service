@@ -6,22 +6,21 @@ config_version, a deactivated version 1, renamed rows, a config an operator crea
 seeded database is a no-op; the documented "new config_version" recipe keeps one active version per config; and
 Database.initialize_schema runs it.
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is the DSN of an EMPTY scratch database that is used by this file
-alone (the tests wipe the seeded tables before each case). Synthetic data only.
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards) (the tests wipe the seeded tables before each case). Synthetic data only.
 """
 import asyncio
 import json
 import logging
-import os
 
 import asyncpg
 import pytest
+import pg_support
 
 from app.config import settings
-from app.database.db import SCHEMA_FILE, db
+from app.database.db import db
 from seed_support import PERSONAS, extraction_config_id, extraction_config_v1, mitra_config_v1, seed_config, seed_config_blocks
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -31,22 +30,12 @@ PARENT = PERSONAS["Parent"]
 COUNTS = {"leader_category": 4, "programs": 4, "config": 11, "config_version": 11}
 
 
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-
-
 def _run(body, tenant=True):
     """Runs `body(conn)` on the scratch database: schema applied, the seeded tables wiped, tenant 'mitra' present or not."""
     async def main():
         conn = await asyncpg.connect(DSN)
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             for table in ("config_version", "config", "programs", "leader_category", "tenant"):
                 await conn.execute(f"DELETE FROM {table}")
             if tenant:
@@ -304,7 +293,10 @@ def test_initialize_schema_runs_the_seed_and_warns_when_the_tenant_is_missing(mo
             with caplog.at_level(logging.WARNING, logger="analytics_service.db"):
                 await db.initialize_schema()
             assert await _counts(conn) == {t: 0 for t in COUNTS}
-            assert any("Config seed skipped" in r.message and "mitra" in r.message for r in caplog.records)
+            # truthful: the statements are guarded by the tenant (they insert nothing), the rest of the seed still ran
+            seed_logs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Config seed")]
+            assert len(seed_logs) == 1 and "'mitra'" in seed_logs[0] and "insert nothing" in seed_logs[0]
+            assert not any("skipped" in r.getMessage() for r in caplog.records)
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra')")
             await db.initialize_schema()
             await db.initialize_schema()                                        # every start runs it again

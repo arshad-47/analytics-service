@@ -1,7 +1,7 @@
 """
 Real-Postgres test: a stored session whose PII check is TRUE/FALSE goes back to NULL (not checked) when the session
 grows or a message changes, and keeps its flag when the same content arrives again. Opt-in like
-tests/test_feedback_versions_pg.py (FEEDBACK_TEST_DATABASE_URL = an EMPTY scratch database used by this file alone).
+tests/test_feedback_versions_pg.py (FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards)).
 Synthetic data only.
 """
 import json
@@ -11,8 +11,11 @@ from datetime import datetime, timezone
 import pytest
 
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS
-from tests.test_feedback_versions_pg import DSN, _run
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS
+import pg_support
+from test_feedback_versions_pg import _run
+
+DSN = pg_support.SERVER_URL   # the fixture of tests/conftest.py swaps in this module's own scratch database
 
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
@@ -30,10 +33,10 @@ def _event(sid, sess, messages, bot_id=None):
     event = {
         "submissionId": sid, "sessionId": sess, "submissionType": "feedback", "tenantCode": "mitra",
         "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": YOUTH["program_id"], "programName": "1M Voice",
+        "tags": {"programId": YOUTH["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": YOUTH["leader_category_id"], "leaderCategoryName": "Youth",
                  "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": YOUTH["session_type"], "questionnaireVersion": "V1",
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": YOUTH["session_type"], "questionnaireVersion": "V1",
                  "language": "en", "completionStatus": "IN_PROGRESS", "submissionDate": STARTED.isoformat(),
                  "messages": messages},
     }

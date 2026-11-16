@@ -11,7 +11,7 @@ import pytest
 
 from app.services import feedback_extraction as fx
 from app.services.feedback_extraction_constants import (
-    MAX_RESPONDENT_MESSAGE_CHARS,
+    DEFAULT_MAX_RESPONDENT_MESSAGE_CHARS as MAX_RESPONDENT_MESSAGE_CHARS,
     PII_TYPES,
 )
 from seed_support import PERSONAS, extraction_config_id, extraction_config_v1
@@ -608,8 +608,9 @@ def test_precheck_reads_both_columns_and_only_respondent_rows():
     assert _flagged("fine", english="call 9876543210") == ("phone",)                       # translated column
     bot_only = [_row(1, "Call us on 9876543210 or mail help@example.org"), _row(2, "ok", answer=True)]
     assert fx.pii_precheck_kinds(bot_only) == ()                                           # bot lines are never PII
-    split = [_row(1, "Q"), _row(2, "1234", answer=True), _row(3, "5678", answer=True)]
-    assert fx.pii_precheck_kinds(split) == ()                                              # messages are checked separately
+    separate = [_row(1, "Q"), _row(2, "1234 is my pin", answer=True), _row(3, "5678", answer=True)]
+    assert fx.pii_precheck_kinds(separate) == ()                  # a message with words is checked on its own
+    # (a number answered in parts, '98765' then '43210', is joined: tests/test_feedback_extraction_pii_policy.py)
 
 
 def test_precheck_overrides_a_model_that_says_pii_false_even_when_the_respondent_tells_it_to():

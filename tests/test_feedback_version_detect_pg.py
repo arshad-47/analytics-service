@@ -1,7 +1,7 @@
 """
 Real-Postgres test of detect_questionnaire_versions (app/database/feedback_operations.py): sessions are stored through
 the real ingest path, then the questions they were asked are compared. Opt-in like tests/test_feedback_versions_pg.py:
-FEEDBACK_TEST_DATABASE_URL must name an EMPTY scratch database used by this file alone. Synthetic data only.
+FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards). Synthetic data only.
 """
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -10,8 +10,11 @@ import pytest
 
 from app.database.feedback_operations import detect_questionnaire_versions, set_questionnaire_version
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS
-from tests.test_feedback_versions_pg import DSN, _run
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS
+import pg_support
+from test_feedback_versions_pg import _run
+
+DSN = pg_support.SERVER_URL   # the fixture of tests/conftest.py swaps in this module's own scratch database
 
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
@@ -46,10 +49,10 @@ async def _add(conn, questions, minutes, stamped="V1"):
     await insert_or_update_submission(conn, {
         "submissionId": sid, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback",
         "tenantCode": "mitra", "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": YOUTH["program_id"], "programName": "1M Voice",
+        "tags": {"programId": YOUTH["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": YOUTH["leader_category_id"], "leaderCategoryName": "Youth",
                  "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": YOUTH["session_type"], "questionnaireVersion": stamped,
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": YOUTH["session_type"], "questionnaireVersion": stamped,
                  "language": "en", "completionStatus": "COMPLETED", "submissionDate": started.isoformat(),
                  "messages": _messages(questions), "botId": YOUTH["bot_id"]},
     })
@@ -105,4 +108,26 @@ def test_detect_with_no_sessions_or_one_version_of_questions_proposes_nothing():
         everyone = await detect_questionnaire_versions()
         assert set(everyone) == {"Educator_Voice", "General_Public_Voice", "Parent_Voice", "Youth_Voice"}
         assert await detect_questionnaire_versions("Nobody_Voice") == {}
+    _run(body)
+
+
+def test_questions_of_another_tenant_that_points_at_a_mitra_program_never_make_a_proposal():
+    """
+    Sixty mitra sessions ask one set of questions; forty sessions of tenant 'other' carry the mitra program id and a
+    DIFFERENT set (written with plain SQL, the ingest path refuses them). Counting them would propose a new version.
+    """
+    async def body(conn):
+        for i in range(60):
+            await _add(conn, V1_QS, i)
+        for i in range(40):
+            await pg_support.insert_foreign_session(
+                conn, tenant_code="other", submission_id=f"foreign-{i}", program_id=YOUTH["program_id"],
+                started_at=T0 + timedelta(minutes=60 + i), version="V1", session_type="Youth_Voice",
+                questions=[text for _, text in V2_QS])
+        try:
+            youth = (await detect_questionnaire_versions("Youth_Voice", min_sessions=10, baseline_sessions=40))["Youth_Voice"]
+            assert youth["sessions"] == 60
+            assert youth["proposal"] is None and youth["new_questions"] == []
+        finally:
+            await conn.execute("DELETE FROM submissions WHERE tenant_code = 'other'")
     _run(body)

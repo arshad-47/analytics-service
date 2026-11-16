@@ -4,7 +4,7 @@ Tests for tools/feedback_config.py (show / migrate / set of the per-bot feedback
 * no database: build_parser() accepts every documented form and rejects the rest (argparse errors exit with 2 before
   anything runs), parse_set_value, and main() wiring (JSON output, `error: ...` + exit code 1 for a ValueError, the
   arguments handed to the DB layer, created_by = getpass.getuser()) with the DB layer replaced by fakes;
-* real Postgres (opt-in, FEEDBACK_TEST_DATABASE_URL = DSN of an EMPTY scratch database used by this file alone):
+* real Postgres (opt-in, FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards)):
   main([...]) end to end against a freshly seeded database (the CLI opens its own pool with db.connect(), which reads
   settings.DATABASE_URL, so the tests point that setting at the scratch database). Synthetic data only.
 """
@@ -12,22 +12,21 @@ import asyncio
 import getpass
 import importlib.util
 import json
-import os
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pg_support
 
 from app.config import settings
-from app.database.db import SCHEMA_FILE
-from seed_support import seed_config
+from seed_support import SEED_UPLOAD_CONFIG_COUNT, seed_config
 
 _TOOL = Path(__file__).resolve().parent.parent / "tools" / "feedback_config.py"
 _spec = importlib.util.spec_from_file_location("feedback_config_cli", _TOOL)
 cli = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cli)
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 needs_db = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -41,6 +40,14 @@ SET = ["set", "--session-type", "Youth_Voice", "--source", "mitra"]
     (["show", "--session-type", "Youth_Voice"], {"command": "show", "session_type": "Youth_Voice"}),
     (["migrate"], {"command": "migrate", "dry_run": False}),
     (["migrate", "--dry-run"], {"command": "migrate", "dry_run": True}),
+    (["migrate-legacy", "--tenant-code", "abc"],
+     {"command": "migrate-legacy", "tenant_code": "abc", "map": [], "map_file": None, "source": None,
+      "retire_config": [], "dry_run": False}),
+    (["migrate-legacy", "--tenant-code", "abc", "--map", "leader:Parent=Parent_Voice", "--map", "PTM=Teacher_Voice",
+      "--source", "ptm_app", "--retire-config", "7b3c1a2e-0000-4000-8000-000000000001", "--dry-run",
+      "--map-file", "m.json"],
+     {"map": ["leader:Parent=Parent_Voice", "PTM=Teacher_Voice"], "source": "ptm_app", "dry_run": True,
+      "retire_config": ["7b3c1a2e-0000-4000-8000-000000000001"], "map_file": "m.json"}),
     (SET + ["--key", "max_csv_upload_bytes", "--value", "50000000"],
      {"command": "set", "session_type": "Youth_Voice", "source": "mitra", "key": "max_csv_upload_bytes",
       "value": "50000000", "json": None, "unset": False, "dry_run": False, "tenant_code": None, "note": None}),
@@ -49,6 +56,13 @@ SET = ["set", "--session-type", "Youth_Voice", "--source", "mitra"]
     (SET + ["--key", "expect_stages", "--unset"], {"key": "expect_stages", "unset": True}),
     (["set", "--key", "ingestion_schema", "--json", "{}", "--source", "google_forms", "--session-type", "Parent_Voice",
       "--tenant-code", "mitra"], {"source": "google_forms", "session_type": "Parent_Voice", "tenant_code": "mitra"}),
+    # a source is a free label (no allow-list); the program is picked by id or by name
+    (["set", "--key", "process_steps", "--json", "[]", "--source", "ptm_app", "--session-type", "Parent",
+      "--tenant-code", "abc", "--program-name", "PTM 2026"],
+     {"source": "ptm_app", "program_name": "PTM 2026", "program_id": None, "tenant_code": "abc"}),
+    (["show", "--tenant-code", "abc", "--program-id", "7b3c1a2e-0000-4000-8000-000000000001", "--source", "ptm_app"],
+     {"command": "show", "tenant_code": "abc", "program_id": "7b3c1a2e-0000-4000-8000-000000000001",
+      "source": "ptm_app", "program_name": None}),
 ])
 def test_build_parser_accepts_every_documented_form(argv, expected):
     args = cli.build_parser().parse_args(argv)
@@ -64,7 +78,8 @@ def test_build_parser_accepts_every_documented_form(argv, expected):
     ["set", "--session-type", "Youth_Voice", "--key", "process_steps", "--json", "[]"],            # no --source
     ["set", "--session-type", "Youth_Voice", "--source", "mitra", "--json", "[]"],                 # no --key
     SET + ["--key", "not_a_setting", "--value", "1"],                                              # unknown key
-    ["set", "--session-type", "Youth_Voice", "--source", "whatsapp", "--key", "process_steps", "--json", "[]"],
+    ["set", "--session-type", "Youth_Voice", "--source", "mitra", "--key", "process_steps", "--json", "[]",
+     "--program-id"],                                                                              # selector without value
     SET + ["--key", "process_steps", "--json"],                                                   # option without value
     SET + ["--key", "process_steps", "--json", "[]", "--unknown"],
 ])
@@ -115,8 +130,9 @@ class _FakeDb:
 def fake_layer(monkeypatch):
     fake_db, calls = _FakeDb(), []
 
-    async def listing(session_type=None):
-        calls.append(("show", session_type))
+    async def listing(session_type=None, **selectors):
+        calls.append(("show", session_type) if all(v is None for v in selectors.values())
+                     else ("show", session_type, selectors))
         return {"configs": []}
 
     async def migrating(dry_run=False, created_by="cli"):
@@ -129,7 +145,22 @@ def fake_layer(monkeypatch):
             raise ValueError("Feedback config 'max_csv_upload_bytes' must be a positive integer (bytes), got 13")
         return {"changed": True}
 
+    async def adapter_problems(selectors):
+        calls.append(("adapter_problems", dict(selectors)))
+        return {}
+
+    async def adapter_after_set(session_type, source, key, value, **kwargs):
+        calls.append(("adapter_after_set", session_type, source, key))
+        return "adapter is wrong" if value == "wide_form" else None
+
+    async def legacy(**kwargs):
+        calls.append(("migrate-legacy", kwargs))
+        return {"dry_run": kwargs["dry_run"], "configs": {}}
+
     monkeypatch.setattr(cli, "db", fake_db)
+    monkeypatch.setattr(cli.feedback_legacy_upgrade, "adapter_problems_for", adapter_problems)
+    monkeypatch.setattr(cli.feedback_legacy_upgrade, "adapter_problem_after_set", adapter_after_set)
+    monkeypatch.setattr(cli.feedback_legacy_upgrade, "migrate_legacy", legacy)
     monkeypatch.setattr(cli.feedback_operations, "list_feedback_config", listing)
     monkeypatch.setattr(cli.feedback_operations, "migrate_feedback_config", migrating)
     monkeypatch.setattr(cli.feedback_operations, "set_feedback_config_value", setting)
@@ -141,23 +172,55 @@ def test_main_wiring_with_the_db_layer_faked(fake_layer, capsys):
     fake_db, calls = fake_layer
     assert cli.main(["show"]) == 0
     assert cli.main(["show", "--session-type", "Parent_Voice"]) == 0
+    assert cli.main(["show", "--tenant-code", "abc", "--program-name", "PTM", "--source", "ptm_app"]) == 0
     assert cli.main(["migrate", "--dry-run"]) == 0
     assert cli.main(["migrate"]) == 0
     assert cli.main(SET + ["--key", "max_csv_upload_bytes", "--value", "50000000", "--note", "why", "--dry-run"]) == 0
     assert cli.main(SET + ["--key", "process_steps", "--json", '[{"name": "feedback_metadata_extraction"}]']) == 0
     assert cli.main(SET + ["--key", "expect_stages", "--unset"]) == 0
-    assert calls == [
-        ("show", None), ("show", "Parent_Voice"), ("migrate", True, "operator-1"), ("migrate", False, "operator-1"),
+    assert [c for c in calls if c[0] in ("show", "migrate", "set")] == [
+        ("show", None), ("show", "Parent_Voice"),
+        ("show", None, {"tenant_code": "abc", "program_id": None, "program_name": "PTM", "source": "ptm_app"}),
+        ("migrate", True, "operator-1"), ("migrate", False, "operator-1"),
         ("set", "Youth_Voice", "mitra", "max_csv_upload_bytes", 50000000,
-         {"tenant_code": None, "unset": False, "created_by": "operator-1", "change_note": "why", "dry_run": True}),
+         {"tenant_code": None, "program_id": None, "program_name": None, "unset": False,
+          "created_by": "operator-1", "change_note": "why", "dry_run": True}),
         ("set", "Youth_Voice", "mitra", "process_steps", [{"name": "feedback_metadata_extraction"}],
-         {"tenant_code": None, "unset": False, "created_by": "operator-1", "change_note": None, "dry_run": False}),
+         {"tenant_code": None, "program_id": None, "program_name": None, "unset": False,
+          "created_by": "operator-1", "change_note": None, "dry_run": False}),
         ("set", "Youth_Voice", "mitra", "expect_stages", None,
-         {"tenant_code": None, "unset": True, "created_by": "operator-1", "change_note": None, "dry_run": False}),
+         {"tenant_code": None, "program_id": None, "program_name": None, "unset": True,
+          "created_by": "operator-1", "change_note": None, "dry_run": False}),
     ]
-    assert fake_db.events == ["connect", "disconnect"] * 7
+    assert fake_db.events == ["connect", "disconnect"] * 8
     out = capsys.readouterr().out
     assert out.startswith("{\n  ") and '"dry_run": true' in out  # indented JSON on stdout
+
+
+def test_show_and_set_ask_the_adapter_validator_and_migrate_legacy_hands_its_arguments_on(fake_layer, tmp_path, capsys):
+    fake_db, calls = fake_layer
+    getpass_user = "operator-1"
+    assert cli.main(["show", "--tenant-code", "abc"]) == 0
+    assert ("adapter_problems", {"session_type": None, "source": None, "tenant_code": "abc", "program_id": None,
+                                 "program_name": None}) in calls
+    assert cli.main(SET + ["--key", "adapter", "--json", '"wide_form"']) == 1          # refused before any write
+    assert "the config would be invalid after this change: adapter is wrong" in capsys.readouterr().err
+    assert not [c for c in calls if c[0] == "set"]
+    assert cli.main(SET + ["--key", "adapter", "--json", '"conversation_rows"']) == 0
+    assert [c for c in calls if c[0] == "set"][0][3:5] == ("adapter", "conversation_rows")
+    map_file = tmp_path / "map.json"
+    map_file.write_text('{"leader:Youth": "Youth_Voice"}')
+    assert cli.main(["migrate-legacy", "--tenant-code", "abc", "--map", "PTM=Teacher_Voice", "--map-file", str(map_file),
+                     "--source", "mitra", "--retire-config", "7b3c1a2e-0000-4000-8000-000000000001",
+                     "--dry-run"]) == 0
+    kwargs = [c for c in calls if c[0] == "migrate-legacy"][0][1]
+    assert kwargs == {"tenant_code": "abc", "session_type_map": {"PTM": "Teacher_Voice", "leader:Youth": "Youth_Voice"},
+                      "source": "mitra", "retire_config_ids": ["7b3c1a2e-0000-4000-8000-000000000001"],
+                      "dry_run": True, "created_by": getpass_user}
+    # a malformed mapping or a missing file is an error line and exit 1, never a traceback
+    assert cli.main(["migrate-legacy", "--tenant-code", "abc", "--map", "no-separator"]) == 1
+    assert cli.main(["migrate-legacy", "--tenant-code", "abc", "--map-file", str(tmp_path / "missing.json")]) == 1
+    assert capsys.readouterr().err.count("error: ") == 2
 
 
 @pytest.mark.parametrize("argv,needle", [
@@ -188,16 +251,6 @@ def test_main_exits_with_2_on_argparse_errors_before_running_anything(monkeypatc
 
 # ====================================================================================== real Postgres
 
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-
-
 def _with_conn(body):
     async def main():
         conn = await asyncpg.connect(DSN)
@@ -211,7 +264,7 @@ def _with_conn(body):
 @pytest.fixture
 def scratch(monkeypatch):
     async def reset(conn):
-        await conn.execute(_schema_sql())
+        await conn.execute(pg_support.schema_sql())
         await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
         await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
         await conn.execute("DELETE FROM config_version")
@@ -245,7 +298,7 @@ def test_show_prints_the_seeded_settings(scratch, capsys):
         assert c["max_csv_upload_bytes"] == 104857600 and c["process_steps"] == []
         assert c["problems"] == {} and c["expect_stages"] is None
     assert cli.main(["show"]) == 0
-    assert len(_json(capsys)["configs"]) == 7
+    assert len(_json(capsys)["configs"]) == SEED_UPLOAD_CONFIG_COUNT
 
 
 @needs_db
@@ -293,3 +346,8 @@ def test_set_scalar_json_dry_run_unset_and_errors(scratch, capsys):
                      "--value", "5"]) == 1
     assert "no mitra upload config for session_type" in capsys.readouterr().err
     assert _active_config()[0] == before  # a rejected change writes nothing
+
+
+def test_the_tool_documents_the_60_second_consumer_cache():
+    # B13: a change reaches the Kafka consumers only when their cache entry expires
+    assert "60 seconds" in cli.__doc__ and "cache" in cli.__doc__

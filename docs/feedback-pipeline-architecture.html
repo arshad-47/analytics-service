@@ -244,7 +244,7 @@ a { color: var(--accent); }
       <ul>
         <li>The activity loads the whole conversation in order, the Youth extraction config, and the prompt named in that config.</li>
         <li>One call to OpenRouter returns JSON with the persona's fields and a PII flag. Code validates it strictly: values must fit the configured bands or the integer range, placeholders such as "N/A" become not provided, anything else is stored as unmapped with the raw words kept.</li>
-        <li>Code adds a PII backstop: 8 or more digits, an email, an @handle or a URL forces the flag on, whatever the model said.</li>
+        <li>Code adds a PII backstop: a long run of digits (8 or more; separators and Unicode digits normalised, year ranges and short lists of numbers excepted), an email, an @handle or a URL forces the flag on, whatever the model said. A flagged session keeps no respondent words.</li>
         <li>One transaction writes <code>feedback_extracted_data</code>, <code>pii_detected</code>, <code>meta_data.extraction</code> and <code>llm_logs</code>. If the conversation changed during the call, nothing is written and the step retries.</li>
       </ul>
       <p class="reads"><b>Reads:</b> <code>fields</code>, <code>pii.types</code>, <code>llm</code>, <code>prompt_name</code>, the prompt text</p>
@@ -314,8 +314,8 @@ a { color: var(--accent); }
 <text class="bl" x="934" y="192">(fenced by a content hash)</text>
 <polyline class="a-conf" points="415,198 415,250 1015,250 1015,228" fill="none" marker-end="url(#mc2)"/>
 <text class="lbl lbl-conf" x="715" y="242" text-anchor="middle">fields, bands, pii types fill the variables</text>
-<rect class="chip" x="10" y="278" width="350" height="56" rx="8"/><text class="bl" x="24" y="301">Named prompt missing: the run fails</text><text class="bl lbl2" x="24" y="320">No silent fallback to the generic prompt.</text>
-<rect class="chip" x="385" y="278" width="350" height="56" rx="8"/><text class="bl" x="399" y="301">No prompt_name in the config: generic prompt</text><text class="bl lbl2" x="399" y="320">Used by configs written before per-persona prompts.</text>
+<rect class="chip" x="10" y="278" width="350" height="56" rx="8"/><text class="bl" x="24" y="301">Named prompt missing: the run fails</text><text class="bl lbl2" x="24" y="320">No silent fallback to any other prompt.</text>
+<rect class="chip" x="385" y="278" width="350" height="56" rx="8"/><text class="bl" x="399" y="301">No prompt_name in the config: rejected</text><text class="bl lbl2" x="399" y="320">prompt_name is required; there is no default prompt.</text>
 <rect class="chip" x="760" y="278" width="350" height="56" rx="8"/><text class="bl" x="774" y="301">Model: step override, then config.llm, then .env</text><text class="bl lbl2" x="774" y="320">The first one that is set wins.</text>
 </svg></div>
     <figcaption>The session names its persona, the persona's config names a prompt, and the prompt is rendered with that persona's fields. A Parent session takes the same path and ends at a different config and a different prompt.</figcaption>
@@ -399,10 +399,10 @@ a { color: var(--accent); }
   <div class="edge">
     <div><b>Unchanged session</b>Skipped at upload. Nothing is published and nothing is written.</div>
     <div><b>Bad session in a file</b>Goes to the DLQ topic with its identifiers. The other sessions continue.</div>
-    <div><b>Config missing or invalid</b>The event is dead-lettered with a hint to run <code>feedback_config.py migrate</code> and replay it. A stored session is marked failed, not retried in a loop.</div>
+    <div><b>Config missing or invalid</b>The event is dead-lettered with a hint to run <code>feedback_config.py migrate</code> (or <code>migrate-legacy</code> for a database created before <code>session_type</code> existed) and replay it. A stored session is marked failed, not retried in a loop.</div>
     <div><b>Session grew during the model call</b>The write is refused and the step retries on the new content. The PII flag is never left from older text.</div>
     <div><b>Model or provider error</b>Provider text is stripped from errors and logs. Temporal retries up to 3 times, then the step fails.</div>
-    <div><b>Very long respondent message</b>Over 20,000 characters: no model call, the session is flagged PII and its fields are stored as unmapped.</div>
+    <div><b>Very long respondent message</b>Over the configured limit (default 20,000 characters per message, 200,000 per conversation): no model call, the session is flagged PII and its fields are stored as unmapped.</div>
   </div>
 </section>
 </main>

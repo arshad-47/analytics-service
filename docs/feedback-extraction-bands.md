@@ -15,7 +15,7 @@ Configs: `prompt_name` in each config names the persona's prompt exactly:
 | Parent (`Parent_Voice`) | `Feedback Metadata Extraction - Parent` |
 | Educator (`Educator_Voice`) | `Feedback Metadata Extraction - Educator` |
 
-The generic prompt `Feedback Metadata Extraction` stays seeded as the fallback of a config without `prompt_name`.
+`prompt_name` is required in every extraction config. The program-neutral prompt `Feedback Metadata Extraction` stays seeded only as a TEMPLATE to copy for a new program; no config falls back to it.
 
 ## Shared across personas
 
@@ -112,9 +112,9 @@ FROM prompts WHERE name = 'Feedback Metadata Extraction - Youth';
 COMMIT;
 ```
 
-**To point a persona at a different prompt**, add a new prompt row (`INSERT INTO prompts (name, analysis_type) VALUES ('<name>', 'feedback_metadata_extraction')` plus its version 1) and put the exact name in a new config version's `prompt_name`. A `prompt_name` that does not resolve fails loudly; there is no silent fallback to the generic prompt.
+**To point a persona at a different prompt**, add a new prompt row (`INSERT INTO prompts (name, analysis_type) VALUES ('<name>', 'feedback_metadata_extraction')` plus its version 1) and put the exact name in a new config version's `prompt_name`. A `prompt_name` that does not resolve fails loudly; there is no silent fallback to any other prompt.
 
-After a band or prompt change, re-run the affected sessions (one real LLM call each): `python tools/run_feedback_extraction.py run --session-type Youth_Voice` without `--only-unprocessed`. Try one or two first with `--limit 2`.
+After a band or prompt change, re-run the affected sessions (one real LLM call each): `python tools/run_feedback_extraction.py run --session-type Youth_Voice --tenant-code <tenant>` without `--only-unprocessed`. Try one or two first with `--limit 2`.
 
 ## How an existing database picks this up
 

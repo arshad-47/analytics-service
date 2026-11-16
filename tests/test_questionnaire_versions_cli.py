@@ -5,7 +5,7 @@ Two parts:
 * no database: build_parser() accepts every documented form and rejects the rest, argparse errors exit with
   code 2 before anything runs, and main() wiring (JSON output, `error: ...` + exit code 1 for a ValueError, the
   arguments handed to the DB layer, created_by = getpass.getuser()) with the DB layer replaced by fakes;
-* real Postgres (opt-in, FEEDBACK_TEST_DATABASE_URL = DSN of an EMPTY scratch database used by this file alone):
+* real Postgres (opt-in, FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards)):
   main([...]) end to end. The CLI opens its own pool with db.connect() / db.disconnect(), which reads
   settings.DATABASE_URL, so the tests point that setting at the scratch database. Every test starts from a fresh
   seed (config_version 1, only V1, for every persona). Synthetic data only.
@@ -14,25 +14,24 @@ import asyncio
 import getpass
 import importlib.util
 import json
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pg_support
 
 from app.config import settings
-from app.database.db import SCHEMA_FILE
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, seed_config
 
 _TOOL = Path(__file__).resolve().parent.parent / "tools" / "questionnaire_versions.py"
 _spec = importlib.util.spec_from_file_location("questionnaire_versions_cli", _TOOL)
 cli = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cli)
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 needs_db = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -112,6 +111,9 @@ def test_main_exits_with_2_on_argparse_errors_before_running_anything(monkeypatc
     assert captured.out == "" and "required" in captured.err
 
 
+PROGRAM_ID = "7b3c1a2e-0000-4000-8000-000000000001"
+
+
 class _FakeDb:
     def __init__(self):
         self.events = []
@@ -129,12 +131,14 @@ def fake_layer(monkeypatch):
     fake_db = _FakeDb()
     calls = []
 
-    async def listing(session_type=None):
-        calls.append(("list", session_type))
+    async def listing(session_type=None, **selectors):
+        calls.append(("list", session_type) if all(v is None for v in selectors.values())
+                     else ("list", session_type, selectors))
         return {"Youth_Voice": {"config_version": 1, "versions": [{"key": "V1", "effective_from": None}], "sessions": {}}}
 
-    async def restamp(session_type=None, dry_run=False):
-        calls.append(("restamp", session_type, dry_run))
+    async def restamp(session_type=None, dry_run=False, **selectors):
+        calls.append(("restamp", session_type, dry_run) if all(v is None for v in selectors.values())
+                     else ("restamp", session_type, dry_run, selectors))
         return {"session_types": {}, "changed": 0, "dry_run": dry_run}
 
     async def setting(session_type, key, effective_from, **kwargs):
@@ -159,14 +163,21 @@ def test_main_wiring_with_the_db_layer_faked(fake_layer, capsys):
     assert cli.main(["restamp", "--session-type", "Parent_Voice"]) == 0
     assert cli.main(SET_ARGS) == 0
     assert cli.main(SET_ARGS + ["--note", "why", "--no-restamp", "--dry-run"]) == 0
+    assert cli.main(SET_ARGS + ["--tenant-code", "abc", "--program-name", "PTM", "--source", "ptm_app"]) == 0
+    assert cli.main(["list", "--tenant-code", "abc", "--program-id", PROGRAM_ID, "--source", "ptm_app"]) == 0
+    none = {"tenant_code": None, "program_id": None, "program_name": None, "source": None}
     assert calls == [
         ("list", None), ("list", "Youth_Voice"), ("restamp", None, True), ("restamp", "Parent_Voice", False),
         ("set", "Youth_Voice", "V3", V3_TEXT,
-         {"created_by": "operator-1", "change_note": None, "restamp": True, "dry_run": False}),
+         {**none, "created_by": "operator-1", "change_note": None, "restamp": True, "dry_run": False}),
         ("set", "Youth_Voice", "V3", V3_TEXT,
-         {"created_by": "operator-1", "change_note": "why", "restamp": False, "dry_run": True}),
+         {**none, "created_by": "operator-1", "change_note": "why", "restamp": False, "dry_run": True}),
+        ("set", "Youth_Voice", "V3", V3_TEXT,
+         {"tenant_code": "abc", "program_id": None, "program_name": "PTM", "source": "ptm_app",
+          "created_by": "operator-1", "change_note": None, "restamp": True, "dry_run": False}),
+        ("list", None, {"tenant_code": "abc", "program_id": PROGRAM_ID, "program_name": None, "source": "ptm_app"}),
     ]
-    assert fake_db.events == ["connect", "disconnect"] * 6   # the pool is opened and closed around every command
+    assert fake_db.events == ["connect", "disconnect"] * 8   # the pool is opened and closed around every command
     out = capsys.readouterr().out
     assert out.count("\n  ") > 0                              # indented JSON
 
@@ -198,7 +209,8 @@ def test_detect_is_wired_to_the_read_only_operation_and_prints_its_result(monkey
     monkeypatch.setattr(cli.feedback_operations, "detect_questionnaire_versions", detecting)
     assert cli.main(["detect", "--session-type", "Youth_Voice", "--min-sessions", "7"]) == 0
     assert calls == [("Youth_Voice", {"min_sessions": 7, "baseline_sessions": 100, "min_coverage": 0.3,
-                                      "include_wording": False})]
+                                      "include_wording": False, "tenant_code": None, "program_id": None,
+                                      "program_name": None, "source": None})]
     assert json.loads(capsys.readouterr().out)["Youth_Voice"]["proposal"] is None
     assert cli.main(["detect", "--min-sessions", "0"]) == 1
     assert capsys.readouterr().err.startswith("error: min_sessions")
@@ -225,7 +237,7 @@ def test_main_turns_a_value_error_into_an_error_line_and_exit_code_1(fake_layer,
 
 
 def test_main_does_not_swallow_other_errors(fake_layer, monkeypatch):
-    async def broken(session_type=None):
+    async def broken(session_type=None, **selectors):
         raise RuntimeError("database is down")
     monkeypatch.setattr(cli.feedback_operations, "list_questionnaire_versions", broken)
     with pytest.raises(RuntimeError, match="database is down"):
@@ -233,16 +245,6 @@ def test_main_does_not_swallow_other_errors(fake_layer, monkeypatch):
 
 
 # ====================================================================================== real Postgres
-
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-
 
 def _with_conn(body):
     async def main():
@@ -258,7 +260,7 @@ def _with_conn(body):
 def scratch(monkeypatch):
     """A freshly seeded scratch database that the CLI (db.connect() -> settings.DATABASE_URL) talks to."""
     async def reset(conn):
-        await conn.execute(_schema_sql())
+        await conn.execute(pg_support.schema_sql())
         await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
         await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
         await conn.execute("DELETE FROM config_version")
@@ -277,10 +279,10 @@ def _store(persona, stored_version, started_at):
     event = {
         "submissionId": sid, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback",
         "tenantCode": "mitra", "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": PERSONAS[persona]["program_id"], "programName": "1M Voice",
+        "tags": {"programId": PERSONAS[persona]["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": PERSONAS[persona]["leader_category_id"], "leaderCategoryName": persona,
                  "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": PERSONAS[persona]["session_type"],
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": PERSONAS[persona]["session_type"],
                  "questionnaireVersion": stored_version, "language": "en", "completionStatus": "COMPLETED",
                  "botId": PERSONAS[persona]["bot_id"], "submissionDate": started_at.isoformat(),
                  "messages": [
@@ -428,7 +430,7 @@ def test_set_moves_an_existing_key_and_reports_no_change_for_the_same_value(scra
 @pytest.mark.parametrize("argv,message", [
     (["set", "--session-type", "Youth_Voice", "--key", "V2", "--effective-from", "2026-11-03T18:23:03"], "UTC offset"),
     (["set", "--session-type", "Youth_Voice", "--key", "V2", "--effective-from", "tomorrow"], "not an ISO instant"),
-    (["set", "--session-type", "Nobody_Voice", "--key", "V2", "--effective-from", V2_TEXT], "no active Mitra upload config"),
+    (["set", "--session-type", "Nobody_Voice", "--key", "V2", "--effective-from", V2_TEXT], "no active upload config with questionnaire versions"),
     (["set", "--session-type", "Youth_Voice", "--key", "V1", "--effective-from", V2_TEXT], "first one"),
     (["set", "--session-type", "Youth_Voice", "--key", "", "--effective-from", V2_TEXT], "non-empty"),
 ])
@@ -463,8 +465,8 @@ def test_restamp_relabels_from_the_current_windows(scratch, capsys):
     code, out, _ = _call(capsys, ["restamp", "--dry-run"])
     res = json.loads(out)
     assert code == 0 and res["dry_run"] is True and res["changed"] == 2
-    assert res["session_types"]["Youth_Voice"] == {"sessions": 1, "changed": 1, "versions": {"V2": 1}}
-    assert res["session_types"]["General_Public_Voice"] == {"sessions": 0, "changed": 0, "versions": {}}
+    assert {k: res["session_types"]["Youth_Voice"][k] for k in ("sessions", "changed", "versions")} == {"sessions": 1, "changed": 1, "versions": {"V2": 1}}
+    assert {k: res["session_types"]["General_Public_Voice"][k] for k in ("sessions", "changed", "versions")} == {"sessions": 0, "changed": 0, "versions": {}}
     assert _state() == before                                           # a dry run writes nothing
 
     code, out, _ = _call(capsys, ["restamp", "--session-type", "Youth_Voice"])
@@ -481,8 +483,8 @@ def test_restamp_relabels_from_the_current_windows(scratch, capsys):
 @needs_db
 def test_restamp_with_an_invalid_stored_list_returns_1(scratch, capsys):
     async def corrupt(conn):
-        await conn.execute("UPDATE config_version SET config = '{}'::jsonb WHERE config_id = $1::uuid",
-                           PERSONAS["Youth"]["config_id"])
+        await conn.execute("UPDATE config_version SET config = '{\"adapter\": \"conversation_rows\"}'::jsonb "
+                           "WHERE config_id = $1::uuid", PERSONAS["Youth"]["config_id"])
     _with_conn(corrupt)
     code, out, err = _call(capsys, ["restamp"])
     assert code == 1 and out == "" and err.startswith("error: ") and "questionnaire_versions" in err
@@ -491,6 +493,15 @@ def test_restamp_with_an_invalid_stored_list_returns_1(scratch, capsys):
 @needs_db
 def test_the_cli_leaves_no_pool_open_and_can_be_called_repeatedly(scratch, capsys):
     from app.database.db import db
+    registry_before = dict(db._pools)     # the pools are keyed by event loop; `db.pool` is None outside a running loop
     for _ in range(3):
         assert _call(capsys, ["list"])[0] == 0
     assert db.pool is None
+    # `db.pool` is always None once asyncio.run() has returned, so it cannot show an omitted disconnect: the loop-keyed
+    # registry can (a pool left open would still be registered under its finished loop)
+    assert db._pools == registry_before
+
+
+def test_the_tool_documents_the_60_second_consumer_cache():
+    # B13: a change reaches the Kafka consumers only when their cache entry expires
+    assert "60 seconds" in cli.__doc__ and "cache" in cli.__doc__

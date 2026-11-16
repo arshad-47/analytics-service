@@ -1,22 +1,22 @@
 """
-Real-Postgres tests of the review fixes around the per-persona feedback config: a pending feedback submission whose
-persona config is missing / invalid must not stop the batch sweep (the older story row is still returned, the bad
-row is marked failed with the reason), the same for the retry sweep, the bulk-retry persona lookup, and the startup
-check against real config rows.
+Real-Postgres tests of the process steps of a feedback submission (the unit side: tests/test_feedback_process_steps.py):
+a pending feedback submission whose persona config is missing / invalid must not stop the batch sweep (the older
+story row is still returned, the bad row is marked failed with the reason), the same for the retry sweep, and the
+startup check against real config rows.
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is set to the DSN of an EMPTY scratch database that is used by
-this file alone. Synthetic data only.
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch
+database of its own for this file and drops it afterwards). Synthetic data only.
 """
 import asyncio
 import json
 from datetime import datetime
-import os
 import uuid
 
 import asyncpg
 import pytest
+import pg_support
 
-from app.database.db import SCHEMA_FILE, db
+from app.database.db import db
 from app.database.feedback_operations import (
     get_active_feedback_config,
     get_feedback_process_steps,
@@ -27,31 +27,21 @@ from app.database.feedback_operations import (
     set_questionnaire_version,
 )
 from app.database.operations import insert_or_update_submission
-from seed_support import seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, seed_config
 from app.services.feedback_constants import (
     DEFAULT_INGESTION_SCHEMA,
     DEFAULT_MAX_CSV_UPLOAD_BYTES,
     REQUIRED_FEEDBACK_CONFIG_KEYS,
 )
-from seed_support import PERSONAS
+from seed_support import PERSONAS, SEED_UPLOAD_CONFIG_COUNT
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
 YOUTH = PERSONAS["Youth"]
 STEPS = []  # the seed / migrate default: extraction is opt-in (an LLM call per submission)
-SEEDED_CONFIGS = 7  # 4 Mitra (Youth, Parent, General Public, Educator) + 3 Google Forms (no Educator form)
-
-
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
+SEEDED_CONFIGS = SEED_UPLOAD_CONFIG_COUNT   # the upload configs of the seed (one per persona and source)
 
 
 def _run(body):
@@ -60,7 +50,7 @@ def _run(body):
         conn = await asyncpg.connect(DSN)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
             await conn.execute("DELETE FROM config_version")
@@ -88,10 +78,11 @@ def _event(source="mitra", session_type=None):
         "submissionId": sid, "sessionId": sid if source == "google_forms" else f"sess-{uuid.uuid4().hex}",
         "submissionType": "feedback", "tenantCode": "mitra", "eventType": "create",
         "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": YOUTH["program_id"], "programName": "1M Voice",
+        "tags": {"programId": YOUTH["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": YOUTH["leader_category_id"], "leaderCategoryName": "Youth",
                  "state": None, "district": None, "source": source},
-        "data": {"source": source, "sessionType": session_type, "questionnaireVersion": "V1", "language": "en",
+        "data": {"source": source, "adapter": "wide_form" if source == "google_forms" else "conversation_rows",
+                 "sessionType": session_type, "questionnaireVersion": "V1", "language": "en",
                  "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T08:00:00.000Z", **ref,
                  "messages": [
                      {"sequence": 1, "questionKey": "AGE_IDENTIFICATION", "isFollowUp": False, "message": "Age?",

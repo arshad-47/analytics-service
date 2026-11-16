@@ -3,10 +3,18 @@
 -- leader categories and programs those configs belong to. Run by app/database/db.py at every start,
 -- after schema.sql and the other seed files (it depends on none of them).
 --
+-- This file is DATA: the settings of the first program, 1 Million Voices, tenant 'mitra'. `feedback` is a generic
+-- report type: another program, tenant, source (a free [a-z0-9_] label), persona or CSV shape is added as more
+-- config rows (the 1MV blocks below are the pattern to copy); nothing here is a limit of the platform. Every
+-- feedback_upload config names its `adapter`: 'conversation_rows' (one row per message; its CSV headers are the
+-- explicit `column_map`, its status words the `completion_map`) or 'wide_form' (one row per respondent).
+--
 -- Today: the 1M Voice feedback settings of tenant 'mitra', for the four personas (Youth, Parent,
 -- General Public, Educator):
---   * feedback_upload      / mitra         how to read a Mitra raw conversation CSV (one per persona)
---   * feedback_upload      / google_forms  how to read a Google Forms wide CSV (Youth, Parent, General Public)
+--   * feedback_upload      / mitra         adapter conversation_rows: how to read a Mitra raw conversation CSV
+--                                          (one per persona)
+--   * feedback_upload      / google_forms  adapter wide_form: how to read a Google Forms wide CSV (Youth, Parent,
+--                                          General Public)
 --   * feedback_extraction  / any           the metadata fields and bands of the LLM extraction and the
 --                                          prompt it uses (prompt_name, a row of seed_prompts.sql)
 -- Other kinds of config are added to this file in the same pattern (one CONFIG block each).
@@ -97,32 +105,24 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT '864bd1a7-3f34-473e-8578-65c801908657'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "Youth_Voice",
-  "columns": {
-    "required": [
-      "session_type",
-      "session_status",
-      "session",
-      "submission_id",
-      "language",
-      "sequence",
-      "message",
-      "created_at",
-      "stage",
-      "sender_id"
-    ],
-    "optional": [
-      "bot_id",
-      "bot_name",
-      "translated_message",
-      "conversation_row_id",
-      "receiver_id",
-      "updated_at"
-    ],
-    "ignored": [
-      "audio_file",
-      "file_url",
-      "other_params"
-    ]
+  "adapter": "conversation_rows",
+  "column_map": {
+    "session_type": "session_type",
+    "session_status": "session_status",
+    "session": "session",
+    "submission_id": "submission_id",
+    "language": "language",
+    "sequence": "sequence",
+    "message": "message",
+    "created_at": "created_at",
+    "stage": "stage",
+    "sender_id": "sender_id",
+    "bot_id": "bot_id",
+    "bot_name": "bot_name",
+    "translated_message": "translated_message",
+    "conversation_row_id": "conversation_row_id",
+    "receiver_id": "receiver_id",
+    "updated_at": "updated_at"
   },
   "opening_row": {
     "mode": "auto"
@@ -133,7 +133,6 @@ SELECT '864bd1a7-3f34-473e-8578-65c801908657'::uuid, 1, TRUE, $cfg$
       "effective_from": null
     }
   ],
-  "ignore_extra_columns": true,
   "bot_sender_ids": [
     "1"
   ],
@@ -148,10 +147,10 @@ SELECT '864bd1a7-3f34-473e-8578-65c801908657'::uuid, 1, TRUE, $cfg$
     }
   },
   "sequence_offset": 1,
-  "completion_values": [
-    "COMPLETED",
-    "IN_PROGRESS"
-  ],
+  "completion_map": {
+    "COMPLETED": "COMPLETED",
+    "IN_PROGRESS": "IN_PROGRESS"
+  },
   "closing_keys": [
     "THANK_YOU",
     "THANKYOU",
@@ -163,8 +162,7 @@ SELECT '864bd1a7-3f34-473e-8578-65c801908657'::uuid, 1, TRUE, $cfg$
   "questions": [
     {
       "key": "AGE_IDENTIFICATION",
-      "text": "Can you please tell me your age?",
-      "kind": "metadata"
+      "text": "Can you please tell me your age?"
     }
   ],
   "max_csv_upload_bytes": 104857600,
@@ -237,7 +235,7 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT '957b809a-028a-4139-8455-881d24696eb7'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "Youth_Voice",
-  "layout": "wide",
+  "adapter": "wide_form",
   "timestamp_column": "Timestamp",
   "datetime": {
     "formats": [
@@ -245,7 +243,6 @@ SELECT '957b809a-028a-4139-8455-881d24696eb7'::uuid, 1, TRUE, $cfg$
     ],
     "fallback_timezone": "Asia/Kolkata"
   },
-  "id_strategy": "generate_uuid4",
   "default_completion": "COMPLETED",
   "ignored_columns": [
     "Email Address"
@@ -485,32 +482,24 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT 'aa3bf372-219a-405f-b13d-caef9becad68'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "Parent_Voice",
-  "columns": {
-    "required": [
-      "session_type",
-      "session_status",
-      "session",
-      "submission_id",
-      "language",
-      "sequence",
-      "message",
-      "created_at",
-      "stage",
-      "sender_id"
-    ],
-    "optional": [
-      "bot_id",
-      "bot_name",
-      "translated_message",
-      "conversation_row_id",
-      "receiver_id",
-      "updated_at"
-    ],
-    "ignored": [
-      "audio_file",
-      "file_url",
-      "other_params"
-    ]
+  "adapter": "conversation_rows",
+  "column_map": {
+    "session_type": "session_type",
+    "session_status": "session_status",
+    "session": "session",
+    "submission_id": "submission_id",
+    "language": "language",
+    "sequence": "sequence",
+    "message": "message",
+    "created_at": "created_at",
+    "stage": "stage",
+    "sender_id": "sender_id",
+    "bot_id": "bot_id",
+    "bot_name": "bot_name",
+    "translated_message": "translated_message",
+    "conversation_row_id": "conversation_row_id",
+    "receiver_id": "receiver_id",
+    "updated_at": "updated_at"
   },
   "opening_row": {
     "mode": "auto"
@@ -521,7 +510,6 @@ SELECT 'aa3bf372-219a-405f-b13d-caef9becad68'::uuid, 1, TRUE, $cfg$
       "effective_from": null
     }
   ],
-  "ignore_extra_columns": true,
   "bot_sender_ids": [
     "1"
   ],
@@ -536,10 +524,10 @@ SELECT 'aa3bf372-219a-405f-b13d-caef9becad68'::uuid, 1, TRUE, $cfg$
     }
   },
   "sequence_offset": 1,
-  "completion_values": [
-    "COMPLETED",
-    "IN_PROGRESS"
-  ],
+  "completion_map": {
+    "COMPLETED": "COMPLETED",
+    "IN_PROGRESS": "IN_PROGRESS"
+  },
   "closing_keys": [
     "THANK_YOU",
     "THANKYOU",
@@ -551,8 +539,7 @@ SELECT 'aa3bf372-219a-405f-b13d-caef9becad68'::uuid, 1, TRUE, $cfg$
   "questions": [
     {
       "key": "STATE_IDENTIFICATION",
-      "text": "Which state do you stay in?",
-      "kind": "metadata"
+      "text": "Which state do you stay in?"
     }
   ],
   "max_csv_upload_bytes": 104857600,
@@ -625,7 +612,7 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "Parent_Voice",
-  "layout": "wide",
+  "adapter": "wide_form",
   "timestamp_column": "Timestamp",
   "datetime": {
     "formats": [
@@ -633,7 +620,6 @@ SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
     ],
     "fallback_timezone": "Asia/Kolkata"
   },
-  "id_strategy": "generate_uuid4",
   "default_completion": "COMPLETED",
   "ignored_columns": [
     "Email Address"
@@ -848,32 +834,24 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT 'c19ca45c-7cc5-4fea-a157-c8f508b4c592'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "General_Public_Voice",
-  "columns": {
-    "required": [
-      "session_type",
-      "session_status",
-      "session",
-      "submission_id",
-      "language",
-      "sequence",
-      "message",
-      "created_at",
-      "stage",
-      "sender_id"
-    ],
-    "optional": [
-      "bot_id",
-      "bot_name",
-      "translated_message",
-      "conversation_row_id",
-      "receiver_id",
-      "updated_at"
-    ],
-    "ignored": [
-      "audio_file",
-      "file_url",
-      "other_params"
-    ]
+  "adapter": "conversation_rows",
+  "column_map": {
+    "session_type": "session_type",
+    "session_status": "session_status",
+    "session": "session",
+    "submission_id": "submission_id",
+    "language": "language",
+    "sequence": "sequence",
+    "message": "message",
+    "created_at": "created_at",
+    "stage": "stage",
+    "sender_id": "sender_id",
+    "bot_id": "bot_id",
+    "bot_name": "bot_name",
+    "translated_message": "translated_message",
+    "conversation_row_id": "conversation_row_id",
+    "receiver_id": "receiver_id",
+    "updated_at": "updated_at"
   },
   "opening_row": {
     "mode": "auto"
@@ -884,7 +862,6 @@ SELECT 'c19ca45c-7cc5-4fea-a157-c8f508b4c592'::uuid, 1, TRUE, $cfg$
       "effective_from": null
     }
   ],
-  "ignore_extra_columns": true,
   "bot_sender_ids": [
     "1"
   ],
@@ -899,10 +876,10 @@ SELECT 'c19ca45c-7cc5-4fea-a157-c8f508b4c592'::uuid, 1, TRUE, $cfg$
     }
   },
   "sequence_offset": 1,
-  "completion_values": [
-    "COMPLETED",
-    "IN_PROGRESS"
-  ],
+  "completion_map": {
+    "COMPLETED": "COMPLETED",
+    "IN_PROGRESS": "IN_PROGRESS"
+  },
   "closing_keys": [
     "THANK_YOU",
     "THANKYOU",
@@ -914,8 +891,7 @@ SELECT 'c19ca45c-7cc5-4fea-a157-c8f508b4c592'::uuid, 1, TRUE, $cfg$
   "questions": [
     {
       "key": "AGE_IDENTIFICATION",
-      "text": "Can you please tell me your age?",
-      "kind": "metadata"
+      "text": "Can you please tell me your age?"
     }
   ],
   "max_csv_upload_bytes": 104857600,
@@ -988,7 +964,7 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT '6543fdb5-8d6e-4929-ae6e-576d7237f38a'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "General_Public_Voice",
-  "layout": "wide",
+  "adapter": "wide_form",
   "timestamp_column": "Timestamp",
   "datetime": {
     "formats": [
@@ -996,7 +972,6 @@ SELECT '6543fdb5-8d6e-4929-ae6e-576d7237f38a'::uuid, 1, TRUE, $cfg$
     ],
     "fallback_timezone": "Asia/Kolkata"
   },
-  "id_strategy": "generate_uuid4",
   "default_completion": "COMPLETED",
   "ignored_columns": [
     "Email Address"
@@ -1179,32 +1154,24 @@ INSERT INTO config_version (config_id, version, is_active, config, created_by, c
 SELECT '4bc09524-71e3-4f0e-95b9-9d936e6e8697'::uuid, 1, TRUE, $cfg$
 {
   "session_type": "Educator_Voice",
-  "columns": {
-    "required": [
-      "session_type",
-      "session_status",
-      "session",
-      "submission_id",
-      "language",
-      "sequence",
-      "message",
-      "created_at",
-      "stage",
-      "sender_id"
-    ],
-    "optional": [
-      "bot_id",
-      "bot_name",
-      "translated_message",
-      "conversation_row_id",
-      "receiver_id",
-      "updated_at"
-    ],
-    "ignored": [
-      "audio_file",
-      "file_url",
-      "other_params"
-    ]
+  "adapter": "conversation_rows",
+  "column_map": {
+    "session_type": "session_type",
+    "session_status": "session_status",
+    "session": "session",
+    "submission_id": "submission_id",
+    "language": "language",
+    "sequence": "sequence",
+    "message": "message",
+    "created_at": "created_at",
+    "stage": "stage",
+    "sender_id": "sender_id",
+    "bot_id": "bot_id",
+    "bot_name": "bot_name",
+    "translated_message": "translated_message",
+    "conversation_row_id": "conversation_row_id",
+    "receiver_id": "receiver_id",
+    "updated_at": "updated_at"
   },
   "opening_row": {
     "mode": "auto"
@@ -1215,7 +1182,6 @@ SELECT '4bc09524-71e3-4f0e-95b9-9d936e6e8697'::uuid, 1, TRUE, $cfg$
       "effective_from": null
     }
   ],
-  "ignore_extra_columns": true,
   "bot_sender_ids": [
     "1"
   ],
@@ -1230,10 +1196,10 @@ SELECT '4bc09524-71e3-4f0e-95b9-9d936e6e8697'::uuid, 1, TRUE, $cfg$
     }
   },
   "sequence_offset": 1,
-  "completion_values": [
-    "COMPLETED",
-    "IN_PROGRESS"
-  ],
+  "completion_map": {
+    "COMPLETED": "COMPLETED",
+    "IN_PROGRESS": "IN_PROGRESS"
+  },
   "closing_keys": [
     "THANK_YOU",
     "THANKYOU",
@@ -1245,8 +1211,7 @@ SELECT '4bc09524-71e3-4f0e-95b9-9d936e6e8697'::uuid, 1, TRUE, $cfg$
   "questions": [
     {
       "key": "STATE_IDENTIFICATION",
-      "text": "Which state do you stay in?",
-      "kind": "metadata"
+      "text": "Which state do you stay in?"
     }
   ],
   "max_csv_upload_bytes": 104857600,
@@ -1518,15 +1483,92 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
   ],
   "pii": {
     "types": [
-      "name",
-      "phone",
-      "email",
-      "address",
-      "school_name",
-      "id_number",
-      "other"
+      {
+        "name": "name",
+        "description": "a personal name of the respondent or of anyone they mention (family, teacher, friend)"
+      },
+      {
+        "name": "phone",
+        "description": "a phone number"
+      },
+      {
+        "name": "email",
+        "description": "an email address or a social media handle"
+      },
+      {
+        "name": "address",
+        "description": "a home address, street, house number, or a village/locality small enough to identify a person"
+      },
+      {
+        "name": "school_name",
+        "description": "the name of a specific school, college, institution or workplace"
+      },
+      {
+        "name": "id_number",
+        "description": "an identity or document number (Aadhaar, PAN, roll number, admission number)"
+      },
+      {
+        "name": "other",
+        "description": "any other detail that could identify a person"
+      }
+    ],
+    "min_digit_run": 8,
+    "min_digit_run_short_groups": 10,
+    "url_tlds": [
+      "com",
+      "in",
+      "org",
+      "net",
+      "co",
+      "io",
+      "me",
+      "edu",
+      "gov",
+      "app",
+      "link",
+      "ly",
+      "tv",
+      "info"
     ]
   },
+  "limits": {
+    "max_respondent_message_chars": 20000,
+    "max_bot_message_chars": 4000,
+    "max_conversation_chars": 200000,
+    "max_value_chars": 120,
+    "max_raw_chars": 500
+  },
+  "placeholders": [
+    "n/a",
+    "na",
+    "n.a",
+    "nil",
+    "null",
+    "none",
+    "nan",
+    "undefined",
+    "unknown",
+    "not known",
+    "not provided",
+    "not specified",
+    "not applicable",
+    "not available",
+    "not mentioned",
+    "not given",
+    "not answered",
+    "no answer",
+    "no district",
+    "nothing",
+    "not sure",
+    "dont know",
+    "don't know",
+    "do not know",
+    "skip",
+    "skipped",
+    "नहीं पता",
+    "पता नहीं",
+    "लागू नहीं"
+  ],
   "llm": {}
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
@@ -1755,15 +1797,92 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
   ],
   "pii": {
     "types": [
-      "name",
-      "phone",
-      "email",
-      "address",
-      "school_name",
-      "id_number",
-      "other"
+      {
+        "name": "name",
+        "description": "a personal name of the respondent or of anyone they mention (family, teacher, friend)"
+      },
+      {
+        "name": "phone",
+        "description": "a phone number"
+      },
+      {
+        "name": "email",
+        "description": "an email address or a social media handle"
+      },
+      {
+        "name": "address",
+        "description": "a home address, street, house number, or a village/locality small enough to identify a person"
+      },
+      {
+        "name": "school_name",
+        "description": "the name of a specific school, college, institution or workplace"
+      },
+      {
+        "name": "id_number",
+        "description": "an identity or document number (Aadhaar, PAN, roll number, admission number)"
+      },
+      {
+        "name": "other",
+        "description": "any other detail that could identify a person"
+      }
+    ],
+    "min_digit_run": 8,
+    "min_digit_run_short_groups": 10,
+    "url_tlds": [
+      "com",
+      "in",
+      "org",
+      "net",
+      "co",
+      "io",
+      "me",
+      "edu",
+      "gov",
+      "app",
+      "link",
+      "ly",
+      "tv",
+      "info"
     ]
   },
+  "limits": {
+    "max_respondent_message_chars": 20000,
+    "max_bot_message_chars": 4000,
+    "max_conversation_chars": 200000,
+    "max_value_chars": 120,
+    "max_raw_chars": 500
+  },
+  "placeholders": [
+    "n/a",
+    "na",
+    "n.a",
+    "nil",
+    "null",
+    "none",
+    "nan",
+    "undefined",
+    "unknown",
+    "not known",
+    "not provided",
+    "not specified",
+    "not applicable",
+    "not available",
+    "not mentioned",
+    "not given",
+    "not answered",
+    "no answer",
+    "no district",
+    "nothing",
+    "not sure",
+    "dont know",
+    "don't know",
+    "do not know",
+    "skip",
+    "skipped",
+    "नहीं पता",
+    "पता नहीं",
+    "लागू नहीं"
+  ],
   "llm": {}
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
@@ -1906,15 +2025,92 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
   ],
   "pii": {
     "types": [
-      "name",
-      "phone",
-      "email",
-      "address",
-      "school_name",
-      "id_number",
-      "other"
+      {
+        "name": "name",
+        "description": "a personal name of the respondent or of anyone they mention (family, teacher, friend)"
+      },
+      {
+        "name": "phone",
+        "description": "a phone number"
+      },
+      {
+        "name": "email",
+        "description": "an email address or a social media handle"
+      },
+      {
+        "name": "address",
+        "description": "a home address, street, house number, or a village/locality small enough to identify a person"
+      },
+      {
+        "name": "school_name",
+        "description": "the name of a specific school, college, institution or workplace"
+      },
+      {
+        "name": "id_number",
+        "description": "an identity or document number (Aadhaar, PAN, roll number, admission number)"
+      },
+      {
+        "name": "other",
+        "description": "any other detail that could identify a person"
+      }
+    ],
+    "min_digit_run": 8,
+    "min_digit_run_short_groups": 10,
+    "url_tlds": [
+      "com",
+      "in",
+      "org",
+      "net",
+      "co",
+      "io",
+      "me",
+      "edu",
+      "gov",
+      "app",
+      "link",
+      "ly",
+      "tv",
+      "info"
     ]
   },
+  "limits": {
+    "max_respondent_message_chars": 20000,
+    "max_bot_message_chars": 4000,
+    "max_conversation_chars": 200000,
+    "max_value_chars": 120,
+    "max_raw_chars": 500
+  },
+  "placeholders": [
+    "n/a",
+    "na",
+    "n.a",
+    "nil",
+    "null",
+    "none",
+    "nan",
+    "undefined",
+    "unknown",
+    "not known",
+    "not provided",
+    "not specified",
+    "not applicable",
+    "not available",
+    "not mentioned",
+    "not given",
+    "not answered",
+    "no answer",
+    "no district",
+    "nothing",
+    "not sure",
+    "dont know",
+    "don't know",
+    "do not know",
+    "skip",
+    "skipped",
+    "नहीं पता",
+    "पता नहीं",
+    "लागू नहीं"
+  ],
   "llm": {}
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
@@ -2063,15 +2259,92 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
   ],
   "pii": {
     "types": [
-      "name",
-      "phone",
-      "email",
-      "address",
-      "school_name",
-      "id_number",
-      "other"
+      {
+        "name": "name",
+        "description": "a personal name of the respondent or of anyone they mention (family, teacher, friend)"
+      },
+      {
+        "name": "phone",
+        "description": "a phone number"
+      },
+      {
+        "name": "email",
+        "description": "an email address or a social media handle"
+      },
+      {
+        "name": "address",
+        "description": "a home address, street, house number, or a village/locality small enough to identify a person"
+      },
+      {
+        "name": "school_name",
+        "description": "the name of a specific school, college, institution or workplace"
+      },
+      {
+        "name": "id_number",
+        "description": "an identity or document number (Aadhaar, PAN, roll number, admission number)"
+      },
+      {
+        "name": "other",
+        "description": "any other detail that could identify a person"
+      }
+    ],
+    "min_digit_run": 8,
+    "min_digit_run_short_groups": 10,
+    "url_tlds": [
+      "com",
+      "in",
+      "org",
+      "net",
+      "co",
+      "io",
+      "me",
+      "edu",
+      "gov",
+      "app",
+      "link",
+      "ly",
+      "tv",
+      "info"
     ]
   },
+  "limits": {
+    "max_respondent_message_chars": 20000,
+    "max_bot_message_chars": 4000,
+    "max_conversation_chars": 200000,
+    "max_value_chars": 120,
+    "max_raw_chars": 500
+  },
+  "placeholders": [
+    "n/a",
+    "na",
+    "n.a",
+    "nil",
+    "null",
+    "none",
+    "nan",
+    "undefined",
+    "unknown",
+    "not known",
+    "not provided",
+    "not specified",
+    "not applicable",
+    "not available",
+    "not mentioned",
+    "not given",
+    "not answered",
+    "no answer",
+    "no district",
+    "nothing",
+    "not sure",
+    "dont know",
+    "don't know",
+    "do not know",
+    "skip",
+    "skipped",
+    "नहीं पता",
+    "पता नहीं",
+    "लागू नहीं"
+  ],
   "llm": {}
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'

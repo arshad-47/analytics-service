@@ -17,11 +17,11 @@ from app.api.services.feedback_gforms import (
     parse_gforms_csv,
     prepare_gforms_responses,
 )
-from seed_support import PERSONAS
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS
 
 FIXTURES = Path(__file__).resolve().parent / "csv_uploads"
 YOUTH = PERSONAS["Youth"]
-PROGRAM = {"id": YOUTH["program_id"], "name": "1M Voice"}
+PROGRAM = {"id": YOUTH["program_id"], "name": FEEDBACK_PROGRAM_NAME}
 LEADER = {"id": YOUTH["leader_category_id"], "name": "Youth"}
 PUBLISHED = "2026-10-20T00:00:00.000Z"
 
@@ -49,10 +49,9 @@ FUTURE = q("FUTURE", "When you think about your future, what do you want your li
 def make_config():
     return {
         "session_type": "Youth_Voice",
-        "layout": "wide",
+        "adapter": "wide_form",
         "timestamp_column": "Timestamp",
         "datetime": {"formats": ["%m/%d/%Y %H:%M:%S"], "fallback_timezone": "Asia/Kolkata"},
-        "id_strategy": "generate_uuid4",
         "default_completion": "COMPLETED",
         "ignored_columns": ["Email Address"],
         "ignored_column_patterns": ["^Column \\d+$"],
@@ -95,7 +94,7 @@ def prepare(df, cfg):
 
 def build(responses, cfg=None, **overrides):
     kwargs = dict(known_refs=set(), program_info=PROGRAM, leader_info=LEADER, tenant_code="mitra",
-                  published_at=PUBLISHED, config=cfg)
+                  source="google_forms", published_at=PUBLISHED, config=cfg)
     kwargs.update(overrides)
     return build_gforms_events(responses, **kwargs)
 
@@ -248,8 +247,8 @@ class TestMatchForm:
 
     def test_form_that_maps_every_column_wins(self):
         cfg = make_config()
-        cfg["forms"] = {"small": {"name": "small", "questions": [AGE, GENDER]},
-                        "big": {"name": "big", "questions": [AGE, GENDER, STATE]}}
+        cfg["forms"] = {"small": {"name": "small", "questionnaire_version": "V1", "questions": [AGE, GENDER]},
+                        "big": {"name": "big", "questionnaire_version": "V1", "questions": [AGE, GENDER, STATE]}}
         df = frame([["10/2/2026 10:09:20", "22", "F", "Goa"]], ["Timestamp", "How old are you?",
                                                                  "What is your gender?", "Which state do you stay in?"])
         # 'small' leaves the state column unmapped, only 'big' maps every column
@@ -257,15 +256,15 @@ class TestMatchForm:
 
     def test_tighter_fit_wins_when_matched_counts_are_equal(self):
         cfg = make_config()
-        cfg["forms"] = {"small": {"name": "small", "questions": [AGE, GENDER]},
-                        "big": {"name": "big", "questions": [AGE, GENDER, STATE]}}
+        cfg["forms"] = {"small": {"name": "small", "questionnaire_version": "V1", "questions": [AGE, GENDER]},
+                        "big": {"name": "big", "questionnaire_version": "V1", "questions": [AGE, GENDER, STATE]}}
         df = frame([["10/2/2026 10:09:20", "22", "F"]], ["Timestamp", "How old are you?", "What is your gender?"])
         assert match_gforms_form(df, cfg) == ("small", [])
 
     def test_exact_tie_is_ambiguous(self):
         cfg = make_config()
-        cfg["forms"] = {"a": {"name": "a", "questions": [AGE, GENDER]},
-                        "b": {"name": "b", "questions": [AGE, GENDER]}}
+        cfg["forms"] = {"a": {"name": "a", "questionnaire_version": "V1", "questions": [AGE, GENDER]},
+                        "b": {"name": "b", "questionnaire_version": "V1", "questions": [AGE, GENDER]}}
         df = frame([["10/2/2026 10:09:20", "22", "F"]], ["Timestamp", "How old are you?", "What is your gender?"])
         form_key, errors = match_gforms_form(df, cfg)
         assert form_key is None
@@ -274,6 +273,9 @@ class TestMatchForm:
     def test_invalid_config_raises(self):
         df = frame([["10/2/2026 10:09:20", "22"]], ["Timestamp", "How old are you?"])
         with pytest.raises(ValueError, match="forms"):
+            match_gforms_form(df, {"adapter": "wide_form", "timestamp_column": "Timestamp",
+                                   "datetime": {"formats": ["%m/%d/%Y"]}})
+        with pytest.raises(ValueError, match="adapter"):  # a config without an adapter is never guessed
             match_gforms_form(df, {"timestamp_column": "Timestamp", "datetime": {"formats": ["%m/%d/%Y"]}})
 
 
@@ -319,7 +321,8 @@ class TestPrepare:
         df = general_frame([("26/9/2026 9:58:05", "22", "F", "Goa", "a", "b")])
         responses, skipped, _ = prepare(df, config)
         assert responses == []
-        assert skipped[0]["problems"][0].startswith("Timestamp '26/9/2026 9:58:05' does not match")
+        assert skipped[0]["problems"][0].startswith("Timestamp does not match any of the accepted formats")
+        assert "26/9/2026" not in skipped[0]["problems"][0]  # the cell value is never echoed
 
     def test_answers_follow_form_order_and_skip_blanks(self, config):
         # columns in a different order than the form; the worry cell is blank
@@ -499,7 +502,7 @@ class TestEvents:
         assert event["eventType"] == "create"
         assert event["eventPublishedAt"] == PUBLISHED
         assert event["tags"] == {
-            "programId": PROGRAM["id"], "programName": "1M Voice",
+            "programId": PROGRAM["id"], "programName": FEEDBACK_PROGRAM_NAME,
             "leaderCategoryId": LEADER["id"], "leaderCategoryName": "Youth",
             "state": None, "district": None, "source": "google_forms",
         }
@@ -590,10 +593,13 @@ class TestEvents:
         stamp = events[0]["eventPublishedAt"]
         assert stamp.endswith("Z") and len(stamp) == len("2026-10-20T00:00:00.000Z")
 
-    def test_default_completion_comes_from_config(self, config):
-        config["default_completion"] = "IN_PROGRESS"
+    def test_default_completion_must_be_completed_for_a_form_response(self, config):
+        config["default_completion"] = "COMPLETED"
         events, _ = build(self.responses(config), config)
-        assert events[0]["data"]["completionStatus"] == "IN_PROGRESS"
+        assert events[0]["data"]["completionStatus"] == "COMPLETED"
+        config["default_completion"] = "IN_PROGRESS"   # a response is immutable: the config is refused, loudly
+        with pytest.raises(ValueError, match="default_completion"):
+            build(self.responses(config), config)
 
     def test_without_config_the_defaults_apply(self, config):
         events, _ = build(self.responses(config), None)

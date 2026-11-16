@@ -4,10 +4,20 @@ web, consumer and worker startup all log it).
 
 A database that predates the per-bot settings (max_csv_upload_bytes, ingestion_schema, process_steps) keeps the
 config version it was seeded with, and looks healthy until the first event arrives and is dead-lettered. This check
-makes that visible at startup: one ERROR per ACTIVE feedback_upload config that lacks / has an invalid required
-setting (same validators as `python tools/feedback_config.py show`), and one WARNING when one of the removed
-environment variables is still set (they are ignored now). Only names, session types and sources are logged, never
-values or config content. The check never raises: a failure to run it is a warning, not a startup failure.
+makes that visible at startup:
+
+  * one ERROR per ACTIVE feedback_upload config that has an invalid required setting or one whose adapter / column_map /
+    completion_map content is invalid (same validators as `python tools/feedback_config.py show`); a config with no
+    session_type yet is a legacy row and is covered by the next item instead of by its own line;
+  * ONE ERROR for the legacy data of a database created before session_type / questionnaire versions / adapters
+    existed (configs with a NULL session_type, configs and stored sessions that lack the new keys / labels), with the
+    exact dry-run command per tenant (`migrate-legacy`, app/database/feedback_legacy_upgrade.py);
+  * one WARNING when the unique index of `config` could not be created because two config rows collide (the old
+    design kept one row per bot); startup carried on without it;
+  * one WARNING when one of the removed environment variables is still set (they are ignored now).
+
+Only names, session types, sources and ids are logged, never values or config content. The check never raises: a
+failure to run it is a warning, not a startup failure.
 """
 import json
 import logging
@@ -17,6 +27,14 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from dotenv import dotenv_values
 
+from app.database.feedback_legacy_upgrade import (
+    CONFIG_UNIQUE_INDEX,
+    LEGACY_MIGRATE_COMMAND,
+    adapter_config_problem,
+    find_legacy_state,
+    legacy_commands,
+    legacy_state_is_clean,
+)
 from app.services.feedback_config_validation import config_setting_problems
 from app.services.feedback_constants import CONFIG_TYPE_FEEDBACK_UPLOAD
 
@@ -75,6 +93,10 @@ async def check_feedback_configs(conn) -> List[Dict[str, Any]]:
             config = json.loads(config)
         if isinstance(config, dict):
             problems = config_setting_problems(config)
+            if "adapter" not in problems:  # a missing / unknown adapter is already listed above
+                reason = adapter_config_problem(config)
+                if reason is not None:
+                    problems["adapter_config"] = reason
         else:
             problems = {"config": f"must be a JSON object, got {type(config).__name__}"}
         if len(problems) == 0:
@@ -84,20 +106,63 @@ async def check_feedback_configs(conn) -> List[Dict[str, Any]]:
             "tenant_code": row["tenant_code"], "problems": problems,
         }
         invalid.append(entry)
+        if row["session_type"] is None:
+            continue  # a legacy row: reported by check_legacy_feedback_data with the command that fixes it
         logger.error(
             "Feedback upload config of session_type %r (%s, tenant %r) is invalid: %s. Feedback events for this "
             "persona will be dead-lettered and its uploads rejected until it is fixed: run "
-            "`python tools/feedback_config.py migrate` (adds missing keys) or `show` (details).",
+            "`python tools/feedback_config.py migrate` (adds missing keys; or migrate-legacy for a database created before session_type existed) or `show` (details).",
             entry["session_type"], entry["source"], entry["tenant_code"],
             "; ".join(f"{key}: {why}" for key, why in problems.items()),
         )
     return invalid
 
 
+async def check_legacy_feedback_data(conn) -> Dict[str, Any]:
+    """
+    Logs ONE ERROR when the database still holds legacy feedback data (configs without session_type or with missing
+    required keys, stored sessions without session_type / questionnaire_version), naming the exact dry-run command
+    per tenant, and ONE WARNING when the unique index of `config` is missing because configs collide. Returns the
+    state of find_legacy_state. Counts, ids and key names only.
+    """
+    state = await find_legacy_state(conn)
+    if not legacy_state_is_clean(state):
+        null_configs = sum(len(v) for v in state["null_session_type_programs"].values())
+        logger.error(
+            "Legacy feedback data: %d program(s) have an upload config without session_type, %d config(s) lack "
+            "required keys (%s), %d stored session(s) have no session_type and %d no questionnaire_version. "
+            "Uploads for these personas are rejected and their pending sessions fail until the database is "
+            "upgraded. Run once per tenant, check the counts, then run again without --dry-run: %s "
+            "(replace <SESSION_TYPE> with the persona key of each program; README \"Upgrading an existing database\")",
+            null_configs, len(state["configs_missing_keys"]),
+            ", ".join(sorted({k for m in state["configs_missing_keys"] for k in m["keys"]})) or "none",
+            sum(state["sessions_without_session_type"].values()),
+            sum(state["sessions_without_questionnaire_version"].values()),
+            " | ".join(legacy_commands(state)),
+        )
+    if state["index_missing"]:
+        logger.warning(
+            "Table config has no unique index %s: %d group(s) of config rows share the same tenant, source, type, "
+            "program and session_type (or session_type is still NULL), so it could not be created and startup "
+            "carried on without it. Keep one config row per group and retire the others with `%s --tenant-code "
+            "<tenant> --retire-config <config id> --dry-run` (the index is created by the same command once "
+            "the data allows it).",
+            CONFIG_UNIQUE_INDEX, state["duplicate_groups"], LEGACY_MIGRATE_COMMAND,
+        )
+    return state
+
+
 async def run_startup_checks(conn) -> None:
-    """The whole startup check; never raises."""
+    """The whole startup check; never raises (each part on its own: one failing part does not hide the others)."""
     try:
         warn_removed_env_vars()
-        await check_feedback_configs(conn)
     except Exception as exc:  # a health check must not stop the service from starting
         logger.warning("Feedback config startup check could not run: %s", exc)
+    try:
+        await check_feedback_configs(conn)
+    except Exception as exc:
+        logger.warning("Feedback config startup check could not run: %s", exc)
+    try:
+        await check_legacy_feedback_data(conn)
+    except Exception as exc:
+        logger.warning("Legacy feedback data check could not run: %s", exc)

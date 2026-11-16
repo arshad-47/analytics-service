@@ -1,5 +1,7 @@
 """
-Pure parsing, form matching and event building for Google Forms `feedback` uploads.
+Pure parsing, form matching and event building for the `wide_form` adapter of `feedback` uploads (a form export:
+one row per respondent, one column per question; Google Forms is the first). The config's `adapter` selects this
+module, never the source name: any source whose config says `wide_form` is read this way.
 
 The ORIGINAL wide Google Forms CSV (one row per respondent, one column per question) is uploaded as is.
 This module reshapes each response into question/answer rows, gives it a natural key (`source_ref`),
@@ -16,8 +18,8 @@ Flow used by the upload service:
     # look up source_ref of `responses` in feedback_submissions -> known_refs
     events, delta = build_gforms_events(responses, known_refs=known_refs, ..., config=config)
 
-Config shape (`config_version.config` of a Google Forms config; the `feedback_upload google_forms` blocks of seed_config.sql):
-    {"layout": "wide", "timestamp_column": "Timestamp",
+Config shape (`config_version.config` of a wide_form config; the `feedback_upload google_forms` blocks of seed_config.sql):
+    {"adapter": "wide_form", "timestamp_column": "Timestamp",
      "datetime": {"formats": ["%m/%d/%Y %H:%M:%S"], "fallback_timezone": "Asia/Kolkata"},
      "default_completion": "COMPLETED",
      "ignored_columns": ["Email Address"], "ignored_column_patterns": ["^Column \\d+$"],
@@ -30,6 +32,7 @@ import hashlib
 import io
 import json
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -38,11 +41,17 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.api.services.feedback_uploads import _location_tags
+from app.services.feedback_adapter_config import (
+    config_adapter,
+    validate_adapter_config,
+    validate_default_completion,
+    wide_form_identity_problem,
+)
 from app.services.feedback_constants import (
+    ADAPTER_WIDE_FORM,
     COMPLETION_COMPLETED,
     FEEDBACK_REPORT_TYPE,
     GFORMS_SEQUENCE_OFFSET,
-    SOURCE_GOOGLE_FORMS,
 )
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -80,19 +89,36 @@ def parse_gforms_csv(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+def _is_foreign_script_letter(ch: str) -> bool:
+    """A letter or combining mark of a script other than Latin (Kannada, Devanagari, ...). Latin letters with
+    diacritics (é), punctuation (the typographic apostrophe, an en dash) and digits are not."""
+    if unicodedata.category(ch)[0] not in ("L", "M"):
+        return False
+    if ord(ch) < 128:
+        return False
+    if unicodedata.category(ch)[0] == "M":
+        return True  # a combining mark (also the vowel signs of Indic scripts); a mark on a Latin letter is rare in a header
+    return not unicodedata.name(ch, "").startswith("LATIN")
+
+
 def normalise_header(header: str) -> str:
     """
-    Reduce an exported column header to its English text.
+    Reduce an exported column header to its English (Latin-script) text.
 
-    Collapse all whitespace (newlines, tabs, NBSP) to single spaces and strip; cut at the first
-    non-ASCII character (the Kannada part of a bilingual header); strip trailing spaces and any
-    trailing '/', '"', and the typographic quotes; collapse whitespace again.
+    Collapse all whitespace (newlines, tabs, NBSP) to single spaces and strip; cut at the first letter of another script
+    (the Kannada part of a bilingual header). Punctuation and Latin letters outside ASCII are kept, so
+    "Child\u2019s name" and "Child\u2019s class" stay different questions. A header that STARTS with another script
+    ("<Hindi> / Child class") keeps the Latin text that follows the last foreign letter. Then strip trailing spaces
+    and any trailing '/', '"' and the typographic quotes, and collapse whitespace again.
     """
     text = _WHITESPACE_RE.sub(" ", header).strip()
-    for pos, ch in enumerate(text):
-        if ord(ch) > 127:
-            text = text[:pos]
-            break
+    cut = next((pos for pos, ch in enumerate(text) if _is_foreign_script_letter(ch)), None)
+    if cut is not None:
+        if len(text[:cut].strip(_TRAILING_JUNK)) > 0:
+            text = text[:cut]
+        else:
+            last = max(pos for pos, ch in enumerate(text) if _is_foreign_script_letter(ch))
+            text = text[last + 1:].lstrip(_TRAILING_JUNK)
     text = text.rstrip(_TRAILING_JUNK)
     return _WHITESPACE_RE.sub(" ", text).strip()
 
@@ -106,9 +132,19 @@ def _normalise_answer(text: str) -> str:
 # ---------------------------------------------------------------------------------------------
 
 def _check_config(config: Dict[str, Any]) -> None:
+    if config_adapter(config) != ADAPTER_WIDE_FORM:
+        raise ValueError(
+            f"Feedback config adapter must be {ADAPTER_WIDE_FORM!r} for this builder, got {config['adapter']!r}"
+        )
+    validate_adapter_config(config)
     for key in ("timestamp_column", "datetime", "forms"):
         if key not in config:
             raise ValueError(f"Google Forms config is missing '{key}'")
+    # ingestion stores a response only with a sessionType and a questionnaireVersion: refuse the config now
+    # (at upload) instead of accepting the file and failing every response later
+    identity_problem = wide_form_identity_problem(config)
+    if identity_problem is not None:
+        raise ValueError(identity_problem)
     formats = config["datetime"].get("formats")
     if not isinstance(formats, list) or len(formats) == 0:
         raise ValueError("Google Forms config datetime.formats must be a non-empty list")
@@ -275,6 +311,10 @@ def _parse_timestamp(value: str, formats: List[str], fallback_tz) -> Optional[da
             continue
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=fallback_tz)
+        try:
+            parsed.astimezone(timezone.utc)
+        except (OverflowError, ValueError):
+            return None  # year 0001 / 9999 at an offset: not representable in UTC
         return parsed
     return None
 
@@ -342,8 +382,7 @@ def prepare_gforms_responses(
             problems.append(f"{config['timestamp_column']} is blank")
         elif parsed is None:
             problems.append(
-                f"{config['timestamp_column']} {raw_ts.strip()!r} does not match any of the accepted formats: "
-                + ", ".join(formats)
+                f"{config['timestamp_column']} does not match any of the accepted formats: " + ", ".join(formats)
             )
 
         answers: List[Dict[str, str]] = []
@@ -399,6 +438,7 @@ def build_gforms_events(
     program_info: Dict[str, Any],
     leader_info: Dict[str, Any],
     tenant_code: str,
+    source: str,
     published_at: Optional[str] = None,
     id_factory: Optional[Callable[[], str]] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -406,7 +446,8 @@ def build_gforms_events(
     """
     One Kafka event per response whose source_ref is NOT in `known_refs` (the delta).
 
-    program_info / leader_info are {"id", "name"}. Returns (events, {"new", "already_stored"}).
+    program_info / leader_info are {"id", "name"}; `source` is the upload's source label (the events carry it and
+    data.adapter = wide_form). Returns (events, {"new", "already_stored"}).
     submissionId = sessionId = id_factory() (a uuid4 string by default), drawn only for new responses.
     Messages are numbered 1..n: per answer a question row (odd; parentSequence null) then its answer
     row (even; parentSequence = the question's sequence); messageAt = the response's submission_date.
@@ -421,7 +462,9 @@ def build_gforms_events(
     cfg: Dict[str, Any] = config if config is not None else {}
     factory = id_factory if id_factory is not None else (lambda: str(uuid.uuid4()))
     published = published_at if published_at is not None else _format_utc(datetime.now(timezone.utc))
-    completion = cfg.get("default_completion", COMPLETION_COMPLETED)
+    # a form response is final: only COMPLETED is valid (validated; an IN_PROGRESS config fails loudly here)
+    completion = (validate_default_completion(cfg["default_completion"]) if "default_completion" in cfg
+                  else COMPLETION_COMPLETED)
     default_language = _default_language(cfg)
     session_type = cfg.get("session_type")
     forms = cfg.get("forms", {})
@@ -478,10 +521,11 @@ def build_gforms_events(
                 "leaderCategoryName": leader_info["name"],
                 "state": state,
                 "district": district,
-                "source": SOURCE_GOOGLE_FORMS,
+                "source": source,
             },
             "data": {
-                "source": SOURCE_GOOGLE_FORMS,
+                "source": source,
+                "adapter": ADAPTER_WIDE_FORM,
                 "sessionType": session_type,
                 "questionnaireVersion": questionnaire_version,
                 "language": language,

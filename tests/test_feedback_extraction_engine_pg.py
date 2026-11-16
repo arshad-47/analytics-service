@@ -5,30 +5,31 @@ config without the key uses the generic prompt, and the prompt_version actually 
 in meta_data.extraction and in llm_logs; integer fields are stored as canonical decimal strings; the CLI prints
 aggregates only and `show-config` lists prompt name and field flags.
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is the DSN of an EMPTY scratch database used by this file alone.
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards).
 The tests build their own prompts and configs (they do not depend on the seeded field lists) and use a FAKE LLM: no
 network. SYNTHETIC data only.
 """
 import asyncio
 import json
-import os
 import uuid
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pg_support
 
 import app.services.llm as llm_module
 from app.config import settings
-from app.database.db import SCHEMA_FILE, SEED_PROMPTS_FILE, db
+from app.database.db import SEED_PROMPTS_FILE, db
 from app.database.feedback_extraction_operations import extract_submission
+from app.services.feedback_extraction import ExtractionConfigError
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS, extraction_config_id, seed_config
-from app.services.feedback_extraction_constants import PROMPT_NAME
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, extraction_config_id, seed_config
+PROMPT_NAME = "Feedback Metadata Extraction"   # the program-neutral template prompt of seed_prompts.sql (not a code default any more)
 
 import importlib.util
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -45,19 +46,10 @@ SYSTEM = "CUSTOM-PROMPT for {{persona}} ({{field_names}})\n{{fields}}\nPII types
 USER = "BEGIN {{conversation_id}}\n{{conversation}}\nEND {{conversation_id}}"
 
 
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-
-
 def _config(**top):
     raw = {
-        "schema_version": 1, "persona": "Youth", "session_type": "Youth_Voice", "pii": {"types": ["name", "phone", "other"]},
+        "schema_version": 1, "persona": "Youth", "session_type": "Youth_Voice", "prompt_name": CUSTOM_PROMPT,
+        "pii": {"types": ["name", "phone", "other"]},
         "fields": [
             {"name": "age", "kind": "integer", "description": "Age in years.", "min": 5, "max": 100},
             {"name": "gender", "kind": "category", "description": "Gender.", "categories": ["Male", "Female"]},
@@ -99,7 +91,7 @@ def _run(body):
         conn = await asyncpg.connect(DSN)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
             await conn.execute("DELETE FROM config_version")
@@ -131,9 +123,9 @@ async def _add_session(conn, answer="17 and a girl"):
     event = {
         "submissionId": sid, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback", "tenantCode": "mitra",
         "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": YOUTH["program_id"], "programName": "1M Voice", "leaderCategoryId": YOUTH["leader_category_id"],
+        "tags": {"programId": YOUTH["program_id"], "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": YOUTH["leader_category_id"],
                  "leaderCategoryName": "Youth", "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": YOUTH["session_type"], "questionnaireVersion": "V2", "language": "en",
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": YOUTH["session_type"], "questionnaireVersion": "V2", "language": "en",
                  "completionStatus": "COMPLETED", "botId": YOUTH["bot_id"], "submissionDate": "2026-11-10T00:00:00+00:00",
                  "messages": messages},
     }
@@ -223,17 +215,17 @@ def test_a_name_that_does_not_resolve_fails_loudly_with_no_llm_call_and_no_rows(
     _run(body)
 
 
-def test_a_config_without_prompt_name_uses_the_generic_prompt():
+def test_a_config_without_prompt_name_fails_loudly_and_the_generic_prompt_is_not_used():
     async def body(conn, pool):
-        generic = await conn.fetchrow(
-            "SELECT pv.id FROM prompt_version pv JOIN prompts p ON p.id = pv.prompt_id WHERE p.name = $1 AND pv.is_active "
-            "ORDER BY pv.version DESC LIMIT 1", PROMPT_NAME)
-        await _set_config(conn, _config())
+        raw = _config()
+        del raw["prompt_name"]
+        await _set_config(conn, raw)
         sid = await _add_session(conn)
         fake = FakeLlm(_answer())
-        outcome = await extract_submission(pool, sid, "mitra", llm_function=fake)
-        assert outcome.prompt_version_id == generic["id"] and not fake.prompts[0].startswith("CUSTOM-PROMPT")
-        assert {r["prompt_version_id"] for r in (await _rows(conn, sid)).values()} == {generic["id"]}
+        with pytest.raises(ExtractionConfigError, match="needs prompt_name"):
+            await extract_submission(pool, sid, "mitra", llm_function=fake)
+        assert fake.prompts == [] and await _rows(conn, sid) == {}
+        assert await conn.fetchval("SELECT count(*) FROM llm_logs") == 0
     _run(body)
 
 
@@ -256,6 +248,8 @@ def test_integer_values_are_stored_canonical_and_out_of_range_or_text_is_unmappe
 
 def _cli(capsys, monkeypatch, argv):
     monkeypatch.setattr(settings, "DATABASE_URL", DSN)
+    if argv[:1] == ["run"] and "--tenant-code" not in argv:   # the tenant is required: there is no default tenant
+        argv = argv + ["--tenant-code", "mitra"]
     code = cli.main(argv)
     captured = capsys.readouterr()
     return code, captured.out, captured.err
@@ -289,6 +283,37 @@ def test_cli_run_with_a_named_prompt_prints_aggregates_only(capsys, monkeypatch)
     assert MARKER not in out and "Zzdistrict" not in out and "How old" not in out
 
 
+def test_cli_program_id_selects_only_the_sessions_and_configs_of_that_program(capsys, monkeypatch):
+    calls = []
+
+    def fake(prompt, model=None, max_tokens=None, timeout=None):
+        calls.append(1)
+        return _answer(), {"prompt_tokens": 1, "completion_tokens": 1}
+    monkeypatch.setattr(llm_module, "openrouter_chat_completion", fake)
+
+    async def body(conn, pool):
+        await _add_prompt(conn, CUSTOM_PROMPT, [(1, True, "v1")])
+        await _set_config(conn, _config(prompt_name=CUSTOM_PROMPT))
+        await _add_session(conn)
+        await _add_session(conn)
+        moved = await _add_session(conn)
+        parent_program = PERSONAS["Parent"]["program_id"]
+        await conn.execute("UPDATE submissions SET program_id = $2::uuid WHERE submission_id = $1", moved, parent_program)
+        youth = await _cli_in_thread(capsys, monkeypatch, ["run", "--dry-run", "--session-type", "Youth_Voice",
+                                                           "--program-id", YOUTH["program_id"]])
+        other = await _cli_in_thread(capsys, monkeypatch, ["run", "--dry-run", "--session-type", "Youth_Voice",
+                                                           "--program-id", parent_program])
+        shown = await _cli_in_thread(capsys, monkeypatch, ["show-config", "--session-type", "Youth_Voice",
+                                                           "--program-id", parent_program])
+        return youth, other, shown
+
+    youth, other, shown = _run(body)
+    assert json.loads(youth[1])["submissions"]["selected"] == 2
+    assert json.loads(other[1])["submissions"]["selected"] == 1 and json.loads(other[1])["submissions"]["failed"] == 1   # no config of its own
+    assert json.loads(shown[1]) == []                                      # the Youth config belongs to the Youth program
+    assert len(calls) == 2                                                  # only the two Youth sessions called the model
+
+
 def test_cli_run_with_an_unresolvable_prompt_name_counts_the_failure_by_type(capsys, monkeypatch):
     calls = []
     monkeypatch.setattr(llm_module, "openrouter_chat_completion", lambda *a, **k: calls.append(1))
@@ -299,7 +324,7 @@ def test_cli_run_with_an_unresolvable_prompt_name_counts_the_failure_by_type(cap
         return await _cli_in_thread(capsys, monkeypatch, ["run", "--session-type", "Youth_Voice"])
 
     code, out, _ = _run(body)
-    assert code == 0 and json.loads(out)["errors"] == {"RuntimeError": 1} and calls == []
+    assert code == 0 and json.loads(out)["errors"] == {"ExtractionSetupError": 1} and calls == []
 
 
 def test_cli_show_config_lists_the_prompt_name_and_the_field_flags(capsys, monkeypatch):
@@ -307,7 +332,9 @@ def test_cli_show_config_lists_the_prompt_name_and_the_field_flags(capsys, monke
         await _add_prompt(conn, CUSTOM_PROMPT, [(1, True, "v1")])
         await _set_config(conn, _config(prompt_name=CUSTOM_PROMPT))
         named = await _cli_in_thread(capsys, monkeypatch, ["show-config", "--session-type", "Youth_Voice"])
-        await _set_config(conn, _config())
+        no_prompt = _config()
+        del no_prompt["prompt_name"]
+        await _set_config(conn, no_prompt)
         generic = await _cli_in_thread(capsys, monkeypatch, ["show-config", "--session-type", "Youth_Voice"])
         return named, generic
 
@@ -320,4 +347,4 @@ def test_cli_show_config_lists_the_prompt_name_and_the_field_flags(capsys, monke
         {"name": "district", "kind": "free_text", "sensitive": False, "provisional": False},
         {"name": "disability", "kind": "category", "sensitive": True, "provisional": False},
     ]
-    assert json.loads(generic[1])[0]["summary"]["prompt_name"] == "generic"
+    assert json.loads(generic[1])[0]["summary"]["prompt_name"] == "(none)"

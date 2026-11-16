@@ -15,6 +15,7 @@ this module:
   * `mitra_config_v1` / `gforms_config_v1` / `extraction_config_v1`(persona)   fresh dicts by persona name
   * `extraction_config_id(session_type)`        the id of that persona's extraction config
   * `seed_config_blocks()`                      every CONFIG block with its parsed ids (for the SQL-file tests)
+  * `SEED_CONFIG_COUNT` / `SEED_UPLOAD_CONFIG_COUNT` / `SEED_EXTRACTION_CONFIG_COUNT`   counts derived from the blocks
   * `SEED_NOTE_UPLOAD` / `SEED_NOTE_EXTRACTION` the seeded change_note of each config type
 
 The file format it parses (kept regular on purpose; tests/test_seed_config.py checks it):
@@ -163,6 +164,10 @@ PERSONAS: Dict[str, Dict[str, Any]] = _build_personas()
 SESSION_TYPE_TO_PERSONA: Dict[str, str] = {p["session_type"]: name for name, p in PERSONAS.items()}
 GFORMS_PERSONAS = tuple(name for name, p in PERSONAS.items() if p["gforms_config_id"] is not None)
 FEEDBACK_PROGRAM_NAME = next(iter(PERSONAS.values()))["program_name"]
+# counts DERIVED from the parsed seed (no test that is not about the seed content repeats a number of the file)
+SEED_CONFIG_COUNT = len(_PARSED["blocks"])
+SEED_UPLOAD_CONFIG_COUNT = sum(1 for b in _PARSED["blocks"] if b["config_type"] == CONFIG_TYPE_UPLOAD)
+SEED_EXTRACTION_CONFIG_COUNT = sum(1 for b in _PARSED["blocks"] if b["config_type"] == CONFIG_TYPE_EXTRACTION)
 SEED_NOTE_UPLOAD = _find(CONFIG_TYPE_UPLOAD, SOURCE_MITRA, "Youth_Voice")["change_note"]
 SEED_NOTE_EXTRACTION = _find(CONFIG_TYPE_EXTRACTION, SOURCE_ANY, "Youth_Voice")["change_note"]
 

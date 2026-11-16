@@ -1,43 +1,32 @@
 """
 Real-Postgres tests for the feedback branch of insert_or_update_submission / delete_submission.
 
-Skipped unless FEEDBACK_TEST_DATABASE_URL is set to a DSN of a scratch database (empty, or one that already
-has schema.sql applied, e.g. postgresql://postgres@localhost:54329/fb_d_x). The file applies schema.sql itself
+Skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database
+for this file and drops it afterwards). The file applies schema.sql itself
 (the way app/database/db.py does it, idempotent), seeds tenant 'mitra' plus a leader category / program, uses
 random submission ids and cleans up the rows it creates. Synthetic data only.
 """
 import asyncio
 import json
-import os
 import uuid
 
 import asyncpg
 import pytest
+from seed_support import FEEDBACK_PROGRAM_NAME
+import pg_support
 
 from app.database import operations
-from app.database.db import SCHEMA_FILE
 from app.database.operations import (
     FeedbackUpdateNotSupportedError,
     delete_submission,
     insert_or_update_submission,
 )
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(DSN is None, reason="FEEDBACK_TEST_DATABASE_URL not set")
 
 LEADER_ID = "0a0a0a0a-0000-4000-8000-00000000d001"
 PROGRAM_ID = "0a0a0a0a-0000-4000-8000-00000000d002"
-
-
-def _schema_sql() -> str:
-    """schema.sql with IF NOT EXISTS injected the way Database.initialize_schema does it."""
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
 
 
 _SCHEMA_APPLIED = False
@@ -46,7 +35,7 @@ _SCHEMA_APPLIED = False
 async def _ensure_schema(conn):
     global _SCHEMA_APPLIED
     if not _SCHEMA_APPLIED:
-        await conn.execute(_schema_sql())
+        await conn.execute(pg_support.schema_sql())
         _SCHEMA_APPLIED = True
 
 
@@ -93,7 +82,7 @@ SIX = [
 
 def _event(submission_id, session_id, messages, completion="COMPLETED", data=None, **tags):
     base_tags = {
-        "programId": PROGRAM_ID, "programName": "1M Voice",
+        "programId": PROGRAM_ID, "programName": FEEDBACK_PROGRAM_NAME,
         "leaderCategoryId": LEADER_ID, "leaderCategoryName": "Youth",
         "state": "Karnataka", "district": None, "source": "mitra",
     }
@@ -102,8 +91,8 @@ def _event(submission_id, session_id, messages, completion="COMPLETED", data=Non
         "submissionId": submission_id, "submissionType": "feedback", "sessionId": session_id,
         "tenantCode": "mitra", "eventType": "create", "eventPublishedAt": "2026-10-15T09:00:00.000Z",
         "tags": base_tags,
-        "data": {"source": "mitra", "sessionType": "Youth_Voice", "questionnaireVersion": "V2",
-                 "botId": "101", "botName": "Mitra Youth Test Bot",
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice",
+                 "questionnaireVersion": "V2", "botId": "101", "botName": "Mitra Youth Test Bot",
                  "language": "en", "completionStatus": completion,
                  "submissionDate": "2026-10-15T08:01:00.000Z", "messages": messages, **(data or {})},
     }
@@ -306,7 +295,7 @@ def _gf_ref():
 def _gf_event(source_ref, submission_id=None, messages=None):
     sid = submission_id or str(uuid.uuid4())
     event = _event(sid, sid, messages or GF_MESSAGES, source="google_forms")
-    event["data"].update(source="google_forms", sourceRef=source_ref, questionnaireVersion="V1")
+    event["data"].update(source="google_forms", adapter="wide_form", sourceRef=source_ref, questionnaireVersion="V1")
     del event["data"]["botId"], event["data"]["botName"]  # Google Forms has no Mitra bot
     return event
 

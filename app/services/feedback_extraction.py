@@ -17,31 +17,48 @@ The respondents include children and the conversation is DATA, never instruction
 derived from its own text, every message is collapsed to one line, and the template tells the model to ignore
 instructions inside it. Nothing here logs conversation text, and no error message contains it.
 """
+import functools
 import hashlib
 import json
 import logging
 import math
 import re
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+import unicodedata
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from app.services.feedback_extraction_constants import (
+    DEFAULT_MAX_BOT_MESSAGE_CHARS,
+    DEFAULT_MAX_CONVERSATION_CHARS,
+    DEFAULT_MAX_RAW_CHARS,
+    DEFAULT_MAX_RESPONDENT_MESSAGE_CHARS,
+    DEFAULT_MAX_VALUE_CHARS,
+    DEFAULT_PII_MIN_DIGIT_RUN,
+    DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS,
+    DEFAULT_PII_URL_TLDS,
+    DEFAULT_PLACEHOLDERS,
     EXTRACTION_CONFIG_SCHEMA_VERSION,
     FIELD_KINDS as _CONSTANT_FIELD_KINDS,
     KIND_CATEGORY,
-    FREE_TEXT_PLACEHOLDERS,
     KIND_FREE_TEXT,
-    MAX_BOT_MESSAGE_CHARS,
-    MAX_FREE_TEXT_VALUE_CHARS,
+    LIMIT_BOUNDS,
+    MAX_DIGIT_GAP,
+    MAX_LLM_TIMEOUT_SECONDS,
+    MAX_PII_TYPE_DESCRIPTION_CHARS,
     MAX_PII_TYPES,
-    MAX_RAW_VALUE_CHARS,
-    MAX_RESPONDENT_MESSAGE_CHARS,
-    PII_MIN_DIGIT_RUN,
+    MAX_PLACEHOLDER_CHARS,
+    MAX_PLACEHOLDERS,
+    MAX_PROMPT_VARIABLE_CHARS,
+    MAX_PROMPT_VARIABLES,
+    MAX_URL_TLDS,
+    PII_DIGIT_RUN_BOUNDS,
     PII_TYPE_DESCRIPTIONS,
     PII_TYPES,
     STATUS_EXTRACTED,
     STATUS_NOT_PROVIDED,
     STATUS_UNMAPPED,
+    YEAR_MAX,
+    YEAR_MIN,
 )
 
 logger = logging.getLogger("analytics_service.feedback_extraction")
@@ -78,6 +95,28 @@ class ExtractionOutputError(ValueError):
 # ------------------------------------------------------------------------------------------------ config
 
 @dataclass(frozen=True)
+class Limits:
+    """The size limits of one program's extraction (config block `limits`; defaults in the constants module)."""
+    max_respondent_message_chars: int = DEFAULT_MAX_RESPONDENT_MESSAGE_CHARS
+    max_bot_message_chars: int = DEFAULT_MAX_BOT_MESSAGE_CHARS
+    max_conversation_chars: int = DEFAULT_MAX_CONVERSATION_CHARS
+    max_value_chars: int = DEFAULT_MAX_VALUE_CHARS
+    max_raw_chars: int = DEFAULT_MAX_RAW_CHARS
+
+
+@dataclass(frozen=True)
+class PiiPolicy:
+    """The deterministic PII backstop of one program (config block `pii`, keys other than `types`)."""
+    min_digit_run: int = DEFAULT_PII_MIN_DIGIT_RUN
+    min_digit_run_short_groups: int = DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS
+    url_tlds: Tuple[str, ...] = DEFAULT_PII_URL_TLDS
+
+
+DEFAULT_LIMITS = Limits()
+DEFAULT_PII_POLICY = PiiPolicy()
+
+
+@dataclass(frozen=True)
 class FieldSpec:
     name: str
     kind: str                         # 'category' | 'free_text' | 'integer'
@@ -87,7 +126,21 @@ class FieldSpec:
     provisional: bool = False         # product has not confirmed the bands
     min_value: Optional[int] = None   # integer fields only: smallest accepted value (inclusive)
     max_value: Optional[int] = None   # integer fields only: largest accepted value (inclusive)
-    sensitive: bool = False           # prompt rule only (fill when stated explicitly); never changes validation
+    sensitive: bool = False           # a prompt rule (fill only when stated) AND raw_value is not stored (see keeps_raw)
+    store_raw: Optional[bool] = None  # None = the default (not sensitive); True keeps raw_value of a sensitive field
+
+    @property
+    def keeps_raw(self) -> bool:
+        """Whether the respondent's own words (raw_value) of this field are stored. Sensitive fields: only on request."""
+        return self.store_raw if self.store_raw is not None else not self.sensitive
+
+
+def _placeholder_key(text: str) -> str:
+    """'N/A', 'Not provided.', ...: case-insensitive, spaces and surrounding punctuation ignored."""
+    return re.sub(r"\s+", " ", text.replace("’", "'")).strip(" \t.,;:!?\"'()[]{}<>-_*~`").casefold()
+
+
+DEFAULT_PLACEHOLDER_KEYS: FrozenSet[str] = frozenset(_placeholder_key(p) for p in DEFAULT_PLACEHOLDERS)
 
 
 @dataclass(frozen=True)
@@ -97,16 +150,28 @@ class ExtractionConfig:
     fields: Tuple[FieldSpec, ...]
     pii_types: Tuple[str, ...]
     llm: Dict[str, Any]               # optional model / max_tokens / timeout_seconds, each None when unset
-    prompt_name: Optional[str] = None  # exact prompts.name of this persona's prompt; None = the generic prompt
+    prompt_name: Optional[str] = None  # exact prompts.name of this program's prompt; always set by the parser
+    pii_type_descriptions: Mapping[str, str] = field(default_factory=dict)   # type -> description given in the config
+    limits: Limits = DEFAULT_LIMITS
+    pii_policy: PiiPolicy = DEFAULT_PII_POLICY
+    placeholders: FrozenSet[str] = DEFAULT_PLACEHOLDER_KEYS    # normalised keys (see _placeholder_key)
+    prompt_variables: Mapping[str, str] = field(default_factory=dict)        # extra {{variables}} of the prompt
 
     def field_names(self) -> Tuple[str, ...]:
         return tuple(f.name for f in self.fields)
 
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
-_TOP_KEYS = {"schema_version", "persona", "session_type", "source_note", "fields", "pii", "llm", "prompt_name"}
-_FIELD_KEYS = {"name", "kind", "description", "categories", "guidance", "provisional", "min", "max", "sensitive"}
+_TOP_KEYS = {"schema_version", "persona", "session_type", "source_note", "fields", "pii", "llm", "prompt_name",
+             "prompt_variables", "limits", "placeholders"}
+_FIELD_KEYS = {"name", "kind", "description", "categories", "guidance", "provisional", "min", "max", "sensitive",
+               "store_raw"}
 _LLM_KEYS = {"model", "max_tokens", "timeout_seconds"}
+_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds"}
+# The variables the engine itself fills; a config's prompt_variables may not shadow them.
+RESERVED_PROMPT_VARIABLES = frozenset({
+    "persona", "fields", "field_names", "pii_types", "output_format", "conversation_id", "conversation"})
+_TLD_RE = re.compile(r"^[^\W\d_]{2,24}$")
 
 
 def _norm(text: str) -> str:
@@ -124,6 +189,108 @@ def _is_positive_int(value: Any) -> bool:
 
 def _is_plain_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_pii(pii_raw: Any) -> Tuple[Tuple[str, ...], Dict[str, str], PiiPolicy]:
+    if not isinstance(pii_raw, dict):
+        raise ExtractionConfigError("pii must be an object")
+    unknown = sorted(set(pii_raw) - _PII_KEYS)
+    if len(unknown) > 0:
+        raise ExtractionConfigError(f"pii has unknown key(s): {unknown}; allowed: {sorted(_PII_KEYS)}")
+    pii_types: Tuple[str, ...] = PII_TYPES
+    descriptions: Dict[str, str] = {}
+    if "types" in pii_raw:
+        types = pii_raw["types"]
+        if not isinstance(types, list) or len(types) == 0:
+            raise ExtractionConfigError("pii.types must be a non-empty list of lower-case names or {name, description} objects")
+        names: List[str] = []
+        for index, item in enumerate(types):
+            where = f"pii.types[{index}]"
+            if isinstance(item, dict):
+                if set(item) != {"name", "description"}:
+                    raise ExtractionConfigError(f"{where} must have exactly the keys 'name' and 'description'")
+                name, description = item["name"], item["description"]
+                if not _is_text(description) or len(description.strip()) > MAX_PII_TYPE_DESCRIPTION_CHARS:
+                    raise ExtractionConfigError(
+                        f"{where}.description must be a non-empty string of at most {MAX_PII_TYPE_DESCRIPTION_CHARS} characters")
+                descriptions[name if isinstance(name, str) else ""] = description.strip()
+            else:
+                name = item
+            if not _is_text(name) or name != name.strip().lower() or _NAME_RE.match(name) is None:
+                raise ExtractionConfigError(f"{where}: a pii type name must be a lower-case word like 'phone' ({_NAME_RE.pattern})")
+            names.append(name)
+        if len(set(names)) != len(names) or "other" not in names:
+            raise ExtractionConfigError("pii.types must be unique and include 'other'")
+        pii_types = tuple(names)
+
+    def bounded(key: str, default: int, low: int, high: int) -> int:
+        if key not in pii_raw:
+            return default
+        value = pii_raw[key]
+        if not _is_plain_int(value) or value < low or value > high:
+            raise ExtractionConfigError(f"pii.{key} must be an integer from {low} to {high}")
+        return value
+
+    low, high = PII_DIGIT_RUN_BOUNDS
+    min_run = bounded("min_digit_run", DEFAULT_PII_MIN_DIGIT_RUN, low, high)
+    min_short = bounded("min_digit_run_short_groups", max(DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS, min_run), low, high)
+    if min_short < min_run:
+        raise ExtractionConfigError("pii.min_digit_run_short_groups must not be smaller than pii.min_digit_run")
+    tlds = DEFAULT_PII_URL_TLDS
+    if "url_tlds" in pii_raw:
+        raw_tlds = pii_raw["url_tlds"]
+        if (not isinstance(raw_tlds, list) or len(raw_tlds) > MAX_URL_TLDS
+                or any(not isinstance(t, str) or t != t.lower() or _TLD_RE.match(t) is None for t in raw_tlds)):
+            raise ExtractionConfigError(
+                f"pii.url_tlds must be a list (at most {MAX_URL_TLDS}) of lower-case letters-only top-level domains "
+                f"such as 'com'; an empty list switches the bare-domain check off")
+        tlds = tuple(dict.fromkeys(raw_tlds))
+    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds)
+
+
+def _parse_limits(limits_raw: Any) -> Limits:
+    if not isinstance(limits_raw, dict):
+        raise ExtractionConfigError("limits must be an object")
+    unknown = sorted(set(limits_raw) - set(LIMIT_BOUNDS))
+    if len(unknown) > 0:
+        raise ExtractionConfigError(f"limits has unknown key(s): {unknown}; allowed: {sorted(LIMIT_BOUNDS)}")
+    values: Dict[str, int] = {}
+    for key, value in limits_raw.items():
+        low, high = LIMIT_BOUNDS[key]
+        if not _is_plain_int(value) or value < low or value > high:
+            raise ExtractionConfigError(f"limits.{key} must be an integer from {low} to {high}")
+        values[key] = value
+    limits = Limits(**values)
+    if limits.max_value_chars > limits.max_raw_chars and "max_value_chars" in values:
+        raise ExtractionConfigError("limits.max_value_chars must not be larger than limits.max_raw_chars")
+    if limits.max_respondent_message_chars > limits.max_conversation_chars:
+        raise ExtractionConfigError("limits.max_respondent_message_chars must not be larger than limits.max_conversation_chars")
+    return limits
+
+
+def _parse_placeholders(raw: Any) -> FrozenSet[str]:
+    if (not isinstance(raw, list) or len(raw) > MAX_PLACEHOLDERS
+            or any(not _is_text(p) or len(p) > MAX_PLACEHOLDER_CHARS for p in raw)):
+        raise ExtractionConfigError(
+            f"placeholders must be a list (at most {MAX_PLACEHOLDERS}) of non-empty strings of at most "
+            f"{MAX_PLACEHOLDER_CHARS} characters; it replaces the built-in English list")
+    return frozenset(_placeholder_key(p) for p in raw) - {""}
+
+
+def _parse_prompt_variables(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict) or len(raw) > MAX_PROMPT_VARIABLES:
+        raise ExtractionConfigError(f"prompt_variables must be an object of at most {MAX_PROMPT_VARIABLES} entries")
+    parsed: Dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,62}", name) is None:
+            raise ExtractionConfigError("prompt_variables names must match [a-z][a-z0-9_]{0,62}")
+        if name in RESERVED_PROMPT_VARIABLES:
+            raise ExtractionConfigError(f"prompt_variables.{name} is a variable the engine fills itself")
+        if not _is_text(value) or len(value) > MAX_PROMPT_VARIABLE_CHARS:
+            raise ExtractionConfigError(
+                f"prompt_variables.{name} must be a non-empty string of at most {MAX_PROMPT_VARIABLE_CHARS} characters")
+        parsed[name] = value.strip()
+    return parsed
 
 
 def parse_extraction_config(raw: Any) -> ExtractionConfig:
@@ -147,13 +314,16 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
     if not _is_text(session_type):
         raise ExtractionConfigError("extraction config needs a non-empty session_type")
 
-    prompt_name: Optional[str] = None
-    if "prompt_name" in raw:
-        prompt_name = raw["prompt_name"]
-        if not _is_text(prompt_name) or prompt_name != prompt_name.strip():
-            raise ExtractionConfigError(
-                "extraction config prompt_name must be a non-empty string without surrounding spaces "
-                "(the exact name of a prompts row) or be left out")
+    # Required: a config that names no prompt would otherwise be answered with some other program's wording.
+    if "prompt_name" not in raw:
+        raise ExtractionConfigError(
+            "extraction config needs prompt_name (the exact name of a prompts row of analysis_type "
+            "feedback_metadata_extraction); there is no default prompt")
+    prompt_name = raw["prompt_name"]
+    if not _is_text(prompt_name) or prompt_name != prompt_name.strip():
+        raise ExtractionConfigError(
+            "extraction config prompt_name must be a non-empty string without surrounding spaces "
+            "(the exact name of a prompts row)")
 
     raw_fields = raw.get("fields")
     if not isinstance(raw_fields, list) or len(raw_fields) == 0:
@@ -184,6 +354,11 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
         sensitive = item.get("sensitive", False)
         if not isinstance(sensitive, bool):
             raise ExtractionConfigError(f"{where}.sensitive must be a boolean")
+        store_raw: Optional[bool] = None
+        if "store_raw" in item:
+            store_raw = item["store_raw"]
+            if not isinstance(store_raw, bool):
+                raise ExtractionConfigError(f"{where}.store_raw must be a boolean")
         min_value: Optional[int] = None
         max_value: Optional[int] = None
         categories: Tuple[str, ...] = ()
@@ -227,19 +402,17 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
             if "min" in item or "max" in item:
                 raise ExtractionConfigError(f"{where}: a free_text field has no min or max")
         fields.append(FieldSpec(name, kind, item["description"].strip(), categories, guidance, provisional,
-                                min_value, max_value, sensitive))
+                                min_value, max_value, sensitive, store_raw))
 
-    pii_raw = raw.get("pii")
     pii_types: Tuple[str, ...] = PII_TYPES
-    if pii_raw is not None:
-        if not isinstance(pii_raw, dict) or set(pii_raw) != {"types"}:
-            raise ExtractionConfigError("pii must be an object with exactly the key 'types'")
-        types = pii_raw["types"]
-        if not isinstance(types, list) or len(types) == 0 or any(not _is_text(t) or t != t.strip().lower() for t in types):
-            raise ExtractionConfigError("pii.types must be a non-empty list of lower-case strings")
-        if len(set(types)) != len(types) or "other" not in types:
-            raise ExtractionConfigError("pii.types must be unique and include 'other'")
-        pii_types = tuple(types)
+    pii_descriptions: Dict[str, str] = {}
+    pii_policy = DEFAULT_PII_POLICY
+    if raw.get("pii") is not None:
+        pii_types, pii_descriptions, pii_policy = _parse_pii(raw["pii"])
+    limits = _parse_limits(raw["limits"]) if raw.get("limits") is not None else DEFAULT_LIMITS
+    placeholders = _parse_placeholders(raw["placeholders"]) if raw.get("placeholders") is not None \
+        else DEFAULT_PLACEHOLDER_KEYS
+    prompt_variables = _parse_prompt_variables(raw["prompt_variables"]) if raw.get("prompt_variables") is not None else {}
 
     llm_raw = raw.get("llm")
     llm: Dict[str, Any] = {"model": None, "max_tokens": None, "timeout_seconds": None}
@@ -254,10 +427,13 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
         for key in ("max_tokens", "timeout_seconds"):
             if llm_raw.get(key) is not None and not _is_positive_int(llm_raw[key]):
                 raise ExtractionConfigError(f"llm.{key} must be a positive integer or null")
+        if llm_raw.get("timeout_seconds") is not None and llm_raw["timeout_seconds"] > MAX_LLM_TIMEOUT_SECONDS:
+            raise ExtractionConfigError(f"llm.timeout_seconds must not exceed {MAX_LLM_TIMEOUT_SECONDS}")
         for key in _LLM_KEYS:
             if key in llm_raw:
                 llm[key] = llm_raw[key]
-    return ExtractionConfig(persona.strip(), session_type.strip(), tuple(fields), pii_types, llm, prompt_name)
+    return ExtractionConfig(persona.strip(), session_type.strip(), tuple(fields), pii_types, llm, prompt_name,
+                            pii_descriptions, limits, pii_policy, placeholders, prompt_variables)
 
 
 # ------------------------------------------------------------------------------------------------ conversation
@@ -283,7 +459,8 @@ class Conversation:
     text: str                 # one line per turn: "[sequence] Role: text"
     conversation_id: str      # derived from the text; delimits it in the prompt
     respondent_answers: int   # number of non-blank respondent answers
-    oversized_respondent_message: bool = False  # a respondent message longer than MAX_RESPONDENT_MESSAGE_CHARS
+    oversized_respondent_message: bool = False  # a respondent message longer than limits.max_respondent_message_chars
+    too_long: bool = False    # the whole conversation text is longer than limits.max_conversation_chars
 
 
 def _clean(value: Any) -> str:
@@ -293,14 +470,15 @@ def _clean(value: Any) -> str:
     return _SPACE_RE.sub(" ", _CONTROL_RE.sub(" ", value)).strip()
 
 
-def _cap_bot(text: str) -> str:
+def _cap_bot(text: str, limit: int) -> str:
     """Bot messages are the questionnaire's own text and carry no respondent PII: a very long one is cut."""
-    if len(text) > MAX_BOT_MESSAGE_CHARS:
-        return text[:MAX_BOT_MESSAGE_CHARS] + _TRUNCATED
+    if len(text) > limit:
+        return text[:limit] + _TRUNCATED
     return text
 
 
-def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence[str] = ()) -> Conversation:
+def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence[str] = (),
+                       limits: Limits = DEFAULT_LIMITS) -> Conversation:
     """
     Builds the conversation text from the `feedbacks` rows of one session (any order; sorted by `sequence`).
 
@@ -309,9 +487,9 @@ def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence
     (falling back to `message`); a respondent row shows the original `message` and, when it differs, the English
     translation, so the model sees both. A bot row whose `question_key` is one of `closing_keys` (the thank-you
     message of the upload config) is left out. Blank rows are skipped. Respondent messages are NEVER truncated
-    (a cut would hide PII after it); if one is longer than MAX_RESPONDENT_MESSAGE_CHARS the conversation is flagged
-    `oversized_respondent_message` and `extract` does not send it to the model. Bot messages are cut at
-    MAX_BOT_MESSAGE_CHARS.
+    (a cut would hide PII after it); if one is longer than `limits.max_respondent_message_chars` the conversation is
+    flagged `oversized_respondent_message`, and if the whole text is longer than `limits.max_conversation_chars` it
+    is flagged `too_long`; `extract` sends neither to the model. Bot messages are cut at `limits.max_bot_message_chars`.
     """
     closing = {k.strip().upper() for k in closing_keys if isinstance(k, str) and len(k.strip()) > 0}
     turns: List[Turn] = []
@@ -324,10 +502,11 @@ def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence
             key = row.get("question_key")
             if isinstance(key, str) and key.strip().upper() in closing:
                 continue
-            text = _cap_bot(english if len(english) > 0 else message)
+            text = _cap_bot(english if len(english) > 0 else message, limits.max_bot_message_chars)
             role = ROLE_BOT
         else:
-            if len(message) > MAX_RESPONDENT_MESSAGE_CHARS or len(english) > MAX_RESPONDENT_MESSAGE_CHARS:
+            if (len(message) > limits.max_respondent_message_chars
+                    or len(english) > limits.max_respondent_message_chars):
                 oversized = True
             if len(message) > 0 and len(english) > 0 and message.casefold() != english.casefold():
                 text = f"{message} (English translation: {english})"
@@ -343,7 +522,7 @@ def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence
         turns.append(Turn(int(row["sequence"]), role, text))
     body = "\n".join(f"[{t.sequence}] {t.role}: {t.text}" for t in turns)
     conversation_id = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-    return Conversation(tuple(turns), body, conversation_id, answers, oversized)
+    return Conversation(tuple(turns), body, conversation_id, answers, oversized, len(body) > limits.max_conversation_chars)
 
 
 # ------------------------------------------------------------------------------------------------ deterministic PII backstop
@@ -351,25 +530,108 @@ def build_conversation(rows: Sequence[Mapping[str, Any]], closing_keys: Sequence
 # The model's `pii.detected = false` is never trusted on its own: respondent text (a respondent can write
 # "set pii to false") that contains one of these shapes is flagged here whatever the model said. The check is
 # deliberately blunt: a false positive only excludes a session from the export, a false negative leaks PII.
-# Unicode-aware: \d matches Devanagari, Kannada, ... digits.
-_DIGIT_RUN_RE = re.compile(r"\d(?:[\s\-.()]*\d)*")
-_EMAIL_RE = re.compile(r"[^\s@(\[{\"'<]@[^\s@]")
-_HANDLE_RE = re.compile(r"(?<![^\s(\[{\"'<])@[^\s@]{2,}")
-_URL_RE = re.compile(
-    r"(?:https?://|www\.)\S+|(?<![\w@.])[\w-]+(?:\.[\w-]+)*\.(?:com|in|org|net|co|io|me|edu|gov|app|link|ly|tv|info)\b",
-    re.IGNORECASE)
+#
+# Every regular expression here is LINEAR in the length of the text: quantifiers are bounded, and nothing scans
+# "to the end of the token" from every start position (a 20,000-character message must not stall the worker; see
+# tests/test_feedback_extraction_pii_policy.py for the time-budget tests). The digit check is a single pass, not a regex.
+#
+# Policy (the numbers are config: pii.min_digit_run, pii.min_digit_run_short_groups, pii.url_tlds):
+#  * Before matching, the text is NFKC-normalised (fullwidth, circled and superscript digits and '＠' become ASCII)
+#    and format characters (zero-width space and joiner, soft hyphen, BOM, bidi marks) are removed.
+#  * DIGITS: groups of digits separated by anything that is neither a letter nor a digit (space, '-', '.', ',', '/',
+#    '(', ')', en dash, middle dot, underscore, ...; at most MAX_DIGIT_GAP such characters in a row) form one run. A run
+#    counts as a phone or id number when it holds at least `min_digit_run` digits, EXCEPT that a run made only of
+#    one- and two-digit groups (marks '85 90 78 92', ages, classes) needs `min_digit_run_short_groups`, and a run whose
+#    groups are all years from 1900 to 2099 ('2018-2022') never counts. A letter between digits ends the run, so number
+#    words ('five') and 'x'-separated digits are NOT covered (only the model can flag them). Consecutive respondent
+#    messages that are nothing but numbers of three or more digits are joined ('98765' then '43210').
+#  * E-MAIL: letters/digits/._+- then '@' then a letter ('asha@gmail'); '@' followed by a digit ('rate@5%') is not.
+#    HANDLE: '@' at the start of a word followed by a word character and at least one more.
+#  * URL: 'http(s)://' or 'www.' followed by text, or a bare 'name.tld' with a tld of the config list. A two-letter tld
+#    followed by a space and a letter ('learn.in the village': a missing space after a full stop) is not a URL.
+_EMAIL_RE = re.compile(r"[\w.+-]{1,64}@[^\W\d_]")
+_HANDLE_RE = re.compile(r"(?<![^\s(\[{\"'<])@\w[\w.]+")
+
+
+@functools.lru_cache(maxsize=64)
+def _url_regex(tlds: Tuple[str, ...]) -> "Optional[re.Pattern[str]]":
+    long_tlds = [re.escape(t) for t in tlds if len(t) > 2]
+    short_tlds = [re.escape(t) for t in tlds if len(t) <= 2]
+    alternatives: List[str] = []
+    if len(long_tlds) > 0:
+        alternatives.append(r"(?:" + "|".join(long_tlds) + r")\b")
+    if len(short_tlds) > 0:
+        alternatives.append(r"(?:" + "|".join(short_tlds) + r")\b(?!\s+[^\W\d_])")
+    scheme = r"(?:https?://|www\.)\S+"
+    if len(alternatives) == 0:
+        return re.compile(scheme, re.IGNORECASE)
+    bare = r"(?<![\w@.])[\w-]{1,63}(?:\.[\w-]{1,63}){0,8}\.(?:" + "|".join(alternatives) + ")"
+    return re.compile(scheme + "|" + bare, re.IGNORECASE)
+
 
 PII_KIND_NUMBER = "phone"      # a long digit run: a phone number or an id number (the kind is informational)
 PII_KIND_EMAIL = "email"       # an email address or an @handle (the 'email' type covers social handles)
 PII_KIND_URL = "other"
 
 
-def pii_precheck_kinds(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
+def _precheck_text(value: Any) -> str:
+    """The text the pre-check looks at: one line, NFKC-normalised, without format characters."""
+    text = _clean(value)
+    if len(text) == 0 or text.isascii():
+        return text
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return _clean(text)
+
+
+def _digit_runs(text: str) -> List[List[str]]:
+    """The runs of digit groups of `text` (see the policy above). One pass, linear."""
+    runs: List[List[str]] = []
+    groups: List[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if not text[i].isdecimal():
+            i += 1
+            continue
+        j = i + 1
+        while j < n and text[j].isdecimal():
+            j += 1
+        groups.append(text[i:j])
+        k = j
+        while k < n and k - j < MAX_DIGIT_GAP and not text[k].isalnum():
+            k += 1
+        if k > j and k < n and text[k].isdecimal():
+            i = k          # a separator (1..MAX_DIGIT_GAP characters) and then more digits: the run goes on
+            continue
+        runs.append(groups)
+        groups = []
+        i = j
+    return runs
+
+
+def _is_year_group(group: str) -> bool:
+    return len(group) == 4 and YEAR_MIN <= int(group) <= YEAR_MAX
+
+
+def _run_is_number(groups: Sequence[str], policy: PiiPolicy) -> bool:
+    if all(_is_year_group(g) for g in groups):
+        return False
+    short_groups = len(groups) > 1 and all(len(g) <= 2 for g in groups)
+    needed = policy.min_digit_run_short_groups if short_groups else policy.min_digit_run
+    return sum(len(g) for g in groups) >= needed
+
+
+def _is_numbers_only(text: str, groups: Sequence[str]) -> bool:
+    """A message that is nothing but numbers of three or more digits and separators (a number answered in parts)."""
+    return all(len(g) >= 3 for g in groups) and all(ch.isdecimal() or not ch.isalnum() for ch in text)
+
+
+def pii_precheck_kinds(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy = DEFAULT_PII_POLICY) -> Tuple[str, ...]:
     """
     The kinds of identifying shapes found in the RESPONDENT rows (parent_id set), original and translated column
-    each checked on its own: a run of PII_MIN_DIGIT_RUN or more digits (spaces, dashes, dots and parentheses between
-    digits ignored; a two-digit age or a year never reaches it), an email address, an '@handle', a URL. Returns
-    the kinds in a stable order (empty when none). Never returns or logs the text itself.
+    each checked on its own: a long run of digits, an email address, an '@handle', a URL (the policy is described
+    above). Returns the kinds in a stable order (empty when none). Never returns or logs the text itself.
     """
     found: List[str] = []
 
@@ -377,21 +639,30 @@ def pii_precheck_kinds(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
         if kind not in found:
             found.append(kind)
 
-    for row in rows:
-        if row.get("parent_id") is None:
-            continue
-        for column in ("message", "translated_message"):
-            text = _clean(row.get(column))
+    respondent = sorted((r for r in rows if r.get("parent_id") is not None), key=lambda r: r["sequence"])
+    url_re = _url_regex(tuple(policy.url_tlds))
+    for column in ("message", "translated_message"):
+        chain: List[str] = []       # digit groups of consecutive numbers-only messages
+        chain_messages = 0
+        for row in respondent:
+            text = _precheck_text(row.get(column))
             if len(text) == 0:
                 continue
-            for match in _DIGIT_RUN_RE.finditer(text):
-                if len(re.findall(r"\d", match.group(0))) >= PII_MIN_DIGIT_RUN:
+            runs = _digit_runs(text)
+            if any(_run_is_number(run, policy) for run in runs):
+                add(PII_KIND_NUMBER)
+            if len(runs) == 1 and _is_numbers_only(text, runs[0]):
+                chain.extend(runs[0])
+                chain_messages += 1
+                if chain_messages > 1 and _run_is_number(chain, policy):
                     add(PII_KIND_NUMBER)
-                    break
-            if _EMAIL_RE.search(text) is not None or _HANDLE_RE.search(text) is not None:
-                add(PII_KIND_EMAIL)
-            without_email = re.sub(r"\S*@\S*", " ", text)
-            if _URL_RE.search(without_email) is not None:
+            else:
+                chain, chain_messages = [], 0
+            if "@" in text:
+                if _EMAIL_RE.search(text) is not None or _HANDLE_RE.search(text) is not None:
+                    add(PII_KIND_EMAIL)
+                text = " ".join(token for token in text.split(" ") if "@" not in token)
+            if url_re.search(text) is not None:
                 add(PII_KIND_URL)
     return tuple(found)
 
@@ -399,7 +670,7 @@ def pii_precheck_kinds(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
 def apply_pii_precheck(result: "ExtractionResult", rows: Sequence[Mapping[str, Any]],
                        config: ExtractionConfig) -> "ExtractionResult":
     """Forces pii_detected TRUE (and adds the matching types) when the deterministic pre-check finds something."""
-    kinds = pii_precheck_kinds(rows)
+    kinds = pii_precheck_kinds(rows, config.pii_policy)
     if len(kinds) == 0:
         return result
     types = list(result.pii_types)
@@ -411,6 +682,23 @@ def apply_pii_precheck(result: "ExtractionResult", rows: Sequence[Mapping[str, A
         # Only the kinds are logged, never the text: how often the model said false where the pre-check disagrees.
         logger.info("PII pre-check overrode the model's pii.detected=false, kinds=%s", list(kinds))
     return replace(result, pii_detected=True, pii_types=tuple(types))
+
+
+def minimise_flagged(result: "ExtractionResult", config: ExtractionConfig) -> "ExtractionResult":
+    """
+    A session flagged pii_detected keeps no respondent words: raw_value is NULL for every field and the value of a
+    free_text field (it is text the respondent wrote) is NULL as well; the status stays, so a count of what was
+    answered is still possible. Category and integer values (a band from the config, a number inside a range) stay.
+    Such sessions are excluded from the export anyway; this makes sure a query that forgets the exclusion cannot
+    return the text that made the flag TRUE.
+    """
+    if not result.pii_detected:
+        return result
+    kinds = {spec.name: spec.kind for spec in config.fields}
+    fields = tuple(
+        replace(f, raw_value=None, value=None if kinds.get(f.field_name) == KIND_FREE_TEXT else f.value)
+        for f in result.fields)
+    return replace(result, fields=fields)
 
 
 # ------------------------------------------------------------------------------------------------ prompt
@@ -437,8 +725,17 @@ def _render_fields(config: ExtractionConfig) -> str:
     return "\n".join(lines)
 
 
+def _pii_type_description(config: ExtractionConfig, name: str) -> str:
+    """The description the config gives the type, else the neutral built-in one for the default names, else 'as named'."""
+    if name in config.pii_type_descriptions:
+        return config.pii_type_descriptions[name]
+    if name in PII_TYPE_DESCRIPTIONS:
+        return PII_TYPE_DESCRIPTIONS[name]
+    return "as named"
+
+
 def _render_pii_types(config: ExtractionConfig) -> str:
-    return "\n".join(f"- {t}: {PII_TYPE_DESCRIPTIONS.get(t, 'as named')}" for t in config.pii_types)
+    return "\n".join(f"- {t}: {_pii_type_description(config, t)}" for t in config.pii_types)
 
 
 def _render_output_format(config: ExtractionConfig) -> str:
@@ -462,9 +759,12 @@ def _fill(template: str, variables: Mapping[str, str]) -> str:
 def render_prompt(system_template: str, user_template: str, config: ExtractionConfig, conversation: Conversation) -> str:
     """
     The full prompt (system part, blank line, user part) as one string, the way the other activities send it.
-    Variables: persona, fields, field_names, pii_types, output_format, conversation_id, conversation.
+    Variables: persona, fields, field_names, pii_types, output_format, conversation_id, conversation, plus the
+    config's `prompt_variables`. All of them are filled in ONE pass (`_fill`): a value is never scanned again, so
+    neither the conversation nor a configured variable can pull in another variable.
     """
     variables = {
+        **config.prompt_variables,
         "persona": config.persona,
         "fields": _render_fields(config),
         "field_names": ", ".join(config.field_names()),
@@ -500,11 +800,12 @@ class ExtractionRun:
     usage: Dict[str, Any]
     llm_called: bool           # False when no call was made (see skip_reason)
     conversation_turns: int
-    skip_reason: Optional[str] = None   # SKIP_NO_ANSWER | SKIP_OVERSIZED when llm_called is False, else None
+    skip_reason: Optional[str] = None   # SKIP_NO_ANSWER | SKIP_OVERSIZED | SKIP_TOO_LONG when llm_called is False
 
 
 SKIP_NO_ANSWER = "no_respondent_answer"
 SKIP_OVERSIZED = "oversized_respondent_message"
+SKIP_TOO_LONG = "conversation_too_long"
 
 
 def empty_result(config: ExtractionConfig) -> ExtractionResult:
@@ -515,8 +816,9 @@ def empty_result(config: ExtractionConfig) -> ExtractionResult:
 
 def oversized_result(config: ExtractionConfig) -> ExtractionResult:
     """
-    A respondent message longer than MAX_RESPONDENT_MESSAGE_CHARS is not sent to the model (it would have to be cut,
-    and PII after the cut would be lost). The session is flagged pii_detected TRUE with type 'other', so it is
+    A respondent message longer than limits.max_respondent_message_chars (or a conversation longer than
+    limits.max_conversation_chars) is not sent to the model (it would have to be cut, and PII after the cut would be
+    lost). The session is flagged pii_detected TRUE with type 'other', so it is
     excluded from the export and a person can look at it. The respondent did answer, so the fields are 'unmapped'.
     """
     return ExtractionResult(
@@ -554,56 +856,81 @@ def _text_or_none(value: Any, where: str) -> Optional[str]:
     return None if len(stripped) == 0 else stripped
 
 
-def _is_placeholder(text: str) -> bool:
-    """'N/A', 'null', 'Not provided', 'unknown', ...: case-insensitive, spaces and surrounding punctuation ignored."""
-    key = _SPACE_RE.sub(" ", text.replace("\u2019", "'")).strip(" \t.,;:!?\"'()[]{}<>-_*~`").casefold()
-    return len(key) == 0 or key in FREE_TEXT_PLACEHOLDERS
+def _is_placeholder(text: str, placeholders: FrozenSet[str] = DEFAULT_PLACEHOLDER_KEYS) -> bool:
+    """'N/A', 'null', 'Not provided', ...: case-insensitive, spaces and surrounding punctuation ignored."""
+    key = _placeholder_key(text)
+    return len(key) == 0 or key in placeholders
 
 
 _INTEGER_TEXT_RE = re.compile(r"-?[0-9]{1,%d}" % _MAX_INTEGER_DIGITS)
+# A spreadsheet reads a cell that starts with one of these as a formula (CSV / formula injection).
+_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
-def _integer_candidate(value: Any) -> Tuple[Optional[int], str]:
+def _neutralise(text: Optional[str]) -> Optional[str]:
+    """A stored respondent text that starts with = + - @ gets a leading apostrophe, so an export cannot run it as a formula."""
+    if text is not None and len(text) > 0 and text[0] in _FORMULA_PREFIXES:
+        return "'" + text
+    return text
+
+
+def _integer_candidate(value: Any, max_raw: int = DEFAULT_MAX_RAW_CHARS) -> Tuple[Optional[int], str]:
     """(the integer the model's value stands for or None, the model's value as short text for the raw column)."""
     if isinstance(value, bool):
         return None, "true" if value else "false"
     if isinstance(value, int):
-        text = str(value) if len(str(value)) <= MAX_RAW_VALUE_CHARS else str(value)[:MAX_RAW_VALUE_CHARS]
+        text = str(value) if len(str(value)) <= max_raw else str(value)[:max_raw]
         return (value if len(str(abs(value))) <= _MAX_INTEGER_DIGITS else None), text
     if isinstance(value, float):
         text = repr(value)
         if math.isfinite(value) and value.is_integer() and abs(value) < 10 ** _MAX_INTEGER_DIGITS:
             return int(value), text
         return None, text
-    text = value[:MAX_RAW_VALUE_CHARS]
+    text = value[:max_raw]
     if _INTEGER_TEXT_RE.fullmatch(value) is not None:     # ASCII digits only, optional leading minus, no exponent or point
         return int(value), text
     return None, text
 
 
-def _map_integer(spec: FieldSpec, value: Any, raw: Optional[str], confidence: Optional[float]) -> FieldResult:
+def _map_integer(spec: FieldSpec, value: Any, raw: Optional[str], confidence: Optional[float],
+                 config: ExtractionConfig) -> FieldResult:
     """
     An integer field: null / blank / a placeholder is not_provided (or unmapped with the respondent's words when
     `raw` holds something that is not a placeholder); a JSON integer, an integral float or a numeric string inside
     [min, max] is extracted with the canonical decimal string as value; anything else (text, 17.5, out of range,
     a boolean) is unmapped with the raw kept.
     """
-    if isinstance(value, str) and _is_placeholder(value):
+    if isinstance(value, str) and _is_placeholder(value, config.placeholders):
         value = None
     if value is None:
-        if raw is not None and _is_placeholder(raw):
+        if raw is not None and _is_placeholder(raw, config.placeholders):
             raw = None
         if raw is None:
             return FieldResult(spec.name, None, None, STATUS_NOT_PROVIDED, confidence)
         return FieldResult(spec.name, None, raw, STATUS_UNMAPPED, confidence)
-    number, model_text = _integer_candidate(value)
+    number, model_text = _integer_candidate(value, config.limits.max_raw_chars)
     kept_raw = raw if raw is not None else model_text
     if number is None or number < spec.min_value or number > spec.max_value:
         return FieldResult(spec.name, None, kept_raw, STATUS_UNMAPPED, confidence)
     return FieldResult(spec.name, str(number), kept_raw, STATUS_EXTRACTED, confidence)
 
 
-def _map_field(spec: FieldSpec, entry: Mapping[str, Any]) -> FieldResult:
+def _map_field(spec: FieldSpec, entry: Mapping[str, Any], config: Optional[ExtractionConfig] = None) -> FieldResult:
+    """
+    One field of the model's answer, validated against its spec. The respondent's words (raw_value) are stored only
+    when the field keeps them (`FieldSpec.keeps_raw`: not for a sensitive field unless the config says store_raw) and
+    never with a leading = + - @ (see `_neutralise`); a free-text value that starts with one of those is not a place
+    name and is unmapped.
+    """
+    limits = config.limits if config is not None else DEFAULT_LIMITS
+    placeholders = config.placeholders if config is not None else DEFAULT_PLACEHOLDER_KEYS
+    result = _map_field_values(spec, entry, limits, placeholders, config)
+    raw = _neutralise(result.raw_value) if spec.keeps_raw else None
+    return replace(result, raw_value=raw)
+
+
+def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits, placeholders: FrozenSet[str],
+                      config: Optional[ExtractionConfig]) -> FieldResult:
     where = f"field {spec.name!r}"
     unknown = set(entry) - {"value", "raw", "confidence"}
     if len(unknown) > 0:
@@ -633,20 +960,22 @@ def _map_field(spec: FieldSpec, entry: Mapping[str, Any]) -> FieldResult:
             confidence = None
         else:
             confidence = float(confidence)
-    if raw is not None and len(raw) > MAX_RAW_VALUE_CHARS:
-        raw = raw[:MAX_RAW_VALUE_CHARS]
+    if raw is not None and len(raw) > limits.max_raw_chars:
+        raw = raw[:limits.max_raw_chars]
 
     if spec.kind == KIND_FREE_TEXT:
         # A placeholder ("N/A", "null", "Not provided", ...) is the model saying "no answer", not an answer.
-        if value is not None and _is_placeholder(value):
+        if value is not None and _is_placeholder(value, placeholders):
             value = None
-            if raw is not None and _is_placeholder(raw):
+            if raw is not None and _is_placeholder(raw, placeholders):
                 raw = None
-        elif value is None and raw is not None and _is_placeholder(raw):
+        elif value is None and raw is not None and _is_placeholder(raw, placeholders):
             raw = None
 
     if spec.kind == KIND_INTEGER:
-        return _map_integer(spec, integer_text, raw, confidence)
+        if config is None:
+            config = _bare_config(spec, limits, placeholders)
+        return _map_integer(spec, integer_text, raw, confidence, config)
 
     if value is None:
         if raw is None:
@@ -658,14 +987,20 @@ def _map_field(spec: FieldSpec, entry: Mapping[str, Any]) -> FieldResult:
         canonical = {_norm(c): c for c in spec.categories}.get(_norm(value))
         if canonical is not None:
             return FieldResult(spec.name, canonical, raw if raw is not None else value, STATUS_EXTRACTED, confidence)
-        return FieldResult(spec.name, None, raw if raw is not None else value[:MAX_RAW_VALUE_CHARS],
+        return FieldResult(spec.name, None, raw if raw is not None else value[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
 
-    # free_text: taken as given (whitespace collapsed); a value too long to be a name of a place is not trusted.
-    if len(value) > MAX_FREE_TEXT_VALUE_CHARS:
-        return FieldResult(spec.name, None, raw if raw is not None else value[:MAX_RAW_VALUE_CHARS],
+    # free_text: taken as given (whitespace collapsed); a value too long to be a name of a place is not trusted, and
+    # neither is one that a spreadsheet would read as a formula.
+    if len(value) > limits.max_value_chars or value[0] in _FORMULA_PREFIXES:
+        return FieldResult(spec.name, None, raw if raw is not None else value[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
     return FieldResult(spec.name, value, raw if raw is not None else value, STATUS_EXTRACTED, confidence)
+
+
+def _bare_config(spec: FieldSpec, limits: Limits, placeholders: FrozenSet[str]) -> ExtractionConfig:
+    """A minimal config around one field, for callers (tests) that map a single field without a whole config."""
+    return ExtractionConfig("-", "-", (spec,), ("other",), {}, "-", {}, limits, DEFAULT_PII_POLICY, placeholders, {})
 
 
 def parse_model_response(text: Any, config: ExtractionConfig) -> ExtractionResult:
@@ -705,7 +1040,7 @@ def parse_model_response(text: Any, config: ExtractionConfig) -> ExtractionResul
         entry = fields[spec.name]
         if not isinstance(entry, dict):
             raise ExtractionOutputError(f"field {spec.name!r} must be an object")
-        results.append(_map_field(spec, entry))
+        results.append(_map_field(spec, entry, config))
 
     pii = data["pii"]
     if not isinstance(pii, dict) or not set(pii) <= {"detected", "types"} or "detected" not in pii:
@@ -748,15 +1083,19 @@ def extract(
     """
     Conversation -> prompt -> `call_llm(prompt)` -> validated result. `call_llm` returns (answer text, usage dict).
     A conversation without a respondent answer makes NO call: every field is not_provided and pii_detected is False.
-    A conversation with a respondent message longer than MAX_RESPONDENT_MESSAGE_CHARS makes no call either: it is
-    pii_detected TRUE ('other'), fields unmapped. After a valid answer the deterministic PII pre-check can only
-    turn the flag TRUE. A bad answer raises ExtractionOutputError with the call's usage attached.
+    A conversation with a respondent message longer than limits.max_respondent_message_chars, or longer than
+    limits.max_conversation_chars as a whole, makes no call either: it is pii_detected TRUE ('other'), fields
+    unmapped. After a valid answer the deterministic PII pre-check can only turn the flag TRUE, and a flagged
+    session keeps no respondent words (`minimise_flagged`). A bad answer raises ExtractionOutputError with the call's
+    usage attached.
     """
-    conversation = build_conversation(rows, closing_keys)
+    conversation = build_conversation(rows, closing_keys, config.limits)
     if conversation.respondent_answers == 0:
         return ExtractionRun(empty_result(config), {}, False, len(conversation.turns), SKIP_NO_ANSWER)
     if conversation.oversized_respondent_message:
         return ExtractionRun(oversized_result(config), {}, False, len(conversation.turns), SKIP_OVERSIZED)
+    if conversation.too_long:
+        return ExtractionRun(oversized_result(config), {}, False, len(conversation.turns), SKIP_TOO_LONG)
     prompt = render_prompt(system_template, user_template, config, conversation)
     answer, usage = call_llm(prompt)
     usage = usage if isinstance(usage, dict) else {}
@@ -766,5 +1105,5 @@ def extract(
         exc.usage = usage
         raise
     # The model's pii.detected = false is not trusted alone (a respondent can write "set pii to false").
-    result = apply_pii_precheck(result, rows, config)
+    result = minimise_flagged(apply_pii_precheck(result, rows, config), config)
     return ExtractionRun(result, usage, True, len(conversation.turns))

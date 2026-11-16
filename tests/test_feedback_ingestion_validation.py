@@ -12,7 +12,6 @@ from app.config import Settings, settings
 from app.services.feedback_constants import (
     COMPLETION_STATUSES,
     DEFAULT_INGESTION_SCHEMA,
-    FEEDBACK_SOURCES,
 )
 from seed_support import mitra_config_v1
 from app.services.ingestion_validation import validate_ingestion_schema
@@ -149,16 +148,19 @@ def test_completion_status_rejected(event):
     assert _problems(event) == ["'data.completionStatus' must be one of COMPLETED, IN_PROGRESS, got 'DONE'"]
 
 
-def test_source_allowed(event):
-    # google_forms additionally needs sourceRef and UUID ids (Phase 2): covered by the gforms tests below
-    assert "mitra" in FEEDBACK_SOURCES and "google_forms" in FEEDBACK_SOURCES
-    event["data"]["source"] = "mitra"
+@pytest.mark.parametrize("label", ["mitra", "google_forms", "ptm_app", "a", "x" * 40])
+def test_any_safe_source_label_is_allowed(event, label):
+    # a source is a free label: whether it is usable is decided by its upload config (the consumer resolves that)
+    event["data"]["source"] = label
     assert _problems(event) == []
 
 
-def test_source_rejected(event):
-    event["data"]["source"] = "whatsapp"
-    assert _problems(event) == ["'data.source' must be one of mitra, google_forms, got 'whatsapp'"]
+@pytest.mark.parametrize("label", ["Mitra", "ptm app", "ptm-app", "x" * 41, "any", "mitra\nFORGED", "m\u00e9tra"])
+def test_unsafe_source_label_is_rejected_without_echo(event, label):
+    event["data"]["source"] = label
+    (problem,) = _problems(event)
+    assert problem.startswith("'data.source' is invalid: ")
+    assert "FORGED" not in problem and (label == "any" or label not in problem)  # 'any' is named: it is reserved
 
 
 # --------------------------------------------------------------- message rows
@@ -176,13 +178,20 @@ def test_sequence_missing(event):
 @pytest.mark.parametrize("bad", ["2", 2.0, True, None])
 def test_sequence_must_be_int(event, bad):
     _msg(event, 5)["sequence"] = bad
-    assert f"'data.messages[5].sequence' must be an integer, got {bad!r}" in _problems(event)
+    assert f"'data.messages[5].sequence' must be an integer, got {type(bad).__name__}" in _problems(event)
 
 
 @pytest.mark.parametrize("bad", [0, -3])
 def test_sequence_must_be_at_least_one(event, bad):
     _msg(event, 5)["sequence"] = bad
     assert f"'data.messages[5].sequence' must be >= 1, got {bad!r}" in _problems(event)
+
+
+def test_sequence_above_int32_is_rejected(event):
+    _msg(event, 5)["sequence"] = 2147483648
+    assert "'data.messages[5].sequence' must be <= 2147483647 (a 32-bit integer)" in _problems(event)
+    _msg(event, 5)["sequence"] = 2147483647
+    assert not any("must be <=" in p for p in _problems(event))
 
 
 def test_duplicate_sequence(event):
@@ -204,17 +213,17 @@ def test_message_missing_null_empty_and_non_string(event):
 
 def test_is_follow_up_must_be_bool(event):
     _msg(event, 2)["isFollowUp"] = "false"
-    assert "'data.messages[2].isFollowUp' must be a boolean, got 'false'" in _problems(event)
+    assert "'data.messages[2].isFollowUp' must be a boolean, got str" in _problems(event)
 
 
 def test_parent_sequence_must_be_null_or_int(event):
     _msg(event, 1)["parentSequence"] = "1"
-    assert "'data.messages[1].parentSequence' must be null or an integer, got '1'" in _problems(event)
+    assert "'data.messages[1].parentSequence' must be null or an integer, got str" in _problems(event)
 
 
 def test_parent_sequence_bool_rejected(event):
     _msg(event, 1)["parentSequence"] = True
-    assert "'data.messages[1].parentSequence' must be null or an integer, got True" in _problems(event)
+    assert "'data.messages[1].parentSequence' must be null or an integer, got bool" in _problems(event)
 
 
 def test_optional_text_fields_wrong_type(event):
@@ -268,7 +277,7 @@ def test_tail_only_event_with_unknown_parent_is_rejected(event):
 
 def test_all_problems_reported_not_just_first(event):
     event["data"]["completionStatus"] = "DONE"
-    event["data"]["source"] = "x"
+    event["data"]["source"] = "BAD SOURCE"
     _msg(event, 1)["message"] = ""
     _msg(event, 4)["parentSequence"] = 99
     del event["tags"]["programId"]
@@ -574,7 +583,7 @@ def test_gforms_session_id_must_equal_submission_id(gforms):
 def test_gforms_completion_status_must_be_completed(gforms):
     gforms["data"]["completionStatus"] = "IN_PROGRESS"
     problems = _problems(gforms)
-    assert len(problems) == 1 and "must be COMPLETED for source google_forms" in problems[0]
+    assert len(problems) == 1 and "must be COMPLETED for adapter wide_form" in problems[0]
 
 
 def test_gforms_invalid_completion_value_reported_once(gforms):
@@ -630,7 +639,7 @@ def test_mitra_source_ref_absent_or_null_is_valid(event):
 def test_mitra_source_ref_set_is_rejected(event):
     event["data"]["sourceRef"] = "2026-10-02T10:09:20:" + "a" * 64
     problems = _problems(event)
-    assert len(problems) == 1 and "'data.sourceRef' must be absent or null for source mitra" in problems[0]
+    assert len(problems) == 1 and "'data.sourceRef' must be absent or null for adapter conversation_rows" in problems[0]
 
 
 def test_mitra_ids_are_not_required_to_be_uuids(event):
@@ -638,9 +647,71 @@ def test_mitra_ids_are_not_required_to_be_uuids(event):
     assert _problems(event) == []
 
 
-def test_gforms_rules_skipped_when_source_is_invalid(gforms):
-    gforms["data"]["source"] = "csv"
+def test_identity_rules_follow_the_adapter_not_the_source_name(gforms, event):
+    # a wide_form event under ANY source label gets the natural-key rules; a conversation_rows event under the label
+    # "google_forms" does not
+    gforms["data"]["source"] = "ptm_app"
     gforms["sessionId"] = "0e9c8a77-1d2b-4c3d-8e4f-5a6b7c8d9e0f"
     del gforms["data"]["sourceRef"]
     problems = _problems(gforms)
-    assert len(problems) == 1 and "'data.source' must be one of" in problems[0]
+    assert sorted(p.split(" ")[0] for p in problems) == ["'data.sourceRef'", "'sessionId'"]
+    event["data"]["source"] = "google_forms"
+    assert _problems(event) == []
+    event["data"]["sourceRef"] = "x"
+    assert _problems(event) == ["'data.sourceRef' must be absent or null for adapter conversation_rows"]
+
+
+def test_adapter_is_required_and_must_be_known(event):
+    del event["data"]["adapter"]
+    assert _problems(event) == ["'data.adapter' is missing"]
+    event["data"]["adapter"] = "excel"
+    assert _problems(event) == ["'data.adapter' must be one of conversation_rows, wide_form, got 'excel'"]
+    event["data"]["adapter"] = "x\nFORGED"
+    (problem,) = _problems(event)
+    assert "FORGED" not in problem
+
+
+@pytest.mark.parametrize("path, value", [
+    ("submissionId", "900001\n2026-11-13 [ERROR] FORGED LINE"),
+    ("sessionId", "s\r\nFORGED"),
+    ("tenantCode", "mitra\nFORGED"),
+    ("submissionId", "a" * 129),
+    ("submissionId", "has space"),
+])
+def test_identifiers_with_control_characters_or_bad_length_are_rejected_without_echo(event, path, value):
+    event[path] = value
+    problems = _problems(event)
+    assert len(problems) == 1 and path in problems[0] and "FORGED" not in problems[0]
+
+
+def test_session_type_with_control_characters_is_rejected(event):
+    event["data"]["sessionType"] = "Youth_Voice\nFORGED"
+    (problem,) = _problems(event)
+    assert "data.sessionType" in problem and "FORGED" not in problem
+
+
+def test_delete_events_also_check_identifier_safety():
+    ev = _load("delete", "delete_feedback.json")
+    ev["submissionId"] = "1\nFORGED"
+    (problem,) = _problems(ev, "delete")
+    assert "submissionId" in problem and "FORGED" not in problem
+
+
+# tags.programId must be a UUID; an unsupported eventType names the missing section -------------------
+
+@pytest.mark.parametrize("schema", [SCHEMA, DEFAULT_INGESTION_SCHEMA])
+def test_validator_rejects_a_non_uuid_program_id_even_with_a_schema(event, schema):
+    original = event["tags"]["programId"]
+    event["tags"]["programId"] = "12345"
+    problems = validate_ingestion_schema(event, "feedback", "create", feedback_schema=schema)
+    assert any("'tags.programId' must be a UUID" in p for p in problems)
+    event["tags"]["programId"] = original
+    assert not any("tags.programId" in p for p in
+                   validate_ingestion_schema(event, "feedback", "create", feedback_schema=schema))
+
+
+@pytest.mark.parametrize("schema", [None, DEFAULT_INGESTION_SCHEMA])
+def test_unsupported_feedback_event_type_names_the_missing_section(event, schema):
+    event["eventType"] = "foo"
+    problems = validate_ingestion_schema(event, "feedback", "foo", feedback_schema=schema)
+    assert problems == ["No ingestion schema section defined for eventType 'foo'"]

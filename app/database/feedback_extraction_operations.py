@@ -3,7 +3,7 @@ Database side of the feedback metadata extraction, shared by the Temporal activi
 (app/temporal/feedback_extraction_activity.py) and the CLI (tools/run_feedback_extraction.py).
 
 `extract_submission` is the one entry point: it loads a stored session, its active extraction config version and
-the active prompt version the config selects (`prompt_name`, else the generic prompt), makes ONE LLM call with no database connection held, and (unless it is a dry run)
+the active prompt version the config selects (`prompt_name`, required), makes ONE LLM call with no database connection held, and (unless it is a dry run)
 writes the field rows, the PII flag and the llm log in ONE transaction. Re-running a session overwrites its rows.
 Nothing in here logs or stores conversation text; error messages carry no respondent text and no provider text.
 
@@ -32,13 +32,25 @@ from app.services.feedback_extraction import (
     extract,
     parse_extraction_config,
 )
-from app.services.feedback_extraction_constants import ANALYSIS_TYPE, CONFIG_TYPE_FEEDBACK_EXTRACTION, PROMPT_NAME
+from app.services.feedback_extraction_constants import (
+    ACTIVITY_MARGIN_SECONDS,
+    ANALYSIS_TYPE,
+    CONFIG_TYPE_FEEDBACK_EXTRACTION,
+)
 from app.services.llm import split_llm_usage
 
 logger = logging.getLogger("analytics_service.feedback_extraction")
 
 # openrouter_chat_completion(prompt, *, model, max_tokens, timeout) -> (text, usage)
 LlmFunction = Callable[..., Tuple[str, Dict[str, Any]]]
+
+
+class ExtractionSetupError(RuntimeError):
+    """
+    A deterministic setup problem: no extraction config for the session, a prompt that does not exist or has no active
+    version, an LLM timeout the activity budget cannot hold. Retrying cannot fix it (the activity reports it as
+    non-retryable). The message names configuration, never data.
+    """
 
 
 class StaleExtractionError(RuntimeError):
@@ -49,7 +61,12 @@ class LlmCallError(RuntimeError):
     """
     The LLM call failed. The message holds ONLY the exception class name and, when it could be read from the
     message prefix, the HTTP status: the provider's error body (which can echo the prompt) is dropped.
+    `status` is that HTTP status (None for a timeout or connection error).
     """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 _HTTP_STATUS_RE = re.compile(r"^[^:]{0,100}?\bHTTP (\d{3})\b")
@@ -61,7 +78,7 @@ def sanitize_llm_error(exc: BaseException) -> LlmCallError:
     match = _HTTP_STATUS_RE.match(str(exc))
     if match is not None:
         detail += f", HTTP {match.group(1)}"
-    return LlmCallError(f"LLM call failed ({detail})")
+    return LlmCallError(f"LLM call failed ({detail})", int(match.group(1)) if match is not None else None)
 
 
 def rows_fingerprint(rows) -> str:
@@ -102,7 +119,7 @@ def _as_json(value: Any) -> Any:
 async def load_prompt_by_name(conn, name: str) -> Dict[str, Any]:
     """
     The ACTIVE prompt version of the prompts row whose name is exactly `name`: the highest `version` among its
-    is_active versions. Raises RuntimeError when the name does not exist, has no active version, or the prompt is not
+    is_active versions. Raises ExtractionSetupError (a RuntimeError) when the name does not exist, has no active version, or the prompt is not
     a feedback_metadata_extraction prompt (a config must not point at, for example, a theme prompt). The message
     names the prompt (configuration), never data.
     """
@@ -110,9 +127,9 @@ async def load_prompt_by_name(conn, name: str) -> Dict[str, Any]:
         raise ValueError("prompt name must be a non-empty string")
     prompt = await conn.fetchrow("SELECT id, analysis_type FROM prompts WHERE name = $1", name)
     if prompt is None:
-        raise RuntimeError(f"No prompt named {name!r} exists in the database.")
+        raise ExtractionSetupError(f"No prompt named {name!r} exists in the database.")
     if prompt["analysis_type"] != ANALYSIS_TYPE:
-        raise RuntimeError(
+        raise ExtractionSetupError(
             f"Prompt {name!r} has analysis_type {prompt['analysis_type']!r}, not {ANALYSIS_TYPE!r}.")
     row = await conn.fetchrow(
         """
@@ -125,7 +142,7 @@ async def load_prompt_by_name(conn, name: str) -> Dict[str, Any]:
         prompt["id"],
     )
     if row is None:
-        raise RuntimeError(f"Prompt {name!r} has no active prompt version.")
+        raise ExtractionSetupError(f"Prompt {name!r} has no active prompt version.")
     resolved = dict(row)
     resolved["name"] = name
     return resolved
@@ -133,19 +150,21 @@ async def load_prompt_by_name(conn, name: str) -> Dict[str, Any]:
 
 async def load_prompt_for_config(conn, config: ExtractionConfig) -> Dict[str, Any]:
     """
-    The prompt a persona's extraction config selects: its `prompt_name` when the config has one (a name that does not
-    resolve fails loudly, there is NO fallback to the generic prompt), else the generic PROMPT_NAME prompt.
+    The prompt a program's extraction config selects: its `prompt_name` (required by the config parser). A name that
+    does not resolve fails loudly; there is no fallback to any other prompt.
     """
-    name = config.prompt_name if config.prompt_name is not None else PROMPT_NAME
-    return await load_prompt_by_name(conn, name)
+    if config.prompt_name is None:
+        raise ExtractionSetupError("the extraction config names no prompt (prompt_name is required)")
+    return await load_prompt_by_name(conn, config.prompt_name)
 
 
 async def load_extraction_config(conn, tenant_code: str, session_type: str, program_id: Any, source: str) -> Dict[str, Any]:
     """
     The active version of the extraction config of a session: config_type 'feedback_extraction', the session's
-    session_type, config_source 'any' or the session's own source. Like the upload config lookup it falls back: the
-    config of the session's exact program wins, else a program-less one, else any config of the persona (a session
-    in another program still resolves); then a source-specific config beats 'any', then the highest version.
+    session_type, config_source 'any' or the session's own source, and the session's EXACT program or, failing
+    that, the persona's program-less default of the tenant. A config of another program is never used (a second
+    program that reuses a persona name must have its own extraction config; without one the session fails loudly).
+    Among the candidates the exact program wins, then a source-specific config over 'any', then the highest version.
     Returns {id, config_id, version, config: ExtractionConfig}; raises when there is none or it is malformed.
     """
     row = await conn.fetchrow(
@@ -155,44 +174,63 @@ async def load_extraction_config(conn, tenant_code: str, session_type: str, prog
         JOIN config_version cv ON cv.config_id = c.id AND cv.is_active
         WHERE c.config_type = $1 AND c.tenant_code = $2 AND c.session_type = $3
           AND c.config_source IN ('any', $4)
-        ORDER BY (c.program_id IS NOT DISTINCT FROM $5::uuid) DESC, (c.program_id IS NULL) DESC,
-                 (c.config_source = $4) DESC, cv.version DESC, c.id
+          AND (c.program_id = $5::uuid OR c.program_id IS NULL)
+        ORDER BY (c.program_id IS NOT NULL) DESC, (c.config_source = $4) DESC, cv.version DESC, c.id
         LIMIT 1
         """,
         CONFIG_TYPE_FEEDBACK_EXTRACTION, tenant_code, session_type, source, program_id,
     )
     if row is None:
-        raise RuntimeError(
-            f"No active {CONFIG_TYPE_FEEDBACK_EXTRACTION} config for session_type {session_type!r} "
-            f"(tenant {tenant_code!r}); seed it or create one."
+        raise ExtractionSetupError(
+            f"No active {CONFIG_TYPE_FEEDBACK_EXTRACTION} config for session_type {session_type!r} in the session's "
+            f"program (tenant {tenant_code!r}); create one for that program (or a program-less default)."
         )
     config = parse_extraction_config(_as_json(row["config"]))
     if config.session_type != session_type:
-        raise RuntimeError(
+        raise ExtractionSetupError(
             f"extraction config version {row['id']} is for session_type {config.session_type!r}, "
             f"not {session_type!r}."
         )
     return {"id": row["id"], "config_id": row["config_id"], "version": row["version"], "config": config}
 
 
-async def load_closing_keys(conn, tenant_code: str, session_type: str) -> List[str]:
-    """The thank-you / closing question keys of the persona's upload configs (Mitra and Google Forms)."""
-    rows = await conn.fetch(
+async def load_closing_keys(conn, tenant_code: str, session_type: str, program_id: Any, source: str) -> List[str]:
+    """
+    The thank-you / closing question keys of the upload config that applies to THIS session: the same tenant,
+    session_type and program (or the persona's program-less default) and the session's own source ('any' also
+    qualifies). Exactly one config is used (exact program, then own source over 'any', then the highest version):
+    the keys of another program or another source are never merged in.
+    """
+    row = await conn.fetchrow(
         """
         SELECT cv.config
         FROM config c
         JOIN config_version cv ON cv.config_id = c.id AND cv.is_active
         WHERE c.config_type = 'feedback_upload' AND c.tenant_code = $1 AND c.session_type = $2
+          AND c.config_source IN ('any', $3)
+          AND (c.program_id = $4::uuid OR c.program_id IS NULL)
+        ORDER BY (c.program_id IS NOT NULL) DESC, (c.config_source = $3) DESC, cv.version DESC, c.id
+        LIMIT 1
         """,
-        tenant_code, session_type,
+        tenant_code, session_type, source, program_id,
     )
+    if row is None:
+        return []
+    config = _as_json(row["config"])
+    found = config.get("closing_keys") if isinstance(config, dict) else None
     keys: List[str] = []
-    for row in rows:
-        config = _as_json(row["config"])
-        found = config.get("closing_keys") if isinstance(config, dict) else None
-        if isinstance(found, list):
-            keys.extend(k for k in found if isinstance(k, str) and k not in keys)
+    if isinstance(found, list):
+        keys.extend(k for k in found if isinstance(k, str) and k not in keys)
     return keys
+
+
+def persona_identity(session_type: Any, source: Any, program_id: Any) -> Tuple[Any, Any, Optional[str]]:
+    """
+    What selects the extraction config, the prompt and the closing keys of a session: session_type, source and
+    program. Compared (with the message fingerprint) under the write locks: a redelivery that moves a session to
+    another persona without touching its messages must not let the old persona's fields overwrite it.
+    """
+    return (session_type, source, None if program_id is None else str(program_id))
 
 
 async def load_submission_inputs(conn, submission_id: str, tenant_code: str) -> Dict[str, Any]:
@@ -215,10 +253,11 @@ async def load_submission_inputs(conn, submission_id: str, tenant_code: str) -> 
     rows = await conn.fetch(_ROWS_SQL, submission_id, tenant_code)
     config_row = await load_extraction_config(
         conn, tenant_code, head["session_type"], head["program_id"], head["source"])
-    closing = await load_closing_keys(conn, tenant_code, head["session_type"])
+    closing = await load_closing_keys(conn, tenant_code, head["session_type"], head["program_id"], head["source"])
     return {
         "session_type": head["session_type"],
         "questionnaire_version": head["questionnaire_version"],
+        "identity": persona_identity(head["session_type"], head["source"], head["program_id"]),
         "rows": [dict(r) for r in rows],
         "fingerprint": rows_fingerprint(rows),
         "loaded_at": loaded_at,
@@ -240,11 +279,14 @@ async def save_extraction(
     prompt_version_id: Any,
     run_at: datetime,
     llm_log: Optional[Mapping[str, Any]] = None,
+    input_identity: Optional[Tuple[Any, Any, Optional[str]]] = None,
 ) -> None:
     """
-    ONE transaction: lock the feedback_submissions row, re-read the session and compare its fingerprint with
-    `input_fingerprint` (taken when the input was loaded); when it differs raise StaleExtractionError and write
-    nothing. Otherwise upsert one row per field (a re-run overwrites; a field that is no longer configured is
+    ONE transaction: lock the submissions row, then the feedback_submissions row (the order of the ingest path,
+    app/database/operations.py: submissions first), re-read the session and compare its fingerprint with
+    `input_fingerprint` (taken when the input was loaded) and, when `input_identity` is given (persona_identity of
+    the loaded session: session_type, source, program), the identity as well; when either differs raise
+    StaleExtractionError and write nothing. Otherwise upsert one row per field (a re-run overwrites; a field that is no longer configured is
     deleted), set feedback_submissions.pii_detected and merge the `extraction` object into its meta_data, and
     write the llm log (when the LLM was called). `run_at` is the time the input was loaded. The meta_data object
     holds ids, PII types and the time, no text. session_type / questionnaire_version are not copied into the rows.
@@ -258,19 +300,30 @@ async def save_extraction(
         "run_at": run_at.isoformat(),
     }
     async with conn.transaction():
-        # The ingest path takes this same row lock when it touches the session, so after this statement the
-        # messages cannot change until we commit.
-        locked = await conn.fetchval(
-            "SELECT 1 FROM feedback_submissions WHERE submission_id = $1 AND tenant_code = $2 FOR UPDATE",
+        # The ingest path takes these same row locks, in this same order (submissions, then feedback_submissions),
+        # when it touches the session, so after these statements the messages and the persona cannot change
+        # until we commit.
+        master = await conn.fetchrow(
+            "SELECT program_id FROM submissions WHERE submission_id = $1 AND tenant_code = $2 FOR NO KEY UPDATE",
             submission_id, tenant_code,
         )
-        if locked is None:
+        feedback = None if master is None else await conn.fetchrow(
+            "SELECT session_type, source FROM feedback_submissions WHERE submission_id = $1 AND tenant_code = $2 "
+            "FOR UPDATE",
+            submission_id, tenant_code,
+        )
+        if feedback is None:
             raise ValueError(f"submission {submission_id} (tenant {tenant_code}) is not a stored feedback session")
         current = rows_fingerprint(await conn.fetch(_ROWS_SQL, submission_id, tenant_code))
         if current != input_fingerprint:
             raise StaleExtractionError(
                 f"feedback session {submission_id} changed while its extraction was running; nothing was written, "
                 f"it must run again on the new content")
+        if input_identity is not None and persona_identity(
+                feedback["session_type"], feedback["source"], master["program_id"]) != input_identity:
+            raise StaleExtractionError(
+                f"feedback session {submission_id} was moved to another persona (session_type, source or program) "
+                f"while its extraction was running; nothing was written, it must run again for the new persona")
         await conn.execute(
             """
             INSERT INTO feedback_extracted_data (
@@ -391,6 +444,7 @@ async def extract_submission(
     llm_overrides: Optional[Mapping[str, Any]] = None,
     write: bool = True,
     mark_processing: bool = False,
+    activity_budget_seconds: Optional[int] = None,
 ) -> SubmissionOutcome:
     """
     Extracts the metadata of one stored feedback session.
@@ -404,6 +458,9 @@ async def extract_submission(
     no llm log is made. A failed LLM call or an invalid answer writes a 'failed' llm log (not on a dry run) and raises.
     A conversation without a respondent answer makes no LLM call (all fields not_provided, pii_detected FALSE). A
     failed LLM call raises LlmCallError carrying only the exception class and HTTP status, never the provider text.
+    A 'failed' llm log is written only when a call was really made: a setup or prompt error before the call is not
+    logged (and costs nothing). `activity_budget_seconds` (the Temporal activity's start_to_close_timeout, when run as
+    an activity) makes an effective LLM timeout that does not fit the budget an ExtractionSetupError before any call.
     """
     if llm_function is None:
         from app.services.llm import openrouter_chat_completion
@@ -417,10 +474,17 @@ async def extract_submission(
         config: ExtractionConfig = inputs["config_row"]["config"]
         prompt = await load_prompt_for_config(conn, config)
     llm = resolve_llm_settings(config, overrides)
+    if activity_budget_seconds is not None and llm["timeout"] + ACTIVITY_MARGIN_SECONDS > activity_budget_seconds:
+        raise ExtractionSetupError(
+            f"the effective LLM timeout ({llm['timeout']} s) does not fit the activity budget "
+            f"({activity_budget_seconds} s); set llm_timeout_seconds on the workflow step")
     prompt_version_id = prompt["id"]
     config_version_id = inputs["config_row"]["id"]
 
+    called = {"made": False}
+
     def call_llm(text: str) -> Tuple[str, Dict[str, Any]]:
+        called["made"] = True
         try:
             return llm_function(text, model=llm["model"], max_tokens=llm["max_tokens"], timeout=llm["timeout"])
         except Exception as exc:  # noqa: BLE001
@@ -435,7 +499,7 @@ async def extract_submission(
             inputs["closing_keys"],
         )
     except Exception as exc:
-        if write:
+        if write and called["made"]:
             await _log_failed_call(pool, submission_id, tenant_code, llm["model"], prompt_version_id, exc,
                                    getattr(exc, "usage", {}))
         raise
@@ -449,19 +513,25 @@ async def extract_submission(
                 "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "status": "success",
                 "meta_data": usage_meta if len(usage_meta) > 0 else None,
             }
+        stale: Optional[StaleExtractionError] = None
         async with pool.acquire() as conn:
             try:
                 await save_extraction(
                     conn, submission_id=submission_id, tenant_code=tenant_code,
-                    input_fingerprint=inputs["fingerprint"],
+                    input_fingerprint=inputs["fingerprint"], input_identity=inputs["identity"],
                     result=run.result, config_version_id=config_version_id, prompt_version_id=prompt_version_id,
                     run_at=inputs["loaded_at"], llm_log=llm_log,
                 )
             except StaleExtractionError as exc:
-                # Nothing was written (the transaction rolled back). The call still cost tokens: log it as failed.
-                if run.llm_called:
-                    await _log_failed_call(pool, submission_id, tenant_code, llm["model"], prompt_version_id, exc, run.usage)
-                raise
+                stale = exc
+        if stale is not None:
+            # Nothing was written (the transaction rolled back). The call still cost tokens: log it as failed.
+            # This runs AFTER the connection above went back to the pool: _log_failed_call takes its own, and
+            # holding one while waiting for another would deadlock a pool whose connections all hold a stale result.
+            if run.llm_called:
+                stale.usage = dict(run.usage)   # for the callers that total the usage of failed sessions (the CLI)
+                await _log_failed_call(pool, submission_id, tenant_code, llm["model"], prompt_version_id, stale, run.usage)
+            raise stale
     return SubmissionOutcome(
         submission_id, tenant_code, inputs["session_type"], inputs["questionnaire_version"], run, llm["model"],
         config_version_id, prompt_version_id, write, {f.name: f.kind for f in config.fields}, prompt["name"],

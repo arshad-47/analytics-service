@@ -10,13 +10,50 @@ asyncio.run() rather than pytest-asyncio.
 """
 import csv
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
+# ---------------------------------------------------------------------------
+# The settings the suite runs with, set BEFORE anything of the app is imported (app.config builds `settings` at
+# import time and also reads a `.env` in the working directory). An environment variable beats the `.env` file, so
+# these defaults make a fresh clone, CI and a developer machine behave the same: no test depends on the developer's
+# own values. `setdefault` keeps a value that was set on purpose in the shell (for example a different AUTH_TOKEN).
+# DATABASE_URL is a DSN nothing listens on, so a unit test can never reach a real database by accident (the opt-in
+# PG tests use the scratch databases of tests/pg_support.py instead).
+# ---------------------------------------------------------------------------
+TEST_ENVIRONMENT = {
+    "AUTH_TOKEN": "test-token",
+    "DATABASE_URL": "postgresql://test:test@127.0.0.1:1/unit_tests_never_connect",
+    "DATABASE_POOL_MIN_SIZE": "2",
+    "DATABASE_POOL_MAX_SIZE": "10",
+    "KAFKA_BOOTSTRAP_SERVERS": "localhost:9092",
+    "PROCESSING_MODE": "real-time",
+    "BATCH_SIZE": "100",
+    "ENVIRONMENT": "production",
+    "RESET_DB": "false",
+    "ENABLE_RETRY_CRON": "false",
+    "ENABLE_MIGRATION_CRON": "false",
+    "MAX_CSV_UPLOAD_BYTES": "10485760",
+    "OPENROUTER_API_KEY": "test-openrouter-key",
+    "OPENROUTER_BASE_URL": "https://openrouter.invalid/api/v1",
+    "LLM_TEMPERATURE": "0.0",
+    "LLM_MAX_TOKENS": "2048",
+    "LLM_TIMEOUT_SECONDS": "60",
+    "LLM_LOG_PAYLOADS": "false",
+    "STORAGE_PROVIDER": "gcp",
+    "STORAGE_PUBLIC_BUCKET": "",
+    "STORAGE_PRIVATE_BUCKET": "",
+    "LOG_LEVEL": "INFO",
+}
+for _name, _value in TEST_ENVIRONMENT.items():
+    os.environ.setdefault(_name, _value)
+
 import pytest
 
+import pg_support
 from app.services.storage.factory import clear_storage_cache
 
 
@@ -25,6 +62,35 @@ def reset_storage_cache():
     clear_storage_cache()
     yield
     clear_storage_cache()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def pg_scratch_database(request):
+    """
+    One fresh, empty scratch database per test module that has opt-in PG tests (see tests/pg_support.py): the
+    module's `DSN` / `DB_URL` global is pointed at it for the module's tests and the database is dropped afterwards.
+    FEEDBACK_TEST_DATABASE_URL only names the server. A module without such a global, or a run without the variable,
+    gets nothing (no connection is made).
+    """
+    names = pg_support.dsn_attributes(request.module)
+    if len(names) == 0:
+        yield None
+        return
+    try:
+        dsn = pg_support.create_scratch_database(request.module.__name__)
+    except pg_support.PgServerError as exc:
+        pytest.exit(f"{pg_support.ENV_VAR}: {exc}", returncode=3)
+    saved = {name: getattr(request.module, name) for name in names}
+    for name in names:
+        setattr(request.module, name, dsn)
+    pg_support.activate(dsn)
+    try:
+        yield dsn
+    finally:
+        pg_support.activate(None)
+        for name, value in saved.items():
+            setattr(request.module, name, value)
+        pg_support.drop_scratch_database(dsn)
 
 
 # Fake asyncpg pool/connection — used for every db.pool.acquire() call site.

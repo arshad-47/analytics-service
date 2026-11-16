@@ -3,40 +3,30 @@ Real-Postgres tests of the per-persona extraction content: the seeds (one config
 config's `prompt_name` resolves), the seeds never overwrite an edited config or prompt, and one whole extraction
 per persona with a FAKE LLM. The configs come from seed_config.sql (tests/seed_support.py).
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is the DSN of an EMPTY scratch database used by this file alone.
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards).
 No network, no real LLM. SYNTHETIC data only.
 """
 import asyncio
 import json
-import os
 import uuid
 
 import asyncpg
 import pytest
+import pg_support
 
-from app.database.db import SCHEMA_FILE, SEED_PROMPTS_FILE, db
+from app.database.db import SEED_PROMPTS_FILE, db
 from app.database.feedback_extraction_operations import extract_submission, load_prompt_for_config
 from app.database.operations import insert_or_update_submission
 from app.services import feedback_extraction as fx
-from app.services.feedback_extraction_constants import PROMPT_NAME
-from seed_support import PERSONAS, extraction_config_id, extraction_config_v1, seed_config
+PROMPT_NAME = "Feedback Metadata Extraction"   # the program-neutral template prompt of seed_prompts.sql (not a code default any more)
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, extraction_config_id, extraction_config_v1, seed_config
 
 # The persona prompts of seed_prompts.sql: the generic name, " - ", the persona name.
 PERSONA_PROMPT_NAMES = {persona: f"{PROMPT_NAME} - {persona}" for persona in PERSONAS}
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
-
-
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
 
 
 def _run(body):
@@ -45,7 +35,7 @@ def _run(body):
         conn = await asyncpg.connect(DSN)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'mitra'")
             await conn.execute("DELETE FROM config_version")
@@ -152,9 +142,9 @@ async def _add(conn, persona, messages):
     event = {
         "submissionId": sid, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback", "tenantCode": "mitra",
         "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": p["program_id"], "programName": "1M Voice", "leaderCategoryId": p["leader_category_id"],
+        "tags": {"programId": p["program_id"], "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": p["leader_category_id"],
                  "leaderCategoryName": persona, "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": p["session_type"], "questionnaireVersion": "V1", "language": "en",
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": p["session_type"], "questionnaireVersion": "V1", "language": "en",
                  "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T00:00:00+00:00", "messages": messages,
                  "botId": p["bot_id"]},
     }

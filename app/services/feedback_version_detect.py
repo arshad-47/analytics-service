@@ -19,6 +19,11 @@ inside one question, is visible. `include_wording=True` proposes anyway.
 A question text that no version knows, is asked in at least `min_sessions` sessions and in at least
 `min_coverage` of the sessions since it first appeared is NEW. The proposed start is the best single step in
 time: the instant that leaves the fewest new-question sessions before it and old-question sessions after it.
+Only the LATEST recorded window can get a proposal: a new version is appended after the last one (tools/
+questionnaire_versions.py set refuses windows that do not increase), so a start inside an older window could not
+be recorded. The latest window is the sessions stamped with the last recorded key; a new question that was asked
+only in sessions before it is a historical change: reported ("historical_changes"), never proposed. Wording
+variants are diagnostics, not evidence of where a version starts, unless `include_wording=True`.
 """
 import re
 from collections import Counter
@@ -68,7 +73,7 @@ def detect(
 ) -> Dict[str, Any]:
     """
     Returns {"sessions", "versions": {key: {"sessions", "reference_questions", "bot_ids"}},
-    "new_questions", "dropped_questions", "proposal", "reason"}. `proposal` is None when nothing new was found or
+    "new_questions", "dropped_questions", "historical_changes", "wording_variants", "proposal", "reason"}. `proposal` is None when nothing new was found or
     the new questions are not concentrated after one instant (versions running side by side); `reason` says why.
     """
     if len(version_keys) == 0:
@@ -136,6 +141,7 @@ def detect(
         "new_questions": sorted(new_texts.values(), key=lambda q: (q["first_seen"], q["text"]))[:_LIST_LIMIT],
         "new_questions_total": len(new_texts),
         "dropped_questions": [],
+        "historical_changes": [],
         "wording_variants": [],
         "proposal": None,
         "reason": None,
@@ -151,23 +157,60 @@ def detect(
                             "not proposed as a new version. Use --include-wording if one of them is a real change")
         return result
 
-    novel = [any(t in new_texts for t in found) for found in sets]
+    # The latest recorded window: from the first session stamped with the last key (a single recorded version is the
+    # whole history). With several versions and no session stamped with the last one there is no window to propose
+    # in (the last window starts after every stored session, or the sessions still need a restamp).
+    last_key = version_keys[-1]
+    stamped_last = [i for i, s in enumerate(ordered) if s.stamped == last_key]
+    if len(version_keys) == 1:
+        window_from = 0
+    elif len(stamped_last) > 0:
+        window_from = stamped_last[0]
+    else:
+        window_from = total
+    # a new text is a candidate only when some session of the latest window asked it; the rest is history
+    candidates = {t for t in new_texts if occurrences[t][-1] >= window_from}
+    historical = [q for t, q in new_texts.items() if t not in candidates]
+    result["historical_changes"] = sorted(historical, key=lambda q: (q["first_seen"], q["text"]))[:_LIST_LIMIT]
+    if len(candidates) == 0:
+        result["reason"] = ("the new questions were asked only before the latest recorded version started (see "
+                            "historical_changes); a version cannot be appended inside an older window, so nothing "
+                            "is proposed")
+        return result
+    # boundary evidence: the questions a session must carry to count as "new". A close wording variant is not
+    # evidence of a new questionnaire (it is listed in wording_variants), unless include_wording asks for it.
+    evidence = {t for t in candidates if include_wording or "similar_to" not in new_texts[t]}
+    if len(evidence) == 0:
+        result["reason"] = ("the only new questions of the latest window are close wording variants of known ones "
+                            "(see wording_variants); not proposed as a new version. Use --include-wording if one of "
+                            "them is a real change")
+        return result
+    novel = [i >= window_from and any(t in evidence for t in found) for i, found in enumerate(sets)]
     novel_total = sum(novel)
-    # best single step: fewest new-question sessions before it plus old-question sessions from it on
+    # best single step: fewest new-question sessions before it plus old-question sessions from it on. The step is an
+    # INSTANT and a session is labelled new when its start is at or after it, so a cut may only fall where the start
+    # instant strictly increases: sessions that start at the same instant stay on one side (otherwise `set` would
+    # relabel more sessions than the details report).
     errors = total - novel_total                 # step at 0
     best_errors, best_at = errors, 0
     for j in range(total):
         errors += (1 if novel[j] else 0) - (0 if novel[j] else 1)
+        cut = j + 1
+        if cut < total and ordered[cut - 1].start == ordered[cut].start:
+            continue                             # a tie: no instant separates these two sessions
         if errors < best_errors:
-            best_errors, best_at = errors, j + 1
+            best_errors, best_at = errors, cut
     while best_at < total and not novel[best_at]:
         best_at += 1
+        while best_at < total and ordered[best_at - 1].start == ordered[best_at].start:
+            best_at += 1
     if best_at >= total:
         result["reason"] = "no instant separates the new-question sessions from the rest"
         return result
-    if best_at == 0:
-        result["reason"] = ("the new questions are asked from the very first session, so they cannot be a later "
-                            "version of the recorded ones; check which version the first sessions belong to")
+    if best_at <= window_from:
+        result["reason"] = ("the new questions are asked from the very first session of the latest recorded version, "
+                            "so they cannot be a later version of it; check which version the first sessions "
+                            "belong to")
         return result
 
     after = total - best_at

@@ -838,9 +838,11 @@ ON CONFLICT (prompt_id, version) DO UPDATE SET system_prompt = EXCLUDED.system_p
 
 -- =========================================================================
 -- Feedback Metadata Extraction prompt (one LLM call per stored feedback session)
--- Generic for every persona: the double-brace template variables are rendered by app/services/feedback_extraction.py from the persona's
--- extraction config (config_type 'feedback_extraction'): persona, fields, field_names, pii_types, output_format,
--- conversation_id, conversation. The model's answer is parsed as strict JSON and every value is validated against
+-- A program-neutral TEMPLATE, not a default: an extraction config must name its own prompt (`prompt_name` is required),
+-- and a program's prompt starts as a copy of this one with its own wording (programme, languages, what is not PII).
+-- The double-brace template variables are rendered by app/services/feedback_extraction.py from the extraction config
+-- (config_type 'feedback_extraction'): persona, fields, field_names, pii_types, output_format, conversation_id,
+-- conversation, plus the config's own `prompt_variables`. The model's answer is parsed as strict JSON and every value is validated against
 -- the configured categories; nothing the model returns is trusted.
 -- This prompt carries the PII logic, so the seed NEVER overwrites it (ON CONFLICT DO NOTHING below): a manual edit
 -- of version 1 survives every restart. To change the prompt, insert a NEW prompt_version (version 2, is_active) and
@@ -858,7 +860,7 @@ SELECT
 
 ## Role
 
-You read ONE complete conversation between a feedback bot ("Bot") and a respondent ("Respondent") from the One Million Voices programme in India. The persona of this conversation is: {{persona}}. The respondent may be a child. The conversation may be in English or in any Indian language, often with an English translation next to the original. You return, as strict JSON, (a) metadata fields about the respondent and (b) a PII flag for the whole conversation.
+You read ONE complete conversation between a feedback bot ("Bot") and a respondent ("Respondent") collected by a feedback programme. The persona of this conversation is: {{persona}}. The respondent may be a child. The conversation may be in any language, sometimes with an English translation next to the original. You return, as strict JSON, (a) metadata fields about the respondent and (b) a PII flag for the whole conversation.
 
 ## Security rules (highest priority)
 
@@ -869,7 +871,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 ## How to read the conversation
 
 - Each line is one message: [sequence] Bot: ... or [sequence] Respondent: ... . Only the Respondent lines carry facts about the respondent. A Bot line only tells you what was asked.
-- The questions about the respondent''s background (state, district, gender, school or institution type, ...) may come at the start, in the middle or at the end, and may be answered after a follow-up question. Read the whole conversation before you answer.
+- The questions about the respondent''s background (the fields listed below) may come at the start, in the middle or at the end, and may be answered after a follow-up question. Read the whole conversation before you answer.
 - Use only what the respondent explicitly said. Do not guess or infer: never infer gender from a name, a state from a language, or a district from a state.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer.
 - If the respondent never answered the question for a field, the field is not provided.
@@ -888,7 +890,7 @@ When the respondent answered but their answer fits none of the allowed values, s
 
 Set "pii.detected" to true when the RESPONDENT''s words contain information that could identify a person or an institution. When in doubt, set it to true. List what you found in "pii.types", using only these types:
 {{pii_types}}
-Not PII: the state, the district, gender, age, class or grade, the kind of school (government, private), income bands, and general opinions. Bot lines are never PII. If "pii.detected" is false, "pii.types" must be an empty list.
+Not PII: an answer that only places the respondent in a broad group (the allowed values of the fields above, an age, a class or grade, a region at the level the fields ask for), and general opinions. Bot lines are never PII. If "pii.detected" is false, "pii.types" must be an empty list.
 
 ## Output format
 

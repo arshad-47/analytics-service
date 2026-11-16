@@ -6,12 +6,14 @@ from typing import Dict, Any, Optional, List
 import asyncpg
 from datetime import datetime, timezone
 
+from app.services.feedback_adapter_config import is_safe_code, is_safe_id, source_label_problem
 from app.services.feedback_constants import (
+    ADAPTERS,
     COMPLETION_COMPLETED,
     COMPLETION_STATUSES,
     FEEDBACK_REPORT_TYPE,
-    FEEDBACK_SOURCES,
-    SOURCE_GOOGLE_FORMS,
+    MAX_SEQUENCE,
+    NATURAL_KEY_ADAPTERS,
 )
 
 logger = logging.getLogger("analytics_service.operations")
@@ -146,19 +148,33 @@ async def insert_statement_with_parent_check(
         logger.info(f"Statement [{new_id}] stored with no duplicate found.")
 
 
+class TenantOwnershipError(ValueError):
+    """An event names a leader category / program id that already belongs to ANOTHER tenant."""
+
+
+def _no_row_written(command_tag: Any) -> bool:
+    """True when an INSERT ... ON CONFLICT DO UPDATE ... WHERE ran but wrote no row (command tag 'INSERT 0 0'): the
+    conflicting row exists and its WHERE (same tenant) was false."""
+    return isinstance(command_tag, str) and command_tag.startswith("INSERT") and command_tag.endswith(" 0")
+
+
 async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant_code: str) -> tuple:
     """
     Safely upserts parent metadata tables: tenant, leader_category, and programs.
     Reads from the new top-level `tags` dict with flattened keys.
     Returns (program_id, leader_id) as UUIDs.
+
+    Tenant isolation: an existing tenant is never renamed (a first event only creates it), and the conflict update of
+    a leader category / program applies ONLY to a row of the same tenant. An event of tenant A that names an id owned
+    by tenant B raises TenantOwnershipError (nothing of B is changed) instead of renaming B's rows.
     """
-    # 1. Upsert Tenant
+    # 1. Create the tenant if it is new; never rename an existing one.
     tenant_name = tenant_code.capitalize()
     await conn.execute(
         """
         INSERT INTO tenant (name, code)
         VALUES ($1, $2)
-        ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
+        ON CONFLICT (code) DO NOTHING
         """,
         tenant_name, tenant_code
     )
@@ -169,40 +185,50 @@ async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant
     # 2. Upsert Leader Category (from flattened tags)
     leader_id = tags.get("leaderCategoryId")
     if leader_id:
-        await conn.execute(
+        result = await conn.execute(
             """
             INSERT INTO leader_category (id, name, description, tenant_code)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (id) DO UPDATE SET 
-                name = EXCLUDED.name, 
-                description = EXCLUDED.description, 
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
                 updated_at = now()
+            WHERE leader_category.tenant_code = EXCLUDED.tenant_code
             """,
             leader_id,
             tags.get("leaderCategoryName", ""),
-            None,  # TODO: description can be added once the PM provides it 
+            None,  # TODO: description can be added once the PM provides it
             tenant_code
         )
+        if _no_row_written(result):
+            raise TenantOwnershipError(
+                f"leaderCategoryId {leader_id} belongs to another tenant than {tenant_code!r}; rejecting the event."
+            )
 
     # 3. Upsert Programs (depends on leader category)
     program_id = tags.get("programId")
     if program_id and leader_id:
-        await conn.execute(
+        result = await conn.execute(
             """
             INSERT INTO programs (id, leaders_id, name, description, tenant_code)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id) DO UPDATE SET 
-                leaders_id = EXCLUDED.leaders_id, 
-                name = EXCLUDED.name, 
-                description = EXCLUDED.description, 
+            ON CONFLICT (id) DO UPDATE SET
+                leaders_id = EXCLUDED.leaders_id,
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
                 updated_at = now()
+            WHERE programs.tenant_code = EXCLUDED.tenant_code
             """,
             program_id,
             leader_id,
             tags.get("programName", ""),
-            None,  # TODO: description can be added once the PM provides it 
+            None,  # TODO: description can be added once the PM provides it
             tenant_code
         )
+        if _no_row_written(result):
+            raise TenantOwnershipError(
+                f"programId {program_id} belongs to another tenant than {tenant_code!r}; rejecting the event."
+            )
 
     return program_id, leader_id
 
@@ -280,7 +306,7 @@ def is_feedback_type(submission_type: Any) -> bool:
 
 
 class _FeedbackAlreadyStored(Exception):
-    """Internal signal: a Google Forms response with this source_ref is already stored. Raised inside the
+    """Internal signal: a natural-key (wide_form) response with this source_ref is already stored. Raised inside the
     transaction so everything written so far rolls back, then handled as a no-op by the caller."""
 
 
@@ -292,7 +318,7 @@ def _is_source_ref_violation(error: asyncpg.exceptions.UniqueViolationError) -> 
 async def _find_stored_gforms_response(
     conn: asyncpg.Connection, tenant_code: str, source_ref: str
 ) -> Optional[Dict[str, Any]]:
-    """The stored submission of a Google Forms response, looked up by its natural key (None if new)."""
+    """The stored submission of a natural-key (wide_form) response, looked up by its natural key (None if new)."""
     return await conn.fetchrow(
         """
         SELECT s.id, s.submission_id, s.tenant_code, s.status
@@ -305,7 +331,7 @@ async def _find_stored_gforms_response(
 
 
 def _already_stored_result(stored: Dict[str, Any]) -> Dict[str, Any]:
-    """The unchanged result for a Google Forms response that is already stored (nothing was written)."""
+    """The unchanged result for a natural-key response that is already stored (nothing was written)."""
     return {
         "id": stored["id"],
         "submission_id": stored["submission_id"],
@@ -352,8 +378,8 @@ def _parse_feedback_messages(raw_messages: Any) -> List[Dict[str, Any]]:
         if not isinstance(raw, dict):
             raise ValueError(f"{where} must be an object, got {type(raw).__name__}")
         sequence = raw.get("sequence")
-        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
-            raise ValueError(f"{where}.sequence must be an integer >= 1, got {sequence!r}")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1 or sequence > MAX_SEQUENCE:
+            raise ValueError(f"{where}.sequence must be an integer from 1 to {MAX_SEQUENCE}")
         if sequence in seen_sequences:
             raise ValueError(f"{where}.sequence {sequence} appears more than once in the event")
         seen_sequences.add(sequence)
@@ -366,7 +392,7 @@ def _parse_feedback_messages(raw_messages: Any) -> List[Dict[str, Any]]:
         parent_sequence = raw.get("parentSequence")
         if parent_sequence is not None:
             if isinstance(parent_sequence, bool) or not isinstance(parent_sequence, int):
-                raise ValueError(f"{where}.parentSequence must be an integer or null, got {parent_sequence!r}")
+                raise ValueError(f"{where}.parentSequence must be an integer or null")
             if parent_sequence >= sequence:
                 raise ValueError(
                     f"{where}.parentSequence {parent_sequence} must be lower than its own sequence {sequence}"
@@ -398,11 +424,13 @@ async def _ingest_feedback_submission(
       4. parent_id pass from parentSequence (idempotent; null parentSequence leaves parent_id untouched)
     Both `create` (a first upload, or a re-upload of a grown session) and a repeated event take this path:
     a create on an existing session reconciles instead of being skipped.
-    Google Forms responses are immutable and identified by data.sourceRef (feedback_submissions.source_ref,
-    unique per tenant): a response whose sourceRef is already stored is a no-op that returns the stored
-    submission (whatever submissionId the event carries), and this also covers a concurrent writer that
-    stored it first (the unique violation rolls this event back and is treated as already stored).
-    A Google Forms event never updates an existing submission.
+    A source is a free label (the consumer already tied the event to an active upload config of that source). The
+    identity rules come from data.adapter, the adapter of that config: a natural-key adapter (wide_form) identifies a
+    response by data.sourceRef (feedback_submissions.source_ref, unique per tenant) and its responses are immutable: a
+    response whose sourceRef is already stored is a no-op that returns the stored submission (whatever submissionId
+    the event carries), and this also covers a concurrent writer that stored it first (the unique violation rolls
+    this event back and is treated as already stored). Such an event never updates an existing submission. For every
+    other adapter (conversation_rows) sourceRef must be absent and a session grows by id.
     Returns the usual dict plus `changed` (False when nothing was written) and per-table counts.
     """
     submission_id = str(event_payload["submissionId"])
@@ -410,6 +438,8 @@ async def _ingest_feedback_submission(
     submission_type = event_payload["submissionType"]
     session_id = event_payload.get("sessionId")
     tags = event_payload.get("tags", {})
+    if not is_safe_id(submission_id) or not is_safe_code(tenant_code):
+        raise ValueError("feedback event has an unsafe submissionId or tenantCode; rejecting it.")
     ident = f"submission {submission_id} (tenant {tenant_code}, session {session_id})"
 
     if event_type != "create":
@@ -419,11 +449,18 @@ async def _ingest_feedback_submission(
         )
     if not isinstance(session_id, str) or len(session_id.strip()) == 0:
         raise ValueError(f"feedback event requires a non-empty sessionId; rejecting {ident}.")
+    if not is_safe_id(session_id):
+        raise ValueError(f"feedback event has an unsafe sessionId; rejecting submission {submission_id}.")
 
     data = event_payload.get("data", {})
     source = data.get("source")
-    if source not in FEEDBACK_SOURCES:
-        raise ValueError(f"data.source must be one of {FEEDBACK_SOURCES}, got {source!r}; rejecting {ident}.")
+    source_problem = source_label_problem(source)
+    if source_problem is not None:
+        raise ValueError(f"data.source is invalid ({source_problem}); rejecting {ident}.")
+    adapter = data.get("adapter")
+    if adapter not in ADAPTERS:
+        raise ValueError(f"data.adapter must be one of {ADAPTERS}; rejecting {ident}.")
+    is_natural_key = adapter in NATURAL_KEY_ADAPTERS
     completion_status = data.get("completionStatus")
     if completion_status not in COMPLETION_STATUSES:
         raise ValueError(
@@ -443,16 +480,15 @@ async def _ingest_feedback_submission(
         if isinstance(value, str) and len(value.strip()) > 0
     }
     source_ref = data.get("sourceRef")
-    is_gforms = source == SOURCE_GOOGLE_FORMS
-    if is_gforms:
+    if is_natural_key:
         if not isinstance(source_ref, str) or len(source_ref.strip()) == 0:
-            raise ValueError(f"data.sourceRef must be a non-empty string for a google_forms event; rejecting {ident}.")
+            raise ValueError(f"data.sourceRef must be a non-empty string for adapter {adapter}; rejecting {ident}.")
         if submission_id != session_id:
             raise ValueError(
-                f"a google_forms event must carry the same value as submissionId and sessionId; rejecting {ident}."
+                f"an event of adapter {adapter} must carry the same value as submissionId and sessionId; rejecting {ident}."
             )
     elif source_ref is not None:
-        raise ValueError(f"data.sourceRef must be absent or null unless data.source is google_forms; rejecting {ident}.")
+        raise ValueError(f"data.sourceRef must be absent or null for adapter {adapter}; rejecting {ident}.")
     messages = _parse_feedback_messages(data.get("messages"))
 
     submission_date = _parse_feedback_timestamp(data.get("submissionDate"), "data.submissionDate")
@@ -461,12 +497,12 @@ async def _ingest_feedback_submission(
     state = tags.get("state")
     district = tags.get("district")
 
-    if is_gforms:
+    if is_natural_key:
         # Already stored (by natural key)? Then there is nothing to do, whatever submissionId this event carries.
         stored = await _find_stored_gforms_response(conn, tenant_code, source_ref)
         if stored is not None:
             logger.info(
-                f"Google Forms response already stored as submission {stored['submission_id']} under tenant "
+                f"Natural-key (wide_form) response already stored as submission {stored['submission_id']} under tenant "
                 f"{tenant_code}; ignoring {ident}."
             )
             return _already_stored_result(stored)
@@ -477,25 +513,26 @@ async def _ingest_feedback_submission(
         if id_taken is not None:
             raise ValueError(
                 f"submission {submission_id} already exists under tenant {tenant_code} with a different "
-                f"sourceRef; a google_forms event never updates an existing submission; rejecting {ident}."
+                f"sourceRef; an event of adapter {adapter} never updates an existing submission; rejecting {ident}."
             )
 
     try:
         return await _write_feedback_submission(
             conn, event_payload, ident, source, source_ref, language, completion_status, messages,
             submission_date, state, district, session_type.strip(), questionnaire_version.strip(), bot_info,
+            is_natural_key,
         )
     except _FeedbackAlreadyStored:
         pass
     except asyncpg.exceptions.UniqueViolationError as e:
-        if not (is_gforms and _is_source_ref_violation(e)):
+        if not (is_natural_key and _is_source_ref_violation(e)):
             raise
     # Only reached when a concurrent writer stored the same response first (the transaction was rolled back).
     stored = await _find_stored_gforms_response(conn, tenant_code, source_ref)
     if stored is None:
-        raise ValueError(f"google_forms response {source_ref!r} conflicted but is not stored; rejecting {ident}.")
+        raise ValueError(f"{adapter} response {source_ref!r} conflicted but is not stored; rejecting {ident}.")
     logger.info(
-        f"Google Forms response lost a write race: already stored as submission {stored['submission_id']} "
+        f"Natural-key (wide_form) response lost a write race: already stored as submission {stored['submission_id']} "
         f"under tenant {tenant_code}; ignoring {ident}."
     )
     return _already_stored_result(stored)
@@ -516,6 +553,7 @@ async def _write_feedback_submission(
     session_type: str,
     questionnaire_version: str,
     bot_info: Dict[str, str],
+    is_natural_key: bool,
 ) -> Dict[str, Any]:
     """The transactional write of _ingest_feedback_submission (see there); one transaction, all or nothing."""
     submission_id = str(event_payload["submissionId"])
@@ -610,8 +648,8 @@ async def _write_feedback_submission(
             submission_id, tenant_code, source, language, completion_status, COMPLETION_COMPLETED, source_ref,
             session_type, questionnaire_version, json.dumps(bot_info) if len(bot_info) > 0 else None,
         )
-        if source == SOURCE_GOOGLE_FORMS and (fs_row is None or not fs_row["inserted"]):
-            # Google Forms responses are immutable: a payload row that already existed (a concurrent writer
+        if is_natural_key and (fs_row is None or not fs_row["inserted"]):
+            # Natural-key (wide_form) responses are immutable: a payload row that already existed (a concurrent writer
             # stored this response between the pre-check and here) is never touched. Roll everything back.
             raise _FeedbackAlreadyStored()
         payload_changed = fs_row is not None
@@ -1662,6 +1700,10 @@ async def fetch_retryable_failed_submissions(
     if limit is None:
         raise ValueError("limit must be provided by the caller; do not rely on a hardcoded default.")
     cutoff_dt = datetime.fromisoformat(failed_before) if isinstance(failed_before, str) else failed_before
+    # BulkStepRetryWorkflow hands the cursor back as the ISO string of the last page's `updated_at` (activity results
+    # are JSON); asyncpg only accepts a datetime for a timestamptz parameter.
+    if isinstance(cursor_updated_at, str):
+        cursor_updated_at = datetime.fromisoformat(cursor_updated_at)
     rows = await conn.fetch(
         """
         SELECT submission_id, session_id, tenant_code, submission_type, status,

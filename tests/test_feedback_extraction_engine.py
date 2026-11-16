@@ -8,8 +8,11 @@ depend on the seeded field lists. SYNTHETIC data only.
 import asyncio
 import copy
 import importlib.util
+import inspect
 import json
 import re
+import shlex
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -31,7 +34,7 @@ MARKER = "zzq-engine-marker"
 
 def _raw_config(**top):
     raw = {
-        "schema_version": 1, "persona": "Youth", "session_type": "Youth_Voice",
+        "schema_version": 1, "persona": "Youth", "session_type": "Youth_Voice", "prompt_name": "Test Prompt",
         "fields": [
             {"name": "age", "kind": "integer", "description": "The age in years.", "min": 5, "max": 100},
             {"name": "gender", "kind": "category", "description": "Gender.", "categories": ["Male", "Female"]},
@@ -60,9 +63,13 @@ def _field(result, name):
 
 # ------------------------------------------------------------------------------------------------ config parser
 
-def test_prompt_name_is_optional_and_kept_exactly():
-    assert _config().prompt_name is None
+def test_prompt_name_is_required_and_kept_exactly():
+    assert _config().prompt_name == "Test Prompt"
     assert _config(prompt_name="Youth Metadata Extraction").prompt_name == "Youth Metadata Extraction"
+    raw = _raw_config()
+    del raw["prompt_name"]
+    with pytest.raises(fx.ExtractionConfigError, match="needs prompt_name.*no default prompt"):
+        fx.parse_extraction_config(raw)
 
 
 @pytest.mark.parametrize("bad", ["", "   ", " Youth", "Youth ", None, 5, True, ["x"], {"a": 1}])
@@ -157,7 +164,11 @@ def test_sensitive_does_not_change_validation():
     raw["fields"][3]["sensitive"] = False
     relaxed = fx.parse_extraction_config(raw)
     answer = _answer(disability="Maybe", age="17")
-    assert fx.parse_model_response(answer, plain) == fx.parse_model_response(answer, relaxed)
+
+    def validated(result):      # value and status; raw_value of a sensitive field is deliberately not stored
+        return [(f.field_name, f.value, f.status, f.confidence) for f in result.fields]
+
+    assert validated(fx.parse_model_response(answer, plain)) == validated(fx.parse_model_response(answer, relaxed))
     assert _field(fx.parse_model_response(answer, plain), "disability").status == "unmapped"
 
 
@@ -272,7 +283,7 @@ def test_a_persona_prompt_is_rendered_in_one_pass_with_integer_fields_and_cannot
 
 # ------------------------------------------------------------------------------------------------ prompt resolution
 
-class FakeConn:
+class FakePromptConn:
     """A connection with a prompts table and a prompt_version table; answers the two lookups of load_prompt_by_name."""
 
     def __init__(self, prompts, versions):
@@ -309,7 +320,7 @@ def _prompt_world():
         ids["No Active"]: [version(1, False, "none")],
         ids["Theme Prompt"]: [version(1, True, "theme")],
     }
-    return FakeConn(prompts, versions)
+    return FakePromptConn(prompts, versions)
 
 
 def test_a_named_prompt_resolves_to_its_highest_active_version():
@@ -318,9 +329,12 @@ def test_a_named_prompt_resolves_to_its_highest_active_version():
     assert row["system_prompt"] == "S youth v3" and row["user_prompt"] == "U youth v3"
 
 
-def test_a_config_without_prompt_name_uses_the_generic_prompt():
-    row = asyncio.run(ops.load_prompt_for_config(_prompt_world(), _config()))
-    assert row["id"] == "generic-v1" and row["name"] == "Feedback Metadata Extraction"
+def test_a_config_object_without_a_prompt_name_is_refused_not_answered_with_a_default_prompt():
+    bare = fx.ExtractionConfig("Youth", "Youth_Voice", _config().fields, fx.PII_TYPES, {}, None)   # only a hand-built one
+    conn = _prompt_world()
+    with pytest.raises(ops.ExtractionSetupError, match="prompt_name is required"):
+        asyncio.run(ops.load_prompt_for_config(conn, bare))
+    assert conn.queries == []
 
 
 def test_a_name_that_does_not_exist_fails_loudly_without_falling_back_to_the_generic_prompt():
@@ -340,24 +354,36 @@ def test_a_name_of_a_prompt_with_another_analysis_type_is_refused():
         asyncio.run(ops.load_prompt_for_config(_prompt_world(), _config(prompt_name="Theme Prompt")))
 
 
-def test_a_missing_generic_prompt_fails_loudly_too():
+def test_a_missing_prompt_is_an_extraction_setup_error_which_is_a_runtime_error():
     conn = _prompt_world()
-    del conn.prompts["Feedback Metadata Extraction"]
-    with pytest.raises(RuntimeError, match="No prompt named 'Feedback Metadata Extraction'"):
+    with pytest.raises(ops.ExtractionSetupError, match="No prompt named 'Test Prompt'") as caught:
         asyncio.run(ops.load_prompt_for_config(conn, _config()))
+    assert isinstance(caught.value, RuntimeError)
 
 
-def test_the_prompt_lookup_never_tests_emptiness_by_truthiness():
-    source = (ROOT / "app" / "database" / "feedback_extraction_operations.py").read_text(encoding="utf-8")
-    block = source[source.index("async def load_prompt_by_name"):source.index("async def load_extraction_config")]
-    code = re.sub(r'"""[\s\S]*?"""', "", block)           # the docstrings are prose
-    assert re.search(r"\bif not (name|row|prompt|config)\b", code) is None          # emptiness is tested explicitly
-    assert re.search(r"\bor (\"|'|\{|\[|None|PROMPT_NAME|name)", code) is None   # no `or default` fallback
+@pytest.mark.parametrize("name", ["", None, 0, ["Youth Prompt"], b"Youth Prompt"])
+def test_a_prompt_name_that_is_not_a_non_empty_string_is_refused_before_any_query(name):
+    # emptiness is tested explicitly: none of these values (all of them false-ish or not text) reaches the database
+    conn = _prompt_world()
+    with pytest.raises(ValueError, match="non-empty string"):
+        asyncio.run(ops.load_prompt_by_name(conn, name))
+    assert conn.queries == []
+
+
+def test_a_whitespace_name_is_looked_up_as_it_is_and_a_prompt_version_numbered_zero_is_still_a_version():
+    conn = _prompt_world()
+    with pytest.raises(ops.ExtractionSetupError, match="No prompt named '  '"):
+        asyncio.run(ops.load_prompt_by_name(conn, "  "))                      # no stripping, no default: not found
+    zero = FakePromptConn(
+        {"Zero": {"id": "p0", "analysis_type": "feedback_metadata_extraction"}},
+        {"p0": [{"id": "z-v0", "version": 0, "is_active": True, "system_prompt": "S", "user_prompt": "U"}]})
+    row = asyncio.run(ops.load_prompt_by_name(zero, "Zero"))
+    assert row["id"] == "z-v0" and row["version"] == 0                          # 0 is a value, not "missing"
 
 
 # ------------------------------------------------------------------------------------------------ the used prompt is what is stored
 
-class FakePool:
+class FakeEnginePool:
     def __init__(self, conn):
         self.conn = conn
 
@@ -376,7 +402,8 @@ def test_extract_submission_sends_the_named_prompt_and_stores_the_version_it_use
     config_version_id = str(uuid.uuid4())
 
     async def fake_inputs(c, submission_id, tenant_code):
-        return {"session_type": "Youth_Voice", "questionnaire_version": "V2", "rows": rows, "fingerprint": ops.rows_fingerprint(
+        return {"session_type": "Youth_Voice", "questionnaire_version": "V2", "identity": ("Youth_Voice", "mitra", None),
+                "rows": rows, "fingerprint": ops.rows_fingerprint(
             [dict(r) for r in rows]), "loaded_at": None, "config_row": {"id": config_version_id, "config": config}, "closing_keys": []}
 
     saved = {}
@@ -392,7 +419,7 @@ def test_extract_submission_sends_the_named_prompt_and_stores_the_version_it_use
         prompts_sent.append(prompt)
         return _answer(age=17), {"prompt_tokens": 3, "completion_tokens": 2}
 
-    outcome = asyncio.run(ops.extract_submission(FakePool(conn), "s1", "mitra", llm_function=llm))
+    outcome = asyncio.run(ops.extract_submission(FakeEnginePool(conn), "s1", "mitra", llm_function=llm))
     assert prompts_sent == ["S youth v3\n\nU youth v3"]
     assert saved["prompt_version_id"] == "youth-v3" and saved["config_version_id"] == config_version_id
     assert saved["llm_log"]["prompt_version_id"] == "youth-v3"
@@ -411,13 +438,8 @@ def test_extract_submission_sends_the_named_prompt_and_stores_the_version_it_use
     monkeypatch.setattr(ops, "load_submission_inputs", fake_inputs_missing)
     prompts_sent.clear()
     with pytest.raises(RuntimeError, match="No prompt named 'Missing Prompt'"):
-        asyncio.run(ops.extract_submission(FakePool(conn), "s1", "mitra", llm_function=llm))
+        asyncio.run(ops.extract_submission(FakeEnginePool(conn), "s1", "mitra", llm_function=llm))
     assert prompts_sent == []
-
-
-def test_extract_submission_no_longer_takes_a_preloaded_prompt():
-    import inspect
-    assert "prompt_row" not in inspect.signature(ops.extract_submission).parameters
 
 
 # ------------------------------------------------------------------------------------------------ CLI
@@ -425,7 +447,7 @@ def test_extract_submission_no_longer_takes_a_preloaded_prompt():
 def test_parser_knows_run_and_show_config_and_no_longer_upgrade_config():
     assert cli.build_parser().parse_args(["show-config"]).command == "show-config"
     assert cli.build_parser().parse_args(["show-config", "--session-type", "Youth_Voice"]).session_type == "Youth_Voice"
-    assert cli.build_parser().parse_args(["run", "--session-type", "Youth_Voice"]).command == "run"
+    assert cli.build_parser().parse_args(["run", "--session-type", "Youth_Voice", "--tenant-code", "t1"]).command == "run"
     # the seed is seed_config.sql and never overwrites: an existing database gets new content through a new
     # config_version (docs/feedback-extraction-bands.md), so the old subcommand is gone
     for argv in (["upgrade-config"], ["upgrade-config", "--dry-run"]):
@@ -445,8 +467,10 @@ def test_summarise_config_lists_prompt_name_and_field_flags_without_bands():
         {"name": "disability", "kind": "category", "sensitive": True, "provisional": True},
     ]
     assert "categories" not in json.dumps(summary)
-    assert cli.summarise_config(_raw_config())["prompt_name"] == "generic"
-    assert cli.summarise_config("not a dict") == {"prompt_name": "generic", "fields": []}
+    raw_without = _raw_config()
+    del raw_without["prompt_name"]
+    assert cli.summarise_config(raw_without)["prompt_name"] == "(none)"
+    assert cli.summarise_config("not a dict") == {"prompt_name": "(none)", "fields": []}
     assert cli.summarise_config({"fields": [1, {"name": "x"}]})["fields"] == [
         {"name": "x", "kind": None, "sensitive": False, "provisional": False}]
 
@@ -487,6 +511,76 @@ def test_the_run_summary_has_no_min_max_for_an_integer_field_nobody_answered():
     assert done["fields"]["age"]["distinct_values"] == 0
 
 
-def test_the_cli_source_has_no_preloaded_prompt_left():
-    source = (ROOT / "tools" / "run_feedback_extraction.py").read_text(encoding="utf-8")
-    assert "load_active_prompt" not in source and "prompt_row" not in source
+def test_neither_the_core_nor_the_cli_offers_a_preloaded_prompt_any_more():
+    assert not hasattr(ops, "load_active_prompt") and not hasattr(cli, "load_active_prompt")
+    assert "prompt_row" not in inspect.signature(ops.extract_submission).parameters
+
+
+def _documented_commands(tool):
+    """The `python tools/<tool>.py ...` example lines of the extraction doc, as argv lists (placeholders filled in)."""
+    text = (ROOT / "docs" / "feedback-extraction-and-dots-queries.md").read_text(encoding="utf-8")
+    commands = []
+    for line in text.splitlines():
+        match = re.match(rf"^python tools/{tool}\.py (.*)$", line)
+        if match is not None:
+            argv = match.group(1).split("  #")[0].replace("<program uuid>", str(uuid.uuid4())).replace("<model>", "some/model")
+            commands.append(shlex.split(argv))
+    return commands
+
+
+def test_every_documented_feedback_config_command_parses_with_the_real_cli():
+    spec = importlib.util.spec_from_file_location("feedback_config_cli_for_docs", ROOT / "tools" / "feedback_config.py")
+    config_cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_cli)
+    commands = _documented_commands("feedback_config")
+    assert len(commands) >= 1
+    for argv in commands:
+        config_cli.build_parser().parse_args(argv)
+
+
+def test_every_documented_extraction_command_parses_with_the_real_cli():
+    commands = _documented_commands("run_feedback_extraction")
+    assert len(commands) >= 1
+    for argv in commands:
+        cli.build_parser().parse_args(argv)
+
+
+def test_the_documented_extraction_commands_parse_once_the_required_tenant_is_added():
+    # the same examples, with the one flag the doc omits: everything else in them is accepted by the real parser
+    for argv in _documented_commands("run_feedback_extraction"):
+        if argv[0] == "run":
+            argv = argv + ["--tenant-code", "t1"]
+        cli.build_parser().parse_args(argv)
+
+
+def test_a_failing_llm_call_surfaces_a_clean_error_and_chains_nothing(monkeypatch):
+    """
+    The provider's error text can carry respondent text. extract_submission replaces it by a sanitized error that
+    is raised OUTSIDE the except block: no __cause__, no implicit __context__, so a traceback never prints the
+    original message under "During handling of the above exception".
+    """
+    conn = _prompt_world()
+    config = _config(prompt_name="Youth Prompt")
+    rows = [{"sequence": 1, "parent_id": None, "question_key": "Q", "message": "How old are you?", "translated_message": None},
+            {"sequence": 2, "parent_id": "p", "question_key": "Q", "message": "17", "translated_message": None}]
+
+    async def fake_inputs(c, submission_id, tenant_code):
+        return {"session_type": "Youth_Voice", "questionnaire_version": "V2", "rows": rows,
+                "fingerprint": ops.rows_fingerprint([dict(r) for r in rows]), "loaded_at": None,
+                "config_row": {"id": str(uuid.uuid4()), "config": config}, "closing_keys": []}
+
+    async def fake_save(c, **kwargs):
+        raise AssertionError("nothing is saved when the call failed")
+
+    monkeypatch.setattr(ops, "load_submission_inputs", fake_inputs)
+    monkeypatch.setattr(ops, "save_extraction", fake_save)
+
+    def llm(prompt, model=None, max_tokens=None, timeout=None):
+        raise RuntimeError("OpenRouter request failed with HTTP 500: echo 5550100123 respondent text")
+
+    with pytest.raises(ops.LlmCallError) as caught:
+        asyncio.run(ops.extract_submission(FakeEnginePool(conn), "s1", "mitra", llm_function=llm))
+    error = caught.value
+    assert str(error) == "LLM call failed (RuntimeError, HTTP 500)"
+    assert error.__cause__ is None and error.__context__ is None
+    assert "5550100123" not in "".join(traceback.format_exception(type(error), error, error.__traceback__))

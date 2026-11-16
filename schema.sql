@@ -542,9 +542,9 @@ CREATE TABLE feedback_submissions (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     submission_id     TEXT NOT NULL,
     tenant_code       TEXT NOT NULL,
-    source            TEXT NOT NULL, -- 'mitra' | 'google_forms'
-    session_type      TEXT NOT NULL, -- persona key of the export (Youth_Voice, ...); the filter for queries, never the bot id
-    questionnaire_version TEXT NOT NULL, -- 'V1' | 'V2' ...: stamped at ingest from the config's dated windows
+    source            TEXT NOT NULL, -- a free label (mitra, google_forms, ...): the source whose upload config read the file
+    session_type      TEXT NOT NULL, -- persona key of the export (Youth_Voice, ...); the filter for queries, never the bot id. NOT NULL on a database created with this schema; on an older database the column is added nullable and stays NULL for stored sessions until `python tools/feedback_config.py migrate-legacy` backfills it (see the section below)
+    questionnaire_version TEXT NOT NULL, -- 'V1' | 'V2' ...: stamped at ingest from the config's dated windows. NOT NULL on a new database; NULL on an older one until `migrate-legacy` (same note as session_type)
     language          TEXT,
     completion_status TEXT NOT NULL CHECK (completion_status IN ('COMPLETED', 'IN_PROGRESS')),
     source_ref        TEXT, -- natural key of the response; set for google_forms, NULL for mitra
@@ -587,13 +587,13 @@ CREATE TABLE feedbacks (
 -- those stay in prompts/prompt_version). Versioned JSON settings live in config_version.
 CREATE TABLE config (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_source TEXT NOT NULL CHECK (config_source IN ('mitra', 'google_forms', 'any')), -- 'any': applies to stored sessions of every source (feedback_extraction)
+    config_source TEXT NOT NULL, -- a free label, [a-z0-9_]{1,40}, validated in code (no CHECK: a new source needs no schema change); 'any' is reserved: the config applies to the stored sessions of every source (feedback_extraction)
     name          TEXT NOT NULL, -- e.g. 'Youth bot CSV validator'
     config_type   TEXT NOT NULL, -- 'feedback_upload' (how to read a CSV), 'feedback_extraction' (what the LLM extracts); story/discussion keep env config
     program_id    UUID REFERENCES programs(id) ON DELETE CASCADE, -- NULL = default for the source and type
     tenant_code   TEXT NOT NULL REFERENCES tenant(code),
     leader_id     UUID REFERENCES leader_category(id) ON DELETE SET NULL, -- optional; NULL for the feedback bots
-    session_type  TEXT NOT NULL, -- persona key (Youth_Voice, ...): what the config applies to; a bot is edited many times
+    session_type  TEXT NOT NULL, -- persona key (Youth_Voice, ...): what the config applies to; a bot is edited many times. NOT NULL on a new database; on an older one the column is added nullable and stays NULL until `python tools/feedback_config.py migrate-legacy` fills it
     bot_id        TEXT, -- informational only (the bot the first version was written for); never matched
     bot_name      TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -620,15 +620,47 @@ CREATE INDEX IF NOT EXISTS idx_feedbacks_program_question ON feedbacks (program_
 CREATE INDEX IF NOT EXISTS idx_feedbacks_parent ON feedbacks (parent_id);
 CREATE INDEX IF NOT EXISTS idx_feedbacks_source ON feedbacks (source);
 
--- Databases created before session_type existed: add the columns (nullable there; a backfill is a one-off).
+-- Databases created before session_type existed: add the columns. They are nullable there (an old config row and an
+-- old stored session have no persona key; inference is not generic, so the operator supplies it once with
+-- `python tools/feedback_config.py migrate-legacy`, see README "Upgrading an existing database").
 ALTER TABLE config ADD COLUMN IF NOT EXISTS session_type TEXT;
 ALTER TABLE feedback_submissions ADD COLUMN IF NOT EXISTS session_type TEXT;
 ALTER TABLE feedback_submissions ADD COLUMN IF NOT EXISTS questionnaire_version TEXT;
 
--- One config per (source, type, program, session_type). The bot id no longer takes part.
-DROP INDEX IF EXISTS uq_config_source_type_program_bot;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_config_source_type_program_session_type
-    ON config (config_source, config_type, COALESCE(program_id, '00000000-0000-0000-0000-000000000000'), COALESCE(session_type, ''));
+-- One config per (tenant, source, type, program, session_type): the bot id and the old key do not take part. The
+-- unique index is created by the function below, which NEVER raises: an older database may hold several config
+-- rows of one (source, type, program) (one per bot, the old design), and then the new index cannot exist yet. The
+-- old bot-keyed index is kept until the new one exists, startup carries on (the app logs a WARNING naming the
+-- table), and `migrate-legacy` finishes the job. Returns TRUE when the new index exists afterwards.
+CREATE OR REPLACE FUNCTION ensure_config_unique_index() RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    -- The only deterministic backfill: a config whose active version already names its session_type (valid
+    -- persona key, same rule as SAFE_CODE_RE) gets that value in the column. Anything else is the operator's call.
+    UPDATE config c SET session_type = v.config ->> 'session_type', updated_at = now()
+    FROM config_version v
+    WHERE v.config_id = c.id AND v.is_active AND c.session_type IS NULL
+      AND jsonb_typeof(v.config -> 'session_type') = 'string'
+      AND (v.config ->> 'session_type') ~ '^[A-Za-z0-9._-]{1,64}$';
+
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema()
+                   AND indexname = 'uq_config_tenant_source_type_program_session_type') THEN
+        BEGIN
+            CREATE UNIQUE INDEX uq_config_tenant_source_type_program_session_type
+                ON config (tenant_code, config_source, config_type,
+                           COALESCE(program_id, '00000000-0000-0000-0000-000000000000'), COALESCE(session_type, ''));
+        EXCEPTION WHEN unique_violation THEN
+            RETURN FALSE;
+        END;
+    END IF;
+    -- The new index exists: the older keys (bot id; and the first session_type key, which had no tenant) go.
+    DROP INDEX IF EXISTS uq_config_source_type_program_bot;
+    DROP INDEX IF EXISTS uq_config_source_type_program_session_type;
+    RETURN TRUE;
+END
+$fn$;
+
+SELECT ensure_config_unique_index();
 
 CREATE INDEX IF NOT EXISTS idx_feedback_submissions_session_type ON feedback_submissions (session_type, questionnaire_version);
 
@@ -637,30 +669,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_config_version_active ON config_version (co
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Feedback metadata extraction (one LLM call per stored session; docs/feedback-extraction-and-dots-queries.md).
--- Databases created before this existed: the column and the wider CHECK are applied here at every startup.
+-- Databases created before this existed: the column is added here at every startup.
 -- ---------------------------------------------------------------------------------------------------------------
 ALTER TABLE feedback_submissions ADD COLUMN IF NOT EXISTS pii_detected BOOLEAN;
 
--- config.config_source accepts 'any' (the extraction config applies to Mitra and Google Forms sessions alike).
--- The inline CHECK of an older database only allows the two sources: replace it, once, whatever it is called.
+-- config.config_source is a free label validated in code ([a-z0-9_]{1,40}; 'any' is the reserved value of the
+-- extraction config), so it has no CHECK. Databases created before this change have one (any name, any list of
+-- sources): drop every CHECK that mentions it. A no-op on a new database and on every later start.
 DO $$
 DECLARE
     old_check RECORD;
-    replaced BOOLEAN := FALSE;
 BEGIN
     FOR old_check IN
         SELECT conname FROM pg_constraint
         WHERE conrelid = 'config'::regclass AND contype = 'c'
           AND pg_get_constraintdef(oid) LIKE '%config_source%'
-          AND pg_get_constraintdef(oid) NOT LIKE '%''any''%'
     LOOP
         EXECUTE format('ALTER TABLE config DROP CONSTRAINT %I', old_check.conname);
-        replaced := TRUE;
     END LOOP;
-    IF replaced THEN
-        ALTER TABLE config ADD CONSTRAINT config_config_source_check
-            CHECK (config_source IN ('mitra', 'google_forms', 'any'));
-    END IF;
 END $$;
 
 -- Long form: one row per session per extracted field, so a new field needs no schema change.

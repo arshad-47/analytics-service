@@ -1,8 +1,7 @@
 """
 Real-Postgres tests for restamp_questionnaire_versions (app/database/feedback_operations.py).
 
-Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL is set to the DSN of an EMPTY scratch database that is used by
-this file alone (the restamp touches every stored Mitra session, and the tests wipe the feedback rows and the
+Opt-in: skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database for this file alone and drops it afterwards) (the restamp touches every stored Mitra session, and the tests wipe the feedback rows and the
 configs before each case). The file applies schema.sql itself (the way app/database/db.py does it), creates the
 tenant 'mitra' and runs the real seed. The seed holds only the V1 baseline for every persona (the V2 windows are
 data, not code), so each case first records the windows it needs with set_questionnaire_version (restamp off), the
@@ -13,19 +12,20 @@ Synthetic data only.
 """
 import asyncio
 import json
-import os
 import uuid
 from datetime import datetime, timezone
 
 import asyncpg
 import pytest
+import factories
+import pg_support
 
-from app.database.db import SCHEMA_FILE, db
+from app.database.db import db
 from app.database.feedback_operations import restamp_questionnaire_versions, set_questionnaire_version
 from app.database.operations import insert_or_update_submission
-from seed_support import PERSONAS, mitra_config_v1, seed_config
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, mitra_config_v1, seed_config
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
@@ -36,16 +36,6 @@ YOUTH_V2_TEXT = "2026-11-03T18:23:03+05:30"
 PARENT_V2_TEXT = "2026-11-03T18:52:54+05:30"
 YOUTH_V2 = datetime(2026, 11, 3, 12, 53, 3, tzinfo=timezone.utc)
 PARENT_V2 = datetime(2026, 11, 3, 13, 22, 54, tzinfo=timezone.utc)
-
-
-def _schema_sql() -> str:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
 
 
 def _run(body, windows=True):
@@ -59,7 +49,7 @@ def _run(body, windows=True):
         conn = await asyncpg.connect(DSN)
         pool = None
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await _wipe(conn)
             await conn.execute("DELETE FROM config_version")
@@ -104,10 +94,10 @@ async def _add(conn, persona, session_type, stored_version, started_at, source="
     event = {
         "submissionId": sid if source == "mitra" else str(uuid.uuid4()), "submissionType": "feedback",
         "tenantCode": "mitra", "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": PERSONAS[persona]["program_id"], "programName": "1M Voice",
+        "tags": {"programId": PERSONAS[persona]["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                  "leaderCategoryId": PERSONAS[persona]["leader_category_id"], "leaderCategoryName": persona,
                  "state": None, "district": None, "source": source},
-        "data": {"source": source, "sessionType": session_type, "questionnaireVersion": stored_version,
+        "data": {"source": source, "adapter": "wide_form" if source == "google_forms" else "conversation_rows", "sessionType": session_type, "questionnaireVersion": stored_version,
                  "language": "en", "completionStatus": "COMPLETED",
                  "submissionDate": started_at.isoformat(), "messages": _messages()},
     }
@@ -128,6 +118,12 @@ async def _versions(conn):
 async def _stamps(conn):
     rows = await conn.fetch("SELECT submission_id, questionnaire_version, updated_at FROM feedback_submissions")
     return {r["submission_id"]: (r["questionnaire_version"], r["updated_at"]) for r in rows}
+
+
+def _counts(entry):
+    """The counts of one restamp result entry (the entry also names its tenant / program / session_type / source)."""
+    assert entry["tenant_code"] == "mitra" and entry["source"] == "mitra" and entry["program_id"] is not None
+    return {k: entry[k] for k in ("sessions", "changed", "versions")}
 
 
 def _at(*args):
@@ -192,7 +188,7 @@ def test_dry_run_reports_the_counts_and_changes_nothing():
         before = await _stamps(conn)
         res = await restamp_questionnaire_versions(dry_run=True)
         assert res["dry_run"] is True and res["changed"] == len(WRONG)
-        assert res["session_types"] == {
+        assert {k: _counts(v) for k, v in res["session_types"].items()} == {
             "Youth_Voice": {"sessions": 4, "changed": 2, "versions": {"V1": 2, "V2": 2}},
             "Parent_Voice": {"sessions": 3, "changed": 2, "versions": {"V1": 1, "V2": 2}},
             "Educator_Voice": {"sessions": 2, "changed": 1, "versions": {"V1": 2}},
@@ -281,7 +277,7 @@ def test_no_sessions_gives_zero_counts_per_configured_persona():
         res = await restamp_questionnaire_versions()
         assert res["changed"] == 0
         assert set(res["session_types"]) == {"Youth_Voice", "Parent_Voice", "General_Public_Voice", "Educator_Voice"}
-        assert all(v == {"sessions": 0, "changed": 0, "versions": {}} for v in res["session_types"].values())
+        assert all(_counts(v) == {"sessions": 0, "changed": 0, "versions": {}} for v in res["session_types"].values())
     _run(body)
 
 
@@ -290,7 +286,7 @@ def test_session_without_a_start_date_is_skipped():
         sid = await _add(conn, "Youth", "Youth_Voice", "V2", _at(2026, 10, 1, 0, 0, 0))
         await conn.execute("UPDATE submissions SET submission_date = NULL WHERE submission_id = $1", sid)
         res = await restamp_questionnaire_versions()
-        assert res["session_types"]["Youth_Voice"] == {"sessions": 0, "changed": 0, "versions": {}}
+        assert _counts(res["session_types"]["Youth_Voice"]) == {"sessions": 0, "changed": 0, "versions": {}}
         assert (await _versions(conn))[sid] == "V2"
     _run(body)
 
@@ -400,29 +396,12 @@ def test_inactive_invalid_config_version_is_ignored():
     _run(body)
 
 
-OTHER_LEADER = "0a0a0a0a-0000-4000-8000-00000000e001"
-OTHER_PROGRAM = "0a0a0a0a-0000-4000-8000-00000000e002"
-
-
 async def _add_other_tenant_session(conn, submission_id, stored_version, started_at):
-    """A Youth_Voice Mitra session of ANOTHER tenant that reuses a submission id of tenant 'mitra'."""
-    await conn.execute("INSERT INTO tenant (name, code) VALUES ('Other', 'other') ON CONFLICT (code) DO NOTHING")
-    await conn.execute(
-        "INSERT INTO leader_category (id, name, tenant_code) VALUES ($1, 'Youth', 'other') ON CONFLICT (id) DO NOTHING",
-        OTHER_LEADER)
-    await conn.execute(
-        "INSERT INTO programs (id, leaders_id, name, tenant_code) VALUES ($1, $2, '1M Voice', 'other') "
-        "ON CONFLICT (id) DO NOTHING", OTHER_PROGRAM, OTHER_LEADER)
-    event = {
-        "submissionId": submission_id, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback",
-        "tenantCode": "other", "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
-        "tags": {"programId": OTHER_PROGRAM, "programName": "1M Voice", "leaderCategoryId": OTHER_LEADER,
-                 "leaderCategoryName": "Youth", "state": None, "district": None, "source": "mitra"},
-        "data": {"source": "mitra", "sessionType": "Youth_Voice", "questionnaireVersion": stored_version,
-                 "language": "en", "completionStatus": "COMPLETED", "botId": YOUTH["bot_id"],
-                 "submissionDate": started_at.isoformat(), "messages": _messages()},
-    }
-    await insert_or_update_submission(conn, event)
+    """A Youth_Voice Mitra session of ANOTHER tenant (its own fictitious program) that reuses a submission id of 'mitra'."""
+    program = await factories.add_program(conn, "other", "Other Programme", "Youth")
+    await factories.store_session(
+        conn, program, "Youth_Voice", "mitra", stored_version, started_at, sid=submission_id,
+        messages=_messages())
 
 
 def test_the_relabel_is_scoped_by_tenant_and_submission_id():
@@ -443,6 +422,36 @@ def test_the_relabel_is_scoped_by_tenant_and_submission_id():
                 "WHERE submission_id = $1", sid)}
             assert after["mitra"][0] == "V2" and after["mitra"][1] > before["mitra"][1]
             assert after["other"] == before["other"]  # not touched
+        finally:
+            await conn.execute("DELETE FROM submissions WHERE tenant_code = 'other'")
+    _run(body)
+
+
+def test_a_session_of_another_tenant_that_points_at_a_mitra_program_is_never_counted_or_relabelled():
+    """
+    The program of a session does not isolate tenants on its own (submissions.program_id only has a foreign key to
+    programs): a row of tenant 'other' that carries a MITRA program id, with a label the mitra windows WOULD change
+    (V1 after the V2 start), must stay out of the count and keep its label. Plain SQL writes it (the ingest path
+    refuses it), the way a mis-tagged or hostile row would look.
+    """
+    async def body(conn):
+        mine = await _add(conn, "Youth", "Youth_Voice", "V1", _at(2026, 11, 5, 9, 0, 0))          # wrong: becomes V2
+        await pg_support.insert_foreign_session(
+            conn, tenant_code="other", submission_id="foreign-1", program_id=YOUTH["program_id"],
+            started_at=_at(2026, 11, 5, 9, 0, 0), version="V1", session_type="Youth_Voice")        # would become V2
+        before = await conn.fetchrow(
+            "SELECT questionnaire_version, updated_at FROM feedback_submissions WHERE tenant_code = 'other'")
+        try:
+            dry = await restamp_questionnaire_versions("Youth_Voice", dry_run=True)
+            assert _counts(dry["session_types"]["Youth_Voice"]) == {"sessions": 1, "changed": 1, "versions": {"V2": 1}}
+            res = await restamp_questionnaire_versions("Youth_Voice")
+            assert _counts(res["session_types"]["Youth_Voice"]) == {"sessions": 1, "changed": 1, "versions": {"V2": 1}}
+            assert res["changed"] == 1
+            assert (await _versions(conn))[mine] == "V2"
+            after = await conn.fetchrow(
+                "SELECT questionnaire_version, updated_at FROM feedback_submissions WHERE tenant_code = 'other'")
+            assert (after["questionnaire_version"], after["updated_at"]) == (before["questionnaire_version"], before["updated_at"])
+            assert after["questionnaire_version"] == "V1"
         finally:
             await conn.execute("DELETE FROM submissions WHERE tenant_code = 'other'")
     _run(body)

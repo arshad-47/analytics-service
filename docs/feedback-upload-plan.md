@@ -2,6 +2,8 @@
 
 > **Update 2026-11-13:** `FEEDBACK_KAFKA_SCHEMA`, `PROCESS_CONFIG_FEEDBACK` and `FEEDBACK_MAX_CSV_UPLOAD_BYTES` named below no longer exist in `.env`; they are the keys `ingestion_schema`, `process_steps` and `max_csv_upload_bytes` of each persona's `feedback_upload` config version (see `tools/feedback_config.py`).
 
+> **Superseded in parts (2026-11-14):** this is the original plan and is kept as history, not as a description of the code. The config keys it names `completion_values` and `columns` were replaced by `completion_map` and `column_map` (and every upload config now names its `adapter`); `config.config_source` no longer has a CHECK (a source is a free label); the config unique key is (tenant, source, type, program, session_type), not the bot id; sources, adapters, the upgrade of an old database (`tools/feedback_config.py migrate-legacy`) and the config format are described in `README.md` ("Feedback uploads" and "Upgrading an existing database") and by the seed `seed_config.sql`.
+
 Status: **proposed, not implemented.** Decisions below were agreed in discussion; open items are listed at the end.
 
 ## Context

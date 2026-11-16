@@ -1,10 +1,10 @@
 """
 Run the feedback metadata extraction on stored sessions WITHOUT Temporal, or show the extraction config.
 
-    python tools/run_feedback_extraction.py run --session-type Youth_Voice [--limit 50] [--submission-id 12345]
+    python tools/run_feedback_extraction.py run --session-type Youth_Voice [--program-id UUID] [--limit 50] [--submission-id 12345]
                                                 [--only-unprocessed] [--dry-run] [--concurrency 4]
                                                 [--model NAME] [--max-tokens N] [--timeout SECONDS] [--top 15]
-    python tools/run_feedback_extraction.py show-config [--session-type Youth_Voice]
+    python tools/run_feedback_extraction.py show-config [--session-type Youth_Voice] [--program-id UUID]
 
 `run` does exactly what the workflow step feedback_metadata_extraction does for each selected session (same code,
 app/database/feedback_extraction_operations.extract_submission): ONE LLM call with the complete conversation,
@@ -14,15 +14,15 @@ one transaction; a re-run overwrites. --only-unprocessed selects the sessions wh
 respondent answer makes no LLM call. The LLM is the one configured for the application (OPENROUTER_* settings),
 sessions go to an external provider: confirm the approval for the data before running on real sessions.
 
-Each session is extracted with the prompt its persona's extraction config selects (`prompt_name`, else the generic
-prompt); a name that does not resolve to a prompt with an active version fails the session loudly.
+Each session is extracted with the prompt its program's extraction config selects (`prompt_name`, required); a name
+that does not resolve to a prompt with an active version fails the session loudly.
 
 It prints AGGREGATES ONLY as JSON: counts per field and status, the most frequent canonical values of the category
 fields (for a free-text field such as district only the number of distinct values; for an integer field such as age
 the number of distinct values and the smallest and largest), PII counts and types, token usage, error types. Never
 conversation text, respondent answers, raw values or free-text values. Reads DATABASE_URL like the application does.
 `show-config` prints the active extraction config versions (configuration, no respondent data): per persona the
-prompt name ("generic" when the config names none) and every field with its kind and the sensitive / provisional
+prompt name ("(none)" for a config that names none: it cannot run) and every field with its kind and the sensitive / provisional
 flags, plus the full config JSON. The seed of these configs is seed_config.sql (it never overwrites an existing
 database); an existing database gets new content through a NEW config_version (docs/feedback-extraction-bands.md,
 "Changing a band or a field").
@@ -38,22 +38,27 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.database.db import db  # noqa: E402
-from app.database.feedback_extraction_operations import extract_submission  # noqa: E402
-from app.services.feedback_constants import FEEDBACK_TENANT_CODE  # noqa: E402
-from app.services.feedback_extraction import KIND_INTEGER  # noqa: E402
+from app.database.feedback_extraction_operations import LlmCallError, extract_submission  # noqa: E402
+from app.services.feedback_extraction import KIND_INTEGER, ExtractionOutputError  # noqa: E402
 from app.services.feedback_extraction_constants import (  # noqa: E402
     CONFIG_TYPE_FEEDBACK_EXTRACTION,
     KIND_CATEGORY,
 )
 
-GENERIC_PROMPT_LABEL = "generic"
+NO_PROMPT_LABEL = "(none)"
 from app.services.llm import split_llm_usage  # noqa: E402
 
 
 async def _select_submissions(conn, tenant_code: str, session_type: str, submission_id: Optional[str],
-                              only_unprocessed: bool, limit: Optional[int]) -> List[str]:
+                              only_unprocessed: bool, limit: Optional[int], program_id: Optional[str] = None) -> List[str]:
     conditions = ["fs.tenant_code = $1", "fs.session_type = $2"]
     params: List[Any] = [tenant_code, session_type]
+    if program_id is not None:
+        # the same session_type can exist in two programs of a tenant: only the sessions of this program
+        params.append(program_id)
+        conditions.append(
+            f"EXISTS (SELECT 1 FROM submissions s WHERE s.submission_id = fs.submission_id "
+            f"AND s.tenant_code = fs.tenant_code AND s.program_id = ${len(params)}::uuid)")
     if submission_id is not None:
         params.append(submission_id)
         conditions.append(f"fs.submission_id = ${len(params)}")
@@ -72,7 +77,7 @@ def _new_aggregates(session_type: str, dry_run: bool) -> Dict[str, Any]:
         "session_type": session_type,
         "mode": "dry_run (nothing written)" if dry_run else "write",
         "submissions": {"selected": 0, "processed": 0, "failed": 0, "llm_calls": 0, "no_respondent_answer": 0,
-                        "oversized_respondent_message": 0},
+                        "oversized_respondent_message": 0, "conversation_too_long": 0},
         "fields": {},
         "pii": {"detected": 0, "not_detected": 0, "types": {}},
         "tokens": {"prompt": 0, "completion": 0},
@@ -92,8 +97,11 @@ def _add_outcome(agg: Dict[str, Any], outcome, top: int, values: Dict[str, Count
         # no call was made: no respondent answer, or a respondent message too long to send (flagged pii TRUE)
         subs[outcome.run.skip_reason] += 1
     for field in outcome.run.result.fields:
-        entry = agg["fields"].setdefault(
-            field.field_name, {"status": Counter(), "kind": outcome.field_kinds.get(field.field_name)})
+        # The sessions of a persona can come from several programs / sources, each with its own extraction config,
+        # and the same field name can have another kind in each: every kind that contributed is remembered, and
+        # _finish prints values only when ALL of them agree on a kind that may be printed.
+        entry = agg["fields"].setdefault(field.field_name, {"status": Counter(), "kinds": set()})
+        entry["kinds"].add(outcome.field_kinds.get(field.field_name))
         entry["status"][field.status] += 1
         if field.value is not None:   # counted here; whether any value is printed is decided in _finish
             values.setdefault(field.field_name, Counter())[field.value] += 1
@@ -106,12 +114,33 @@ def _add_outcome(agg: Dict[str, Any], outcome, top: int, values: Dict[str, Count
         pii["types"][t] = pii["types"].get(t, 0) + 1
 
 
+def _call_was_made(exc: BaseException) -> bool:
+    """
+    True when the failure happened AFTER a model call: a failed call, an answer the contract refuses (it carries the
+    call's usage), or a result found stale after the call. A setup or configuration failure raised before any call
+    made none and is not counted.
+    """
+    return isinstance(exc, (LlmCallError, ExtractionOutputError)) or isinstance(getattr(exc, "usage", None), dict)
+
+
+def _add_failed_call(agg: Dict[str, Any], exc: BaseException) -> None:
+    """The call of a failed session still happened and was billed: it counts in llm_calls and the token totals."""
+    if not _call_was_made(exc):
+        return
+    agg["submissions"]["llm_calls"] += 1
+    usage = getattr(exc, "usage", None)
+    prompt_tokens, completion_tokens, _ = split_llm_usage(usage if isinstance(usage, dict) else {})
+    agg["tokens"]["prompt"] += prompt_tokens
+    agg["tokens"]["completion"] += completion_tokens
+
+
 def _finish(agg: Dict[str, Any], top: int, values: Dict[str, Counter]) -> Dict[str, Any]:
     for name, entry in agg["fields"].items():
         entry["status"] = dict(sorted(entry["status"].items()))
         counter = values.get(name, Counter())
         entry["distinct_values"] = len(counter)
-        kind = entry.pop("kind")
+        kinds = entry.pop("kinds")
+        kind = next(iter(kinds)) if len(kinds) == 1 else None   # contributing configs that disagree: nothing printable
         if kind == KIND_CATEGORY:
             entry["top_values"] = dict(counter.most_common(top))
         elif kind == KIND_INTEGER and len(counter) > 0:
@@ -132,7 +161,7 @@ async def _run(args) -> Dict[str, Any]:
     overrides = {"llm_model": args.model, "max_tokens": args.max_tokens, "llm_timeout_seconds": args.timeout}
     async with db.pool.acquire() as conn:
         ids = await _select_submissions(conn, args.tenant_code, args.session_type, args.submission_id,
-                                        args.only_unprocessed, args.limit)
+                                        args.only_unprocessed, args.limit, args.program_id)
     agg["submissions"]["selected"] = len(ids)
     semaphore = asyncio.Semaphore(args.concurrency)
 
@@ -146,6 +175,7 @@ async def _run(args) -> Dict[str, Any]:
             except Exception as exc:  # noqa: BLE001  counted by type, the message may hold provider text
                 agg["submissions"]["failed"] += 1
                 agg["errors"][type(exc).__name__] = agg["errors"].get(type(exc).__name__, 0) + 1
+                _add_failed_call(agg, exc)
                 return
             _add_outcome(agg, outcome, args.top, values)
 
@@ -155,7 +185,7 @@ async def _run(args) -> Dict[str, Any]:
 
 def summarise_config(config: Any) -> Dict[str, Any]:
     """
-    {"prompt_name": <name or "generic">, "fields": [{"name", "kind", "sensitive", "provisional"}, ...]} of a stored
+    {"prompt_name": <name or "(none)">, "fields": [{"name", "kind", "sensitive", "provisional"}, ...]} of a stored
     config JSON, read leniently (a malformed config is still shown, with what can be read); no band lists.
     """
     name = config.get("prompt_name") if isinstance(config, dict) else None
@@ -166,7 +196,7 @@ def summarise_config(config: Any) -> Dict[str, Any]:
             continue
         summary.append({"name": item.get("name"), "kind": item.get("kind"),
                         "sensitive": item.get("sensitive") is True, "provisional": item.get("provisional") is True})
-    return {"prompt_name": name if isinstance(name, str) else GENERIC_PROMPT_LABEL, "fields": summary}
+    return {"prompt_name": name if isinstance(name, str) else NO_PROMPT_LABEL, "fields": summary}
 
 
 async def _show_config(args) -> List[Dict[str, Any]]:
@@ -175,6 +205,9 @@ async def _show_config(args) -> List[Dict[str, Any]]:
     if args.session_type is not None:
         params.append(args.session_type)
         conditions.append(f"c.session_type = ${len(params)}")
+    if args.program_id is not None:
+        params.append(args.program_id)
+        conditions.append(f"c.program_id = ${len(params)}::uuid")
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT c.session_type, c.config_source, c.program_id, c.id AS config_id, cv.id AS config_version_id, "
@@ -203,6 +236,14 @@ async def _main(args):
         await db.disconnect()
 
 
+def _uuid(text: str) -> str:
+    import uuid
+    try:
+        return str(uuid.UUID(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a program uuid") from None
+
+
 def _positive(text: str) -> int:
     value = int(text)
     if value <= 0:
@@ -216,8 +257,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="extract the metadata of stored sessions and print aggregates")
     run.add_argument("--session-type", required=True, help="persona key, for example Youth_Voice")
-    run.add_argument("--tenant-code", default=FEEDBACK_TENANT_CODE, help="tenant of the sessions (default mitra)")
+    run.add_argument("--tenant-code", required=True, help="tenant of the sessions (required: there is no default tenant)")
     run.add_argument("--limit", type=_positive, help="at most this many sessions (oldest first)")
+    run.add_argument("--program-id", type=_uuid, help="only the sessions of this program (uuid); the same session_type "
+                                                      "can exist in more than one program of a tenant")
     run.add_argument("--submission-id", help="only this session")
     run.add_argument("--only-unprocessed", action="store_true", help="only sessions whose pii_detected is still NULL")
     run.add_argument("--dry-run", action="store_true", help="call the LLM, print aggregates, write nothing")
@@ -229,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("show-config", help="print the active extraction config versions")
     show.add_argument("--session-type", help="only this persona key")
+    show.add_argument("--program-id", type=_uuid, help="only the configs of this program (uuid)")
 
     return parser
 

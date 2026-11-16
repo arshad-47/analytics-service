@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 
 from app.services import feedback_extraction as fx
-from app.services.feedback_extraction_constants import ANALYSIS_TYPE, PII_TYPES, PROMPT_NAME
+from app.services.feedback_extraction_constants import ANALYSIS_TYPE, PII_TYPES
+
+PROMPT_NAME = "Feedback Metadata Extraction"   # the program-neutral template prompt of seed_prompts.sql
 from seed_support import PERSONAS, extraction_config_v1
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -303,8 +305,8 @@ def test_out_of_range_age_and_a_stated_value_that_fits_no_band_are_unmapped_with
     answer = _answer(config, {"age": ("244", "244"), "monthly_household_income": (None, "between 60 and 90 thousand")})
     fields = {f.field_name: f for f in fx.parse_model_response(answer, config).fields}
     assert (fields["age"].status, fields["age"].value, fields["age"].raw_value) == ("unmapped", None, "244")
-    assert (fields["monthly_household_income"].status, fields["monthly_household_income"].raw_value) == (
-        "unmapped", "between 60 and 90 thousand")
+    # monthly_household_income is a sensitive field: its words are not stored (raw_value NULL) unless store_raw is set
+    assert (fields["monthly_household_income"].status, fields["monthly_household_income"].raw_value) == ("unmapped", None)
 
 
 def test_each_persona_accepts_an_answer_with_every_configured_field_and_rejects_a_missing_or_extra_one():
@@ -353,3 +355,32 @@ def test_bands_doc_lists_every_field_of_every_persona_and_where_the_bands_live()
     for prompt_name in PERSONA_PROMPT_NAMES.values():
         assert prompt_name in text
     assert "Changing a band or a field" in text and "How an existing database picks this up" in text
+
+
+# ------------------------------------------------------------------------------------------------ generic, config-driven seeds
+
+@pytest.mark.parametrize("persona", PERSONA_NAMES)
+def test_every_seeded_config_states_its_limits_pii_policy_and_placeholders_explicitly(persona):
+    raw = extraction_config_v1(persona)
+    config = fx.parse_extraction_config(raw)
+    assert raw["limits"] == {"max_respondent_message_chars": 20000, "max_bot_message_chars": 4000,
+                             "max_conversation_chars": 200000, "max_value_chars": 120, "max_raw_chars": 500}
+    assert config.limits == fx.Limits(20000, 4000, 200000, 120, 500)                       # the documented defaults
+    assert raw["pii"]["min_digit_run"] == 8 and raw["pii"]["min_digit_run_short_groups"] == 10
+    assert tuple(raw["pii"]["url_tlds"]) == fx.DEFAULT_PII_URL_TLDS
+    assert config.pii_policy == fx.DEFAULT_PII_POLICY
+    assert all(isinstance(t, dict) and set(t) == {"name", "description"} for t in raw["pii"]["types"])
+    assert config.pii_types == PII_TYPES and set(config.pii_type_descriptions) == set(PII_TYPES)
+    assert "id_number" in config.pii_type_descriptions and "Aadhaar" in config.pii_type_descriptions["id_number"]   # program data
+    assert "n/a" in config.placeholders and "नहीं पता" in config.placeholders                 # a non-English word is data too
+
+
+def test_the_generic_prompt_is_program_neutral_and_only_a_template():
+    sql = SEED_PROMPTS.read_text(encoding="utf-8")
+    _, system, user = _seeded_prompt(sql, PROMPT_NAME)
+    text = system + user
+    for word in ("One Million", "India", "Indian", "Youth", "Parent", "state, district", "government, private"):
+        assert word not in text, word
+    config = fx.parse_extraction_config(extraction_config_v1("Youth"))
+    prompt = fx.render_prompt(system, user, config, fx.build_conversation([]))        # renders with the engine's own variables
+    assert "{{" not in prompt

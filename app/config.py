@@ -112,6 +112,9 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.0)
     LLM_MAX_TOKENS: int = Field(default=2048)
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
+    # Opt-in debugging only: write the full prompt (DEBUG) and the provider's error body (ERROR) to the logs. The
+    # prompt can hold respondents' words and the provider's error body can echo it, so this stays False in production.
+    LLM_LOG_PAYLOADS: bool = Field(default=False)
 
     # SetFit Statement Categorization
     SETFIT_MODEL_ID: str = Field(default="")

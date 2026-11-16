@@ -1,7 +1,7 @@
 """
 Questionnaire versions of the feedback bots (pure functions, no I/O).
 
-A persona's Mitra upload config carries an ordered list
+The upload config of a persona (any source whose adapter versions its questionnaire) carries an ordered list
     "questionnaire_versions": [{"key": "V1", "effective_from": null},
                                {"key": "V2", "effective_from": "2030-01-15T09:00:00+05:30"}]
 and a session's version is the last entry whose effective_from is not after the session's first real

@@ -15,7 +15,7 @@ from app.api.services.feedback_uploads import (
     parse_feedback_csv,
     report_unexpected_stages,
 )
-from seed_support import PERSONAS, mitra_config_v1
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, mitra_config_v1
 from app.services.feedback_versions import parse_versions
 from feedback_test_windows import (
     TEST_V2_START,
@@ -28,7 +28,7 @@ from feedback_test_windows import (
 
 FIXTURES = Path(__file__).resolve().parent / "csv_uploads"
 PARENT = PERSONAS["Parent"]
-PROGRAM = {"id": PARENT["program_id"], "name": "1M Voice"}
+PROGRAM = {"id": PARENT["program_id"], "name": FEEDBACK_PROGRAM_NAME}
 LEADER = {"id": PARENT["leader_category_id"], "name": "Parent"}
 PUBLISHED = "2026-10-20T00:00:00.000Z"
 
@@ -126,22 +126,24 @@ def test_check_accepts_valid_file(config):
 
 def test_check_rejects_file_with_other_persona_session_type(config):
     errors = check_feedback_file(read_fixture("feedback_mixed_bots.csv"), config, PARENT_TYPE)
-    assert errors == ["File contains rows for session_type General_Public_Voice, but only session_type "
-                      "Parent_Voice is allowed for this upload"]
+    # counts only: the cell values of the file are never echoed
+    assert len(errors) == 1 and "General_Public_Voice" not in errors[0]
+    assert errors[0].startswith("2 row(s) carry a session_type other than Parent_Voice (1 other value(s))")
 
 
 def test_check_rejects_a_whole_file_of_another_persona(config):
     df = make_df([{"session_type": "Youth_Voice"}])
     errors = check_feedback_file(df, config, PARENT_TYPE)
-    assert len(errors) == 1 and "Youth_Voice" in errors[0] and "Parent_Voice" in errors[0]
+    assert len(errors) == 1 and "Youth_Voice" not in errors[0] and "Parent_Voice" in errors[0]
     assert check_feedback_file(df, mitra_config_v1("Youth"), "Youth_Voice") == []
 
 
-def test_check_lists_every_foreign_session_type_sorted(config):
+def test_check_counts_every_foreign_session_type_without_naming_them(config):
     df = make_df([{"session_type": "Youth_Voice"}, {"session_type": "Educator_Voice", "sequence": "2"},
                   {"sequence": "3"}])
     (error,) = check_feedback_file(df, config, PARENT_TYPE)
-    assert "Educator_Voice, Youth_Voice" in error
+    assert "2 row(s)" in error and "(2 other value(s))" in error
+    assert "Educator_Voice" not in error and "Youth_Voice" not in error
 
 
 def test_check_rejects_blank_session_type(config):
@@ -155,7 +157,8 @@ def test_check_reports_blank_and_foreign_session_types_together(config):
                   {"session_type": "   ", "sequence": "3"}])
     errors = check_feedback_file(df, config, PARENT_TYPE)
     assert len(errors) == 2
-    assert "Youth_Voice" in errors[0] and "blank in 2 row(s)" in errors[1]
+    assert "1 row(s) carry a session_type other than" in errors[0] and "Youth_Voice" not in errors[0]
+    assert "blank in 2 row(s)" in errors[1]
 
 
 def test_check_ignores_whitespace_around_session_type(config):
@@ -169,8 +172,7 @@ def test_check_requires_the_session_type_column(config):
     assert errors == ["Missing required column(s): session_type"]
 
 
-def test_check_requires_session_type_even_when_the_config_forgot_to_list_it(config):
-    config["columns"]["required"].remove("session_type")
+def test_check_requires_the_session_type_column(config):
     df = make_df([{}]).drop(columns=["session_type"])
     assert check_feedback_file(df, config, PARENT_TYPE) == ["Missing required column(s): session_type"]
 
@@ -180,7 +182,7 @@ def test_check_session_type_column_name_is_case_insensitive(config):
     assert check_feedback_file(df, config, PARENT_TYPE) == []
     wrong = make_df([{"session_type": "Youth_Voice"}]).rename(columns={"session_type": " SESSION_TYPE "})
     (error,) = check_feedback_file(wrong, config, PARENT_TYPE)
-    assert "Youth_Voice" in error
+    assert "1 row(s) carry a session_type other than Parent_Voice" in error
 
 
 def test_check_does_not_look_at_the_bot_id(config):
@@ -190,9 +192,10 @@ def test_check_does_not_look_at_the_bot_id(config):
     assert check_feedback_file(df.drop(columns=["bot_id", "bot_name"]), config, PARENT_TYPE) == []
 
 
-def test_bot_id_is_an_optional_column_in_the_config(config):
-    assert "bot_id" not in config["columns"]["required"]
-    assert "bot_id" in config["columns"]["optional"]
+def test_bot_id_is_an_optional_role_of_the_column_map():
+    from app.services.feedback_adapter_config import COLUMN_ROLES_OPTIONAL, COLUMN_ROLES_REQUIRED
+    assert "bot_id" not in COLUMN_ROLES_REQUIRED
+    assert "bot_id" in COLUMN_ROLES_OPTIONAL
 
 
 def test_check_reports_missing_required_columns_case_insensitively(config):
@@ -221,7 +224,7 @@ def test_valid_fixture_builds_one_event_per_session(config):
     assert e["submissionType"] == "feedback" and e["eventType"] == "create"
     assert e["tenantCode"] == "mitra" and e["sessionId"] == "a" * 32
     assert e["eventPublishedAt"] == PUBLISHED
-    assert e["tags"] == {"programId": PARENT["program_id"], "programName": "1M Voice",
+    assert e["tags"] == {"programId": PARENT["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
                          "leaderCategoryId": PARENT["leader_category_id"], "leaderCategoryName": "Parent",
                          "state": None, "district": None, "source": "mitra"}
     assert e["data"]["source"] == "mitra" and e["data"]["language"] == "hi"
@@ -271,7 +274,8 @@ def test_tail_only_session_is_skipped_with_clear_message(config):
 def test_first_stage_not_in_catalog_is_skipped(config):
     df = make_df(session_rows([("R", "SOMETHING_ELSE", "a", "b")]))
     events, skipped = build(df, config)
-    assert events == [] and "SOMETHING_ELSE" in skipped[0]["problems"][0]
+    assert events == [] and "questions catalog" in skipped[0]["problems"][0]
+    assert "SOMETHING_ELSE" not in skipped[0]["problems"][0]   # the cell value is not echoed
 
 
 def test_bot_bot_and_respondent_respondent_runs(config):
@@ -465,7 +469,7 @@ def test_bad_sessions_skipped_good_ones_still_build_with_all_problems(config):
     assert bad["sessionId"] == "2" * 32
     joined = " | ".join(bad["problems"])
     assert "duplicate sequence" in joined
-    assert "session_status differs" in joined and "WAITING" in joined and "is not one of" in joined
+    assert "session_status differs" in joined and "completion_map" in joined and "WAITING" not in joined
     assert "language differs" in joined
     assert len(bad["problems"]) >= 4                                  # all problems, not just the first
 
@@ -616,19 +620,28 @@ def test_event_values_are_plain_python_types(config):
             assert m["parentSequence"] is None or type(m["parentSequence"]) is int
 
 
-def test_performance_on_a_large_file(config):
+def test_building_events_scales_linearly_with_the_number_of_sessions(config):
+    """93,000 rows (3,000 sessions) are built; the time is judged RELATIVE to a small file, never against a clock."""
     import time
     items = [("R", "STATE_IDENTIFICATION", "a", "b")]
     for n in range(2, 32):
         items.append(("B", f"Q{n}", "q", "q") if n % 2 == 0 else ("R", f"Q{n - 1}", "r", "r"))
-    rows = []
-    for s in range(3000):
-        rows += session_rows(items, session=f"{s:032d}", submission_id=str(1000 + s))
-    df = make_df(rows)                      # 93,000 rows, 3,000 sessions
-    start = time.time()
-    events, skipped = build(df, config)
+
+    def frame(sessions):
+        rows = []
+        for s in range(sessions):
+            rows += session_rows(items, session=f"{s:032d}", submission_id=str(1000 + s))
+        return make_df(rows)
+
+    small, large = frame(375), frame(3000)                    # 8x the sessions: linear costs ~8x, quadratic ~64x
+    t0 = time.perf_counter()
+    build(small, config)
+    t_small = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    events, skipped = build(large, config)
+    t_large = time.perf_counter() - t0
     assert len(events) == 3000 and skipped == []
-    assert time.time() - start < 10
+    assert t_large < 30 * max(t_small, 0.01), (t_small, t_large)
 
 
 # ================================================================================== new behaviour
@@ -883,7 +896,9 @@ def test_unparsable_created_at_on_a_non_opening_row_is_a_problem(config):
     rows = new_rows(V2_STYLE)
     rows[1]["created_at"] = "not a date"
     events, skipped = build(make_df(rows), config)
-    assert events == [] and "not a date" in " | ".join(skipped[0]["problems"])
+    problem = " | ".join(skipped[0]["problems"])
+    assert events == [] and "created_at is missing or unparsable in 1 row(s) (data row(s) 2)" in problem
+    assert "not a date" not in problem
 
 
 def test_blank_row_with_a_stage_is_not_an_opening_row(config):
@@ -1117,7 +1132,7 @@ def test_session_of_another_session_type_is_skipped_others_still_build(config):
     events, skipped = build(make_df(good + foreign), config)
     assert [e["submissionId"] for e in events] == ["1"]
     assert skipped == [{"submissionId": "2", "sessionId": "f" * 32,
-                        "problems": ["session_type 'Youth_Voice' does not match the config's 'Parent_Voice'"]}]
+                        "problems": ["session_type does not match the config's 'Parent_Voice'"]}]
 
 
 def test_blank_session_type_in_a_session_skips_it(config):
@@ -1138,7 +1153,7 @@ def test_session_type_differing_within_a_session_skips_it(config):
     rows[1]["session_type"] = "Youth_Voice"
     events, skipped = build(make_df(rows), config)
     assert events == []
-    assert any("session_type differs within the session" in p and "Youth_Voice" in p and "Parent_Voice" in p
+    assert any("session_type differs within the session (2 distinct values)" in p and "Youth_Voice" not in p
                for p in skipped[0]["problems"])
 
 
@@ -1273,7 +1288,7 @@ def test_the_real_configs_of_all_personas_validate():
         assert cfg["opening_row"] == {"mode": "auto"}
         df = make_df(session_rows([("R", PERSONAS[persona]["first_question_key"], "a", "a")],
                                   session_type=cfg["session_type"]))
-        events, skipped = build(df, cfg, program_info={"id": "p", "name": "1M Voice"},
+        events, skipped = build(df, cfg, program_info={"id": "p", "name": FEEDBACK_PROGRAM_NAME},
                                 leader_info={"id": "l", "name": persona})
         assert skipped == [] and len(events) == 1
 
@@ -1300,7 +1315,7 @@ EDUCATOR_ITEMS = [
 def build_educator(df, cfg=None):
     return build_feedback_events(
         df, cfg if cfg is not None else mitra_config_v1("Educator"),
-        program_info={"id": EDUCATOR["program_id"], "name": "1M Voice"},
+        program_info={"id": EDUCATOR["program_id"], "name": FEEDBACK_PROGRAM_NAME},
         leader_info={"id": EDUCATOR["leader_category_id"], "name": "Educator"},
         tenant_code="mitra", source="mitra", published_at=PUBLISHED)
 
@@ -1342,10 +1357,10 @@ def test_educator_fixture_file():
 def test_an_educator_file_is_rejected_for_a_parent_upload_and_vice_versa(config):
     df = read_fixture("feedback_educator.csv")
     (error,) = check_feedback_file(df, config, PARENT_TYPE)
-    assert "Educator_Voice" in error and "Parent_Voice" in error
+    assert "Educator_Voice" not in error and "Parent_Voice" in error and "other than" in error
     parent_df = read_fixture("feedback_valid_mitra.csv")
     (error,) = check_feedback_file(parent_df, mitra_config_v1("Educator"), "Educator_Voice")
-    assert "Parent_Voice" in error and "Educator_Voice" in error
+    assert "Parent_Voice" not in error and "Educator_Voice" in error
 
 
 def test_educator_sessions_in_a_parent_config_are_skipped_per_session(config):
@@ -1445,3 +1460,31 @@ def test_report_without_a_stage_column_says_so(config):
     df = _stage_df().drop(columns=["stage"])
     report = report_unexpected_stages(df, config)
     assert report["unexpected_stages"] == {} and "missing" in report["note"]
+
+
+# stage report privacy -------------------------------------------------------------------------------------------
+
+def test_stage_report_never_lists_text_that_is_not_a_stage_key():
+    config = {**mitra_config_v1("Youth"), "expect_stages": ["STATE_IDENTIFICATION"]}
+    leaked = "My name is Asha and I live near the old mill"
+    rows = new_rows([("O", "", "hello", "hello"), ("B", "STATE_IDENTIFICATION", "q", "q"),
+                     ("R", leaked, "a", "a"), ("B", "MYSTERY_STAGE", "q2", "q2"),
+                     ("R", "yes, 12 years", "a2", "a2")], submission_id="100", session="a" * 32)
+    report = report_unexpected_stages(make_df(rows), config)
+    flat = json.dumps(report)
+    assert "Asha" not in flat and "mill" not in flat and "12 years" not in flat
+    assert report["unexpected_stages"] == {"MYSTERY_STAGE": 1}
+    assert report["unexpected_stage_count"] == 1
+    assert report["other_stage_values"] == 2              # a count, no text
+    assert report["sessions_with_unexpected_stages"] == 1
+
+
+def test_stage_report_key_pattern_boundaries_and_no_counter_when_all_are_keys():
+    config = {**mitra_config_v1("Youth"), "expect_stages": ["X"]}
+    ok, too_long = "A" * 64, "A" * 65
+    rows = new_rows([("O", "", "h", "h"), ("B", ok, "q", "q"), ("B", too_long, "q", "q"), ("B", "HAS-DASH", "q", "q")],
+                    submission_id="1", session="a" * 32)
+    report = report_unexpected_stages(make_df(rows), config)
+    assert list(report["unexpected_stages"]) == [ok] and report["other_stage_values"] == 2
+    rows = new_rows([("O", "", "h", "h"), ("B", "KEY_ONE", "q", "q")], submission_id="2", session="b" * 32)
+    assert "other_stage_values" not in report_unexpected_stages(make_df(rows), config)

@@ -6,19 +6,19 @@ The delta check (new / unchanged / updated sessions, already stored responses) i
 tests/test_feedback_delta.py.
 
 Everything is in-memory fakes (same conventions as tests/unit_testing.py) except the last section,
-which is skipped unless FEEDBACK_TEST_DATABASE_URL points at a scratch database that already has
-schema.sql applied.
+which is skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch
+database for this file; the section applies schema.sql itself).
 """
 import asyncio
 import csv
 import io
 import json
-import os
 import uuid
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pg_support
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -28,19 +28,20 @@ import app.api.services.uploads as uploads_service_module
 import app.database.feedback_operations as feedback_ops
 import app.database.operations as operations_module
 from app.config import settings
-from seed_support import PERSONAS, gforms_config_v1, mitra_config_v1
+from app.services.feedback_adapter_config import COLUMN_ROLES_REQUIRED
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, gforms_config_v1, mitra_config_v1
 from tests.conftest import FakeConn, install_fake_db, settings_override
 from feedback_test_windows import config_with_v2
 
 YOUTH = PERSONAS["Youth"]
-PROGRAM = {"id": YOUTH["program_id"], "name": "1M Voice"}
+PROGRAM = {"id": YOUTH["program_id"], "name": FEEDBACK_PROGRAM_NAME}
 LEADER = {"id": YOUTH["leader_category_id"], "name": "Youth"}
 RESOLVED = {"program": PROGRAM, "leader": LEADER, "tenant_code": "mitra"}
 
 
 def _resolved(persona: str) -> dict:
     p = PERSONAS[persona]
-    return {"program": {"id": p["program_id"], "name": "1M Voice"},
+    return {"program": {"id": p["program_id"], "name": FEEDBACK_PROGRAM_NAME},
             "leader": {"id": p["leader_category_id"], "name": persona}, "tenant_code": "mitra"}
 
 
@@ -167,7 +168,8 @@ def _headers():
 
 
 def _form(**overrides):
-    data = {"report_type": "feedback", "program_name": "1M Voice", "leader_category": "Youth", "tenant_code": "mitra"}
+    data = {"report_type": "feedback", "program_name": FEEDBACK_PROGRAM_NAME, "leader_category": "Youth", "tenant_code": "mitra",
+            "source": "mitra"}
     data.update(overrides)
     return data
 
@@ -210,8 +212,8 @@ def test_feedback_good_persona_file_accepted(client, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"message": "Successfully uploaded to cloud", "id": 7, "status": "pending"}
 
-    stores.lookup.assert_awaited_once_with("1M Voice", "Youth", "mitra")
-    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra")  # (program_id, config_source): no bot id
+    stores.lookup.assert_awaited_once_with(FEEDBACK_PROGRAM_NAME, "Youth", "mitra")
+    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra", tenant_code="mitra")  # (program_id, config_source): no bot id
     stores.upload.assert_called_once()
     kwargs = stores.insert.await_args.kwargs
     assert kwargs["report_type"] == "feedback"
@@ -235,7 +237,7 @@ def test_feedback_background_task_gets_parsed_string_dataframe(monkeypatch):
 
     async def run():
         return await uploads_service_module.handle_upload(
-            "feedback", "1M Voice", "Youth", "mitra", "na.csv", _csv(rows), tasks, source="mitra")
+            "feedback", FEEDBACK_PROGRAM_NAME, "Youth", "mitra", "na.csv", _csv(rows), tasks, source="mitra")
 
     out = asyncio.run(run())
     assert out["status"] == "in_progress"
@@ -261,8 +263,9 @@ def test_feedback_wrong_persona_session_type_rejected_whole(client, monkeypatch)
                        files=_files(youth_rows))
     assert resp.status_code == 400
     assert resp.json()["errors"] == [
-        "File contains rows for session_type Youth_Voice, but only session_type Parent_Voice is allowed for this upload"]
-    stores.config.assert_awaited_once_with(PERSONAS["Parent"]["program_id"], "mitra")
+        "8 row(s) carry a session_type other than Parent_Voice (1 other value(s)); only session_type Parent_Voice is "
+        "allowed for this upload"]
+    stores.config.assert_awaited_once_with(PERSONAS["Parent"]["program_id"], "mitra", tenant_code="mitra")
     _assert_nothing_stored(stores)
 
 
@@ -272,7 +275,7 @@ def test_feedback_file_mixing_two_personas_is_rejected_whole(client, monkeypatch
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files(mixed))
     assert resp.status_code == 400
     (error,) = resp.json()["errors"]
-    assert "Parent_Voice" in error and "only session_type Youth_Voice is allowed" in error
+    assert "Parent_Voice" not in error and "only session_type Youth_Voice is allowed" in error
     _assert_nothing_stored(stores)
 
 
@@ -287,7 +290,7 @@ def test_feedback_file_with_several_bot_ids_is_accepted_and_all_recorded(client,
     meta = stores.insert.await_args.kwargs["meta_data"]
     assert meta["session_type"] == "Youth_Voice"
     assert meta["bot_ids"] == ["90", "91"]  # distinct, sorted, informational
-    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra")  # the bot id never picks the config
+    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra", tenant_code="mitra")  # the bot id never picks the config
 
 
 def test_feedback_file_without_bot_id_column_is_accepted(client, monkeypatch):
@@ -338,8 +341,8 @@ def test_feedback_educator_upload_resolves_its_own_config(client, monkeypatch):
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(leader_category="Educator"),
                        files=_files(_csv(rows)))
     assert resp.status_code == 200, resp.text
-    stores.lookup.assert_awaited_once_with("1M Voice", "Educator", "mitra")
-    stores.config.assert_awaited_once_with(edu["program_id"], "mitra")
+    stores.lookup.assert_awaited_once_with(FEEDBACK_PROGRAM_NAME, "Educator", "mitra")
+    stores.config.assert_awaited_once_with(edu["program_id"], "mitra", tenant_code="mitra")
     meta = stores.insert.await_args.kwargs["meta_data"]
     assert meta["persona"] == "Educator"
     assert meta["session_type"] == "Educator_Voice"
@@ -352,8 +355,8 @@ def test_feedback_educator_rows_uploaded_as_youth_rejected(client, monkeypatch):
     rows = _session("a" * 32, "1001", bot="110", session_type="Educator_Voice")
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files(_csv(rows)))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == [
-        "File contains rows for session_type Educator_Voice, but only session_type Youth_Voice is allowed for this upload"]
+    assert len(resp.json()["errors"]) == 1
+    assert "Educator_Voice" not in resp.json()["errors"][0] and "only session_type Youth_Voice is allowed" in resp.json()["errors"][0]
     _assert_nothing_stored(stores)
 
 
@@ -363,7 +366,7 @@ def test_feedback_persona_without_mitra_config_rejected(client, monkeypatch):
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(leader_category="Educator"),
                        files=_files(_csv(rows)))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == ["No Mitra upload config is set up for Educator"]
+    assert resp.json()["errors"] == ["No upload config for source 'mitra' is set up for Educator"]
     _assert_nothing_stored(stores)
 
 
@@ -417,13 +420,50 @@ def test_feedback_duplicate_file_still_rejected(client, monkeypatch):
 
 
 # `source` and size cap
-def test_feedback_invalid_source_rejected(client, monkeypatch):
+@pytest.mark.parametrize("bad", ["WhatsApp App", "ptm-app", "x" * 41, "any", "a\nb"])
+def test_feedback_unsafe_source_label_rejected_before_any_lookup(client, monkeypatch, bad):
     stores = _patch_upload_pipeline(monkeypatch)
-    resp = client.post("/v1/upload/", headers=_headers(), data=_form(source="whatsapp"), files=_files())
-    assert resp.status_code == 400
-    assert "whatsapp" in resp.json()["detail"] and "mitra" in resp.json()["detail"]
+    resp = client.post("/v1/upload/", headers=_headers(), data=_form(source=bad), files=_files())
+    assert resp.status_code == 400 and resp.json()["detail"].startswith("Invalid source")
     stores.lookup.assert_not_called()
     _assert_nothing_stored(stores)
+
+
+def test_feedback_unknown_but_safe_source_is_refused_only_for_lack_of_a_config(client, monkeypatch):
+    # "whatsapp" is a perfectly good LABEL: no list in code decides; the missing upload config does
+    stores = _patch_upload_pipeline(monkeypatch, active=None)
+    resp = client.post("/v1/upload/", headers=_headers(), data=_form(source="whatsapp"), files=_files())
+    assert resp.status_code == 400 and resp.json()["errors"] == [
+        "No upload config for source 'whatsapp' is set up for Youth"]
+    stores.config.assert_awaited_once_with(PROGRAM["id"], "whatsapp", tenant_code="mitra")
+    _assert_nothing_stored(stores)
+
+
+@pytest.mark.parametrize("missing", ["source", "tenant_code"])
+def test_feedback_requires_tenant_code_and_source_no_defaults(client, monkeypatch, missing):
+    stores = _patch_upload_pipeline(monkeypatch)
+    data = _form()
+    del data[missing]
+    resp = client.post("/v1/upload/", headers=_headers(), data=data, files=_files())
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", missing]
+    stores.lookup.assert_not_called()
+    _assert_nothing_stored(stores)
+
+
+@pytest.mark.parametrize("missing", ["source", "tenant_code"])
+def test_feedback_blank_tenant_code_or_source_is_missing_too(client, monkeypatch, missing):
+    stores = _patch_upload_pipeline(monkeypatch)
+    resp = client.post("/v1/upload/", headers=_headers(), data=_form(**{missing: "  "}), files=_files())
+    assert resp.status_code == 422
+    stores.lookup.assert_not_called()
+
+
+def test_feedback_unsafe_tenant_code_rejected(client, monkeypatch):
+    stores = _patch_upload_pipeline(monkeypatch)
+    resp = client.post("/v1/upload/", headers=_headers(), data=_form(tenant_code="mitra\nFORGED"), files=_files())
+    assert resp.status_code == 400 and "FORGED" not in resp.text
+    stores.lookup.assert_not_called()
 
 
 def test_feedback_source_defaults_to_mitra_and_is_case_insensitive(client, monkeypatch):
@@ -440,8 +480,8 @@ def test_gforms_good_persona_file_accepted(client, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"message": "Successfully uploaded to cloud", "id": 7, "status": "pending"}
 
-    stores.lookup.assert_awaited_once_with("1M Voice", "Youth", "mitra")
-    stores.config.assert_awaited_once_with(PROGRAM["id"], "google_forms")
+    stores.lookup.assert_awaited_once_with(FEEDBACK_PROGRAM_NAME, "Youth", "mitra")
+    stores.config.assert_awaited_once_with(PROGRAM["id"], "google_forms", tenant_code="mitra")
     stores.upload.assert_called_once()
     meta = stores.insert.await_args.kwargs["meta_data"]
     assert meta["source"] == "google_forms"
@@ -461,7 +501,7 @@ def test_gforms_background_task_gets_parsed_wide_dataframe(monkeypatch):
 
     async def run():
         return await uploads_service_module.handle_upload(
-            "feedback", "1M Voice", "Youth", "mitra", "forms.csv", _gforms_csv(), tasks, source="google_forms")
+            "feedback", FEEDBACK_PROGRAM_NAME, "Youth", "mitra", "forms.csv", _gforms_csv(), tasks, source="google_forms")
 
     assert asyncio.run(run())["status"] == "in_progress"
     fn, record_id, file_bytes, df = tasks.add_task.call_args.args
@@ -515,7 +555,7 @@ def test_mitra_source_with_gforms_shaped_file_rejected(client, monkeypatch):
     assert resp.status_code == 400
     # a wide Google Forms export has none of the Mitra columns (the active config is looked up first)
     (error,) = resp.json()["errors"]
-    assert error == "Missing required column(s): " + ", ".join(ACTIVE_CONFIG["config"]["columns"]["required"])
+    assert error == "Missing required column(s): " + ", ".join(COLUMN_ROLES_REQUIRED)
     _assert_nothing_stored(stores)
 
 
@@ -523,7 +563,7 @@ def test_gforms_no_config_for_persona_rejected(client, monkeypatch):
     stores = _patch_upload_pipeline(monkeypatch, active=None)
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(source="google_forms"), files=_files(_gforms_csv()))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == ["No Google Forms upload config is set up for Youth"]
+    assert resp.json()["errors"] == ["No upload config for source 'google_forms' is set up for Youth"]
     _assert_nothing_stored(stores)
 
 
@@ -534,8 +574,8 @@ def test_gforms_educator_has_no_google_forms_config(client, monkeypatch):
     resp = client.post("/v1/upload/", headers=_headers(),
                        data=_form(source="google_forms", leader_category="Educator"), files=_files(_gforms_csv()))
     assert resp.status_code == 400
-    assert resp.json()["errors"] == ["No Google Forms upload config is set up for Educator"]
-    stores.config.assert_awaited_once_with(PERSONAS["Educator"]["program_id"], "google_forms")
+    assert resp.json()["errors"] == ["No upload config for source 'google_forms' is set up for Educator"]
+    stores.config.assert_awaited_once_with(PERSONAS["Educator"]["program_id"], "google_forms", tenant_code="mitra")
     _assert_nothing_stored(stores)
 
 
@@ -547,7 +587,7 @@ def test_gforms_parent_upload_still_works_with_its_own_config(client, monkeypatc
     resp = client.post("/v1/upload/", headers=_headers(),
                        data=_form(source="google_forms", leader_category="Parent"), files=_files(_gforms_csv("Parent")))
     assert resp.status_code == 200, resp.text
-    stores.config.assert_awaited_once_with(parent["program_id"], "google_forms")
+    stores.config.assert_awaited_once_with(parent["program_id"], "google_forms", tenant_code="mitra")
     meta = stores.insert.await_args.kwargs["meta_data"]
     assert (meta["source"], meta["persona"], meta["session_type"]) == ("google_forms", "Parent", "Parent_Voice")
 
@@ -610,8 +650,8 @@ def test_feedback_size_cap_comes_from_the_config_story_keeps_its_own(client, mon
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files())
     assert resp.status_code == 200, resp.text
     # the config was loaded ONCE for the upload (the route hands it to the service)
-    stores.lookup.assert_awaited_once_with("1M Voice", "Youth", "mitra")
-    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra")
+    stores.lookup.assert_awaited_once_with(FEEDBACK_PROGRAM_NAME, "Youth", "mitra")
+    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra", tenant_code="mitra")
 
     # story with the same payload size is rejected by the story cap
     resp = client.post(
@@ -734,7 +774,7 @@ def test_expect_stages_all_known_reports_nothing_unexpected(client, monkeypatch)
 def _record(meta: Optional[dict] = None) -> dict:
     return {
         "id": 7, "report_type": "feedback", "cloud_storage_path": "path/to/youth.csv",
-        "leader_category": "Youth", "program_name": "1M Voice",
+        "leader_category": "Youth", "program_name": FEEDBACK_PROGRAM_NAME,
         "meta_data": meta if meta is not None else {"tenant_code": "mitra", "source": "mitra"},
     }
 
@@ -1050,7 +1090,7 @@ def test_background_config_missing_on_hold(monkeypatch):
     h.run(file_bytes=GOOD_FILE)
     status, meta = h.final
     assert status == "on_hold"
-    assert meta["validation_errors"] == ["No Mitra upload config is set up for Youth"]
+    assert meta["validation_errors"] == ["No upload config for source 'mitra' is set up for Youth"]
 
 
 def test_background_db_error_on_hold(monkeypatch):
@@ -1116,24 +1156,12 @@ def test_story_record_never_enters_feedback_branch(monkeypatch):
 
 
 # REAL POSTGRES (opt-in): get_program_and_leader / get_active_feedback_config
-DB_URL = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
-
-
-def schema_sql() -> str:
-    """schema.sql with IF NOT EXISTS injected the way Database.initialize_schema does it."""
-    from app.database.db import SCHEMA_FILE
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    return sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
+DB_URL = pg_support.SERVER_URL
 
 
 async def ensure_schema(conn) -> None:
     """Applies schema.sql when the scratch database is still empty (idempotent otherwise)."""
-    await conn.execute(schema_sql())
+    await conn.execute(pg_support.schema_sql())
 
 
 @pytest.mark.skipif(DB_URL is None, reason="FEEDBACK_TEST_DATABASE_URL not set (scratch DB, empty or with schema.sql applied)")
@@ -1158,27 +1186,29 @@ def test_real_db_lookups_by_name_and_tenant(monkeypatch):
                     "INSERT INTO programs (leaders_id, name, tenant_code) VALUES ($1, '1M Voice', 'other')", other_leader)
 
             for persona, p in PERSONAS.items():
-                got = await feedback_ops.get_program_and_leader("1M Voice", persona, "mitra")
+                got = await feedback_ops.get_program_and_leader(FEEDBACK_PROGRAM_NAME, persona, "mitra")
                 assert got == {
-                    "program": {"id": p["program_id"], "name": "1M Voice"},
+                    "program": {"id": p["program_id"], "name": FEEDBACK_PROGRAM_NAME},
                     "leader": {"id": p["leader_category_id"], "name": persona},
                     "tenant_code": "mitra",
                 }
-            other = await feedback_ops.get_program_and_leader("1M Voice", "Youth", "other")
+            other = await feedback_ops.get_program_and_leader(FEEDBACK_PROGRAM_NAME, "Youth", "other")
             assert other["leader"]["id"] == str(other_leader)
-            assert await feedback_ops.get_program_and_leader("1M Voice", "Nobody", "mitra") is None
+            assert await feedback_ops.get_program_and_leader(FEEDBACK_PROGRAM_NAME, "Nobody", "mitra") is None
             assert await feedback_ops.get_program_and_leader("No Program", "Youth", "mitra") is None
-            assert await feedback_ops.get_program_and_leader("1M Voice", "Youth", "missing-tenant") is None
+            assert await feedback_ops.get_program_and_leader(FEEDBACK_PROGRAM_NAME, "Youth", "missing-tenant") is None
 
             for persona, p in PERSONAS.items():
-                active = await feedback_ops.get_active_feedback_config(p["program_id"])  # default source: mitra
+                active = await feedback_ops.get_active_feedback_config(p["program_id"], "mitra")
                 assert active["config_id"] == p["config_id"] and active["version"] == 1
                 assert active["session_type"] == p["session_type"]
                 assert active["config"] == mitra_config_v1(persona)  # JSONB came back as a dict
-                same = await feedback_ops.get_active_feedback_config(p["program_id"], "mitra")
+                same = await feedback_ops.get_active_feedback_config(p["program_id"], "mitra", tenant_code="mitra")
                 assert same == active
+                # the tenant narrows the lookup: another tenant's code finds nothing
+                assert await feedback_ops.get_active_feedback_config(p["program_id"], "mitra", tenant_code="other") is None
             # the lookup is by program + source: an unknown program or source finds nothing
-            assert await feedback_ops.get_active_feedback_config(str(uuid.uuid4())) is None
+            assert await feedback_ops.get_active_feedback_config(str(uuid.uuid4()), "mitra") is None
             assert await feedback_ops.get_active_feedback_config(YOUTH["program_id"], "whatsapp") is None
 
             # only the ACTIVE version is returned; v2 supersedes v1
@@ -1187,12 +1217,12 @@ def test_real_db_lookups_by_name_and_tenant(monkeypatch):
                 await conn.execute(
                     "INSERT INTO config_version (config_id, version, is_active, config) VALUES ($1::uuid, 2, TRUE, $2::jsonb)",
                     YOUTH["config_id"], json.dumps({"marker": "v2"}))
-            active = await feedback_ops.get_active_feedback_config(YOUTH["program_id"])
+            active = await feedback_ops.get_active_feedback_config(YOUTH["program_id"], "mitra")
             assert active["version"] == 2 and active["config"] == {"marker": "v2"}
             assert active["session_type"] == "Youth_Voice"
             async with pool.acquire() as conn:
                 await conn.execute("UPDATE config_version SET is_active = FALSE WHERE config_id = $1::uuid", YOUTH["config_id"])
-            assert await feedback_ops.get_active_feedback_config(YOUTH["program_id"]) is None
+            assert await feedback_ops.get_active_feedback_config(YOUTH["program_id"], "mitra") is None
         finally:
             # these lookups need committed rows (feedback_ops uses its own connections), so undo what the test added
             async with pool.acquire() as conn:
@@ -1239,3 +1269,26 @@ def test_real_db_active_config_is_found_per_source(monkeypatch):
             await pool.close()  # the seed rows stay (the opt-in tests run against an empty database per run)
 
     asyncio.run(run())
+
+
+# ---- ambiguous program / config (fixer S: AmbiguousFeedbackConfigError) -> 409 without config content ----
+
+@pytest.mark.parametrize("where", ["program", "config"])
+def test_feedback_ambiguous_program_or_config_is_409_without_config_content(client, monkeypatch, where):
+    from app.database.feedback_operations import AmbiguousFeedbackConfigError
+    stores = _patch_upload_pipeline(monkeypatch)
+    leaked = "SECRET-CANDIDATE-LIST id=deadbeef session_type=Youth_Voice,Teacher_Voice"
+    boom = AsyncMock(side_effect=AmbiguousFeedbackConfigError(f"2 configs match ({leaked})"))
+    monkeypatch.setattr(feedback_ops, "get_program_and_leader" if where == "program" else "get_active_feedback_config", boom)
+    resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files())
+    assert resp.status_code == 409
+    assert "SECRET-CANDIDATE" not in resp.text and "deadbeef" not in resp.text and "Teacher_Voice" not in resp.text
+    assert "operator" in resp.json()["detail"]
+    _assert_nothing_stored(stores)
+
+
+def test_feedback_config_lookup_is_narrowed_by_tenant(client, monkeypatch):
+    stores = _patch_upload_pipeline(monkeypatch)
+    resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files())
+    assert resp.status_code == 200
+    stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra", tenant_code="mitra")

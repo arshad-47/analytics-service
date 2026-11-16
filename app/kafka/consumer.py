@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
@@ -16,10 +17,11 @@ from app.database.operations import (
     update_submission_status,
     is_feedback_type,
 )
-from app.services.feedback_config_cache import FeedbackConfigCache
+from app.services.feedback_config_cache import FeedbackConfigCache, InvalidCacheKeyError
 from app.services.feedback_config_validation import validate_ingestion_schema_config, validate_process_steps
+from app.services.feedback_adapter_config import validate_adapter_config
 from app.services.feedback_constants import CONFIG_KEY_INGESTION_SCHEMA, CONFIG_KEY_PROCESS_STEPS
-from app.services.ingestion_validation import is_uuid, validate_ingestion_schema
+from app.services.ingestion_validation import feedback_identifier_problems, validate_ingestion_schema
 from app.temporal.workflows import ConfigDrivenProcessingWorkflow
 
 logger = logging.getLogger("analytics_service.kafka.consumer")
@@ -28,7 +30,7 @@ logger = logging.getLogger("analytics_service.kafka.consumer")
 # or invalid: that is an operator error (not a producer bug), the event itself may be fine.
 FEEDBACK_CONFIG_REPLAY_HINT = (
     "operator error, not a bad event: fix the persona's feedback_upload config (for a config that predates the "
-    "per-bot settings run `python tools/feedback_config.py migrate`), then replay this message from the DLQ"
+    "per-bot settings run `python tools/feedback_config.py migrate`, or migrate-legacy for a database created before session_type existed), then replay this message from the DLQ"
 )
 
 # How long the consumer trusts a persona's feedback settings (ingestion schema, process steps) before it reads the
@@ -67,8 +69,21 @@ def _event_text(event: dict, *path: str):
     return None
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_MAX_LOGGED_IDENTIFIER = 128
+
+
+def _log_safe(value) -> str:
+    """An identifier as it may appear in a log line: control characters (CR, LF, ...) become '?' and the length is
+    capped, so an event can never forge or flood a log line (an event that failed validation still has its raw ids)."""
+    text = _CONTROL_CHARS.sub("?", str(value))
+    if len(text) > _MAX_LOGGED_IDENTIFIER:
+        text = text[:_MAX_LOGGED_IDENTIFIER] + "..."
+    return text
+
+
 def _format_identifiers(identifiers: dict) -> str:
-    present = [f"{k}={v}" for k, v in identifiers.items() if v is not None]
+    present = [f"{k}={_log_safe(v)}" for k, v in identifiers.items() if v is not None]
     return ", ".join(present) if present else "no identifiers found"
 
 
@@ -107,10 +122,16 @@ class IngestionConsumer:
             if key not in config:
                 raise ValueError(
                     f"Feedback config of session_type {session_type!r} ({source}) is missing '{key}' "
-                    "(add it with: python tools/feedback_config.py migrate)"
+                    "(add it with: python tools/feedback_config.py migrate; or migrate-legacy for a database created before session_type existed)"
                 )
+        # the adapter says how the source's identity rules work; the event must carry the same one
+        try:
+            adapter = validate_adapter_config(config)
+        except ValueError as exc:
+            raise ValueError(f"{exc} (session_type {session_type!r}, source {source!r})")
         return {
             "config_version_id": active["config_version_id"],
+            "adapter": adapter,
             "ingestion_schema": validate_ingestion_schema_config(config[CONFIG_KEY_INGESTION_SCHEMA]),
             "process_steps": validate_process_steps(config[CONFIG_KEY_PROCESS_STEPS]),
         }
@@ -137,14 +158,23 @@ class IngestionConsumer:
                 "Cannot select the feedback ingestion schema (it is the persona's upload config): "
                 + ", ".join(f"'{name}' is missing or not a non-empty string" for name in missing)
             ]
-        if not is_uuid(lookup["tags.programId"]):
+        # The identifiers become cache keys and SQL parameters: validate them BEFORE they are used (a hostile event
+        # could otherwise pin large keys in the cache or carry control characters). The values are never echoed.
+        bad = feedback_identifier_problems(event, create=True)
+        if len(bad) > 0:
             if event_type == "delete":
                 return None, []
-            return None, [f"'tags.programId' must be a UUID, got {lookup['tags.programId']!r}"]
+            return None, bad
         try:
             runtime = await self.feedback_config_cache.get(
                 lookup["tenantCode"], lookup["tags.programId"], lookup["data.sessionType"], lookup["data.source"]
             )
+        except InvalidCacheKeyError as exc:
+            # an identifier the cache refuses as a key (defence in depth: validated above): name the failed field, the
+            # message never carries its value. A producer bug, not an operator error, so no replay hint.
+            if event_type == "delete":
+                return None, []
+            return None, [f"Invalid feedback config key, the event cannot be tied to a persona config: {exc}"]
         except ValueError as exc:
             if event_type == "delete":
                 return None, []
@@ -157,6 +187,13 @@ class IngestionConsumer:
                 f"{lookup['data.sessionType']!r}, program {lookup['tags.programId']!r}, tenant {lookup['tenantCode']!r} "
                 f"({FEEDBACK_CONFIG_REPLAY_HINT})"
             ]
+        if event_type == "create":
+            event_adapter = _event_text(event, "data", "adapter")
+            if event_adapter != runtime["adapter"]:
+                return None, [
+                    "'data.adapter' does not match the adapter of the persona's upload config "
+                    f"(the config's adapter is {runtime['adapter']!r}; {FEEDBACK_CONFIG_REPLAY_HINT})"
+                ]
         return runtime["ingestion_schema"], []
 
     async def initialize(self):

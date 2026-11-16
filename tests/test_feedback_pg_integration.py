@@ -5,25 +5,26 @@ A persona is identified by its session_type (Youth_Voice, ...), never by a bot i
 by (source, type, program, session_type), the bot id on a config is informational, and every feedback
 submission carries session_type and questionnaire_version.
 
-Skipped unless FEEDBACK_TEST_DATABASE_URL is set to a DSN of an EMPTY database, e.g.
-  FEEDBACK_TEST_DATABASE_URL=postgresql://postgres@localhost:54329/fb_test
-The tests apply schema.sql themselves, exactly the way app/database/db.py does (IF NOT EXISTS
-injection), and never touch anything outside that database. Test data is synthetic.
+Skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (a role with CREATEDB), e.g.
+  FEEDBACK_TEST_DATABASE_URL=postgresql://postgres@localhost:54329/postgres
+tests/pg_support.py creates an EMPTY scratch database for this file and drops it afterwards. The tests apply
+schema.sql themselves, exactly the way app/database/db.py does (IF NOT EXISTS injection), and never touch anything
+outside that database. Test data is synthetic.
 """
 import asyncio
 import contextlib
 import json
-import os
 import uuid
 
 import asyncpg
 import pytest
+import pg_support
 
 import app.database.feedback_operations as feedback_ops
-from app.database.db import SCHEMA_FILE, db
-from seed_support import PERSONAS, gforms_config_v1, mitra_config_v1, seed_config
+from app.database.db import db
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS, SEED_CONFIG_COUNT, gforms_config_v1, mitra_config_v1, seed_config
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
@@ -33,18 +34,6 @@ PARENT = PERSONAS["Parent"]
 EDUCATOR = PERSONAS["Educator"]
 # personas with a Google Form (the Educator has none)
 GFORMS_PERSONA_NAMES = [name for name, p in PERSONAS.items() if p["gforms_config_id"] is not None]
-
-
-def _schema_sql() -> str:
-    """schema.sql with IF NOT EXISTS injected the way Database.initialize_schema does it."""
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    sql = sql.replace("CREATE TABLE IF NOT EXISTS ", "__TABLE_ALREADY__")
-    sql = sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("__TABLE_ALREADY__", "CREATE TABLE IF NOT EXISTS ")
-    sql = sql.replace("CREATE INDEX IF NOT EXISTS ", "__INDEX_ALREADY__")
-    sql = sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-    sql = sql.replace("__INDEX_ALREADY__", "CREATE INDEX IF NOT EXISTS ")
-    return sql
 
 
 def run_db(body):
@@ -58,7 +47,7 @@ def run_db(body):
         tx = conn.transaction()
         await tx.start()
         try:
-            sql = _schema_sql()
+            sql = pg_support.schema_sql()
             await conn.execute(sql)
             await conn.execute(sql)
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT DO NOTHING")
@@ -168,7 +157,7 @@ def test_seeded_rows_match_the_contract():
             assert (lc["name"], lc["tenant_code"]) == (persona, "mitra")
             prog = await conn.fetchrow("SELECT name, leaders_id::text AS leaders_id FROM programs WHERE id = $1::uuid",
                                        p["program_id"])
-            assert prog["name"] == "1M Voice" and prog["leaders_id"] == p["leader_category_id"]
+            assert prog["name"] == FEEDBACK_PROGRAM_NAME and prog["leaders_id"] == p["leader_category_id"]
             cfg = await conn.fetchrow(
                 "SELECT config_source, config_type, program_id::text AS program_id, leader_id, session_type, bot_id, "
                 "bot_name, tenant_code, name FROM config WHERE id = $1::uuid", p["config_id"])
@@ -261,7 +250,7 @@ def test_seed_does_not_overwrite_google_forms_edits():
         assert await conn.fetchval("SELECT name FROM config WHERE id = $1::uuid", YOUTH["gforms_config_id"]) == "edited gf"
         assert await conn.fetchval("SELECT count(*) FROM config_version WHERE config_id = $1::uuid",
                                    YOUTH["gforms_config_id"]) == 2
-        assert await conn.fetchval("SELECT count(*) FROM config") == 11
+        assert await conn.fetchval("SELECT count(*) FROM config") == SEED_CONFIG_COUNT
     run_db(body)
 
 
@@ -271,7 +260,7 @@ def test_seed_skips_when_tenant_missing():
         tx = conn.transaction()
         await tx.start()
         try:
-            await conn.execute(_schema_sql())
+            await conn.execute(pg_support.schema_sql())
             await seed_config(conn)  # no tenant row: the seed is a no-op
             for table in ("tenant", "leader_category", "programs", "config", "config_version"):
                 assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 0, table
@@ -453,7 +442,8 @@ def test_get_active_feedback_config_finds_each_persona_by_program_and_source():
                 assert mitra["config_id"] == p["config_id"]
                 assert mitra["session_type"] == p["session_type"]
                 assert (mitra["version"], mitra["config"]) == (1, mitra_config_v1(persona))
-                assert await feedback_ops.get_active_feedback_config(p["program_id"]) == mitra  # default source
+                with pytest.raises(TypeError):  # the source is always named: it is a free label, there is no default
+                    await feedback_ops.get_active_feedback_config(p["program_id"])
 
                 gforms = await feedback_ops.get_active_feedback_config(p["program_id"], "google_forms")
                 if persona in GFORMS_PERSONA_NAMES:
@@ -494,18 +484,22 @@ def test_get_active_feedback_config_ignores_the_bot_id_of_the_config():
         with _lookups_use(conn):
             # the bot the config was written for is informational: changing or clearing it changes nothing
             await conn.execute("UPDATE config SET bot_id = '999' WHERE id = $1::uuid", YOUTH["config_id"])
-            assert (await feedback_ops.get_active_feedback_config(YOUTH["program_id"]))["config_id"] == YOUTH["config_id"]
+            assert (await feedback_ops.get_active_feedback_config(YOUTH["program_id"], "mitra"))["config_id"] == YOUTH["config_id"]
             await conn.execute("UPDATE config SET bot_id = NULL, bot_name = NULL WHERE id = $1::uuid", YOUTH["config_id"])
-            assert (await feedback_ops.get_active_feedback_config(YOUTH["program_id"]))["config_id"] == YOUTH["config_id"]
+            assert (await feedback_ops.get_active_feedback_config(YOUTH["program_id"], "mitra"))["config_id"] == YOUTH["config_id"]
     run_db(body)
 
 
-def test_config_source_check_rejects_other_values():
+def test_config_source_is_a_free_label_no_check_constraint():
     async def body(conn):
-        await _expect_violation(
-            conn, asyncpg.CheckViolationError,
-            "INSERT INTO config (config_source, name, config_type, tenant_code, session_type) "
-            "VALUES ('csv', 'x', 'feedback_upload', 'mitra', 'Youth_Voice')")
+        # review finding A1: a source is validated in code ([a-z0-9_]{1,40}), so the table accepts any label
+        for source in ("csv", "ptm_app", "any"):
+            await conn.execute(
+                "INSERT INTO config (config_source, name, config_type, tenant_code, session_type) "
+                "VALUES ($1, 'x', 'feedback_upload', 'mitra', 'Scratch_Voice')", source)
+        assert await conn.fetchval(
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'config'::regclass AND contype = 'c'") == 0
+        await conn.execute("DELETE FROM config WHERE session_type = 'Scratch_Voice'")
     run_db(body)
 
 
@@ -570,7 +564,8 @@ def test_feedback_indexes_exist():
         names = {r["indexname"] for r in await conn.fetch(
             "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'")}
         assert {"idx_feedbacks_program_question", "idx_feedbacks_parent", "idx_feedbacks_source",
-                "idx_feedback_submissions_session_type", "uq_config_source_type_program_session_type",
+                "idx_feedback_submissions_session_type", "uq_config_tenant_source_type_program_session_type",
                 "uq_config_version_active"} <= names
         assert "uq_config_source_type_program_bot" not in names  # the bot-keyed uniqueness is gone
+        assert "uq_config_source_type_program_session_type" not in names  # and so is the first, tenant-less key
     run_db(body)

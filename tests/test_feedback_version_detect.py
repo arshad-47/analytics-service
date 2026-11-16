@@ -3,10 +3,11 @@ Tests of app/services/feedback_version_detect.py (pure, no database): proposing 
 the instant it started from the main questions the stored sessions were asked. Synthetic questions only.
 """
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 
 import pytest
 
-from app.services.feedback_version_detect import SessionQuestions, detect, next_key, normalise
+from app.services.feedback_version_detect import WORDING_SIMILARITY, SessionQuestions, detect, next_key, normalise
 
 T0 = datetime(2026, 10, 1, 6, 0, tzinfo=timezone.utc)
 
@@ -205,3 +206,119 @@ def test_a_real_new_question_next_to_a_wording_variant_is_still_proposed():
     result = detect(sessions, ["V1", "V2"])
     assert result["proposal"] is not None
     assert any("similar_to" in q for q in result["new_questions"]) and any("similar_to" not in q for q in result["new_questions"])
+
+
+# C11: the proposed instant must relabel exactly the sessions the details report --------------------------------
+
+def _relabelled_by(proposal, sessions):
+    """What `set` would do: stamp_version labels every session whose start is at or after effective_from as new."""
+    effective = datetime.fromisoformat(proposal["effective_from"])
+    return sum(1 for s in sessions if s.start >= effective)
+
+
+def test_tied_start_instants_never_relabel_more_sessions_than_reported():
+    old = make(100, V1_QS)
+    tie = old[-1].start + timedelta(minutes=10)
+    # the last old session and the first new one start at the very same instant
+    sessions = old + [SessionQuestions("a-tie-old", tie, "V1", tuple(V1_QS))]
+    sessions += [SessionQuestions(f"n{i}", tie if i == 0 else tie + timedelta(minutes=i), "V1", tuple(V2_QS))
+                 for i in range(100)]
+    proposal = detect(sessions, ["V1"])["proposal"]
+    assert proposal is not None
+    assert _relabelled_by(proposal, sessions) == proposal["sessions_from_start"]
+    assert proposal["sessions_before"] + proposal["sessions_from_start"] == len(sessions)
+    # the two sessions that share the instant cannot be told apart by time: the mismatch is shown, never hidden
+    assert proposal["old_question_sessions_from_start"] + proposal["new_question_sessions_before"] == 1
+
+
+def test_a_tied_block_is_never_split_by_the_proposed_instant():
+    old = make(100, V1_QS)
+    tie = old[-1].start + timedelta(minutes=10)
+    sessions = old + [SessionQuestions(f"t{i}", tie, "V1", tuple(V2_QS)) for i in range(200)]  # 200 at one instant
+    proposal = detect(sessions, ["V1"])["proposal"]
+    assert proposal["effective_from"] == tie.isoformat()
+    assert _relabelled_by(proposal, sessions) == proposal["sessions_from_start"] == 200
+    assert proposal["sessions_before"] == 100
+
+
+def test_all_sessions_at_one_instant_cannot_be_separated():
+    t = T0
+    sessions = [SessionQuestions(f"a{i}", t, "V1", tuple(V1_QS)) for i in range(100)]
+    sessions += [SessionQuestions(f"b{i}", t, "V1", tuple(V2_QS)) for i in range(100)]
+    result = detect(sessions, ["V1"])
+    assert result["proposal"] is None
+    assert "no instant" in result["reason"] or "very first session" in result["reason"]
+
+
+# Thresholds: each one is pinned at its boundary, from both sides ----------------------------------------------------
+
+def _with_early_strays(n_early, n_after=40):
+    """100 old sessions of which `n_early` already carry the new question set, then `n_after` new-set sessions."""
+    old = make(100, V1_QS)
+    for k in range(n_early):
+        i = 10 + 7 * k
+        old[i] = SessionQuestions(old[i].session_id, old[i].start, "V1", tuple(V2_QS))
+    return old + make(n_after, V2_QS, start_index=100)
+
+
+def test_purity_exactly_at_the_minimum_is_proposed():
+    # 4 of the 40 sessions with the new questions come before the cut: purity = 36 / 40 = MIN_PURITY exactly
+    sessions = _with_early_strays(4, n_after=36)
+    result = detect(sessions, ["V1"], min_coverage=0.1, baseline_sessions=10)
+    assert result["proposal"] is not None, result["reason"]
+    assert result["proposal"]["purity"] == 0.9 and result["proposal"]["new_question_sessions_before"] == 4
+
+
+def test_purity_below_the_minimum_proposes_nothing_and_says_the_sets_run_side_by_side():
+    # 6 of 46 before the cut: purity 40 / 46 = 0.87 < MIN_PURITY
+    result = detect(_with_early_strays(6, n_after=40), ["V1"], min_coverage=0.1, baseline_sessions=10)
+    assert result["proposal"] is None
+    assert "side by side" in result["reason"] and result["details"]["purity"] < 0.9
+
+
+def _similar(known, new):
+    return make(40, [known], 0) + make(40, [new], 40)
+
+
+def test_a_new_text_at_exactly_the_similarity_threshold_is_a_wording_variant_and_is_not_proposed():
+    known, variant = "abcdefghij", "abcdefghiz"          # 9 of 10 characters match: ratio 2 * 9 / 20 = 0.9
+    assert SequenceMatcher(None, known, variant).ratio() == WORDING_SIMILARITY
+    result = detect(_similar(known, variant), ["V1"], baseline_sessions=40)
+    assert result["proposal"] is None and "wording variants" in result["reason"]
+    assert [q["similar_to"] for q in result["wording_variants"]] == [known]
+
+
+def test_a_new_text_just_below_the_similarity_threshold_is_a_real_change():
+    known, other = "abcdefghijklmnopqrs", "abcdefgXijklmnopqXs"      # 17 of 19 match: 34 / 38 = 0.895
+    assert SequenceMatcher(None, known, other).ratio() < WORDING_SIMILARITY
+    result = detect(_similar(known, other), ["V1"], baseline_sessions=40)
+    assert result["wording_variants"] == [] and result["proposal"] is not None
+    assert result["proposal"]["key"] == "V2"
+
+
+def _sparse_text_sessions(spread, first_at, count, total=200):
+    """`total` old sessions; one extra question appears in `count` of them, every `spread` sessions from `first_at`."""
+    sessions = make(total, V1_QS)
+    for k in range(count):
+        i = first_at + spread * k
+        sessions[i] = SessionQuestions(sessions[i].session_id, sessions[i].start, "V1", tuple(V1_QS) + ("Is this a sparse question?",))
+    return sessions
+
+
+def test_a_text_seen_often_enough_but_in_too_small_a_share_of_the_sessions_is_not_new():
+    # 20 sightings (min_sessions) over the 100 sessions since it first appeared: coverage 0.2 < min_coverage 0.3
+    result = detect(_sparse_text_sessions(spread=5, first_at=100, count=20), ["V1"])
+    assert result["new_questions"] == [] and result["new_questions_total"] == 0
+    assert result["proposal"] is None and "no new question found" in result["reason"]
+
+
+def test_a_text_at_exactly_the_minimum_coverage_counts_as_new():
+    # 30 sightings, the first at index 100: coverage 30 / 100 = 0.3 = min_coverage exactly
+    result = detect(_sparse_text_sessions(spread=3, first_at=100, count=30), ["V1"])
+    assert result["new_questions_total"] == 1 and result["new_questions"][0]["coverage"] == 0.3
+
+
+def test_a_text_seen_in_fewer_than_min_sessions_is_not_new_whatever_its_coverage():
+    sessions = make(60, V1_QS) + make(19, V1_QS + ["A rare question about trees?"], start_index=60)
+    result = detect(sessions, ["V1"])
+    assert result["new_questions_total"] == 0

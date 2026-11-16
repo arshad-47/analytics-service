@@ -55,8 +55,9 @@ def test_seeded_mitra_configs_carry_versions_opening_row_and_session_type():
         assert cfg["session_type"] == p["session_type"]
         assert cfg["opening_row"] == {"mode": "auto"}
         assert cfg["questionnaire_versions"] == BASELINE
-        assert "session_type" in cfg["columns"]["required"]
-        assert "bot_id" not in cfg["columns"]["required"] and "bot_id" in cfg["columns"]["optional"]
+        assert cfg["adapter"] == "conversation_rows"
+        assert cfg["column_map"]["session_type"] == "session_type"      # the explicit map (headers of the 1MV export)
+        assert "columns" not in cfg                                     # replaced by column_map (never read)
         versions = parse_versions(cfg)
         assert versions == [("V1", None)]
 
@@ -105,7 +106,7 @@ def test_schema_creates_the_extraction_table_and_pii_flag():
     assert re.search(r"^CREATE TABLE feedback_extracted_data \(", SCHEMA_TEXT, re.M)
     assert "pii_detected      BOOLEAN" in SCHEMA_TEXT
     assert "ALTER TABLE feedback_submissions ADD COLUMN IF NOT EXISTS pii_detected BOOLEAN;" in SCHEMA_TEXT
-    assert "CHECK (config_source IN ('mitra', 'google_forms', 'any'))" in SCHEMA_TEXT
+    assert "config_source IN" not in SCHEMA_TEXT      # a source is a free label validated in code (review finding A1)
 
 
 def test_schema_feedback_tables_come_after_their_fk_targets():
@@ -120,22 +121,24 @@ def test_schema_feedback_tables_come_after_their_fk_targets():
 def test_schema_unique_indexes_use_if_not_exists():
     # db.py injects IF NOT EXISTS only for plain CREATE TABLE / CREATE INDEX, never for UNIQUE ones.
     unique = re.findall(r"^CREATE UNIQUE INDEX\b.*$", SCHEMA_TEXT, re.M)
-    assert len(unique) >= 2
+    assert len(unique) >= 1          # the config key index is created inside ensure_config_unique_index() instead
     for line in unique:
         assert line.startswith("CREATE UNIQUE INDEX IF NOT EXISTS "), line
 
 
 def test_schema_feedback_indexes_present():
     for name in ("idx_feedbacks_program_question", "idx_feedbacks_parent", "idx_feedbacks_source",
-                 "uq_config_source_type_program_session_type", "uq_config_version_active",
-                 "idx_feedback_submissions_session_type"):
+                 "uq_config_version_active", "idx_feedback_submissions_session_type"):
         assert re.search(rf"CREATE (UNIQUE )?INDEX IF NOT EXISTS {name}\b", SCHEMA_TEXT), name
+    # the config key index is created by ensure_config_unique_index() (it must never raise on old data)
+    assert "uq_config_tenant_source_type_program_session_type" in SCHEMA_TEXT
     assert "COALESCE(program_id, '00000000-0000-0000-0000-000000000000')" in SCHEMA_TEXT
     assert "COALESCE(session_type, '')" in SCHEMA_TEXT
     assert "COALESCE(bot_id, '')" not in SCHEMA_TEXT
     # the old bot-keyed unique index is dropped, not recreated
     assert "DROP INDEX IF EXISTS uq_config_source_type_program_bot" in SCHEMA_TEXT
     assert not re.search(r"CREATE UNIQUE INDEX[^;]*uq_config_source_type_program_bot", SCHEMA_TEXT)
+    assert "tenant_code, config_source, config_type" in SCHEMA_TEXT
     assert re.search(r"ON config_version \(config_id\) WHERE is_active", SCHEMA_TEXT)
 
 

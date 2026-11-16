@@ -10,16 +10,16 @@ Tests for the delta check of `feedback` uploads (slice 2d): only what is not sto
 
 In-memory fakes (the same BgHarness as tests/test_feedback_upload_api.py) except the last section: the
 opt-in real-Postgres tests for get_known_source_refs / get_mitra_session_state, which need
-FEEDBACK_TEST_DATABASE_URL pointing at an EMPTY scratch database (the test applies schema.sql itself).
+FEEDBACK_TEST_DATABASE_URL naming a Postgres server (tests/pg_support.py gives this file a scratch database of its own).
 """
 import asyncio
 import json
-import os
 import uuid
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pg_support
 
 import app.api.services.uploads as uploads_service_module
 import app.database.feedback_operations as feedback_ops
@@ -154,6 +154,32 @@ def test_mitra_stored_session_without_rows_is_republished(monkeypatch):
     h.state.return_value = _stored("1001", SESS_A, count=0, max_seq=0, status="IN_PROGRESS")
     h.run(file_bytes=_csv(_session(SESS_A, "1001")))
     assert h.final[1]["sessions_updated"] == 1
+
+
+def _classify(sequences, stored_count, stored_max, status="COMPLETED", stored_status="COMPLETED"):
+    """_classify_mitra_events for one session whose event holds messages with these sequences."""
+    event = {"submissionId": "1001", "sessionId": SESS_A,
+             "data": {"messages": [{"sequence": n} for n in sequences], "completionStatus": status}}
+    state = _stored("1001", SESS_A, count=stored_count, max_seq=stored_max, status=stored_status)
+    to_publish, unchanged, conflicts = uploads_service_module._classify_mitra_events([event], state)
+    assert conflicts == []
+    return [kind for _, kind in to_publish], unchanged
+
+
+def test_growth_is_judged_by_the_message_count_and_by_the_highest_sequence_each_on_its_own():
+    # same count, a gap was filled and a later row added: only the highest sequence moved (5 -> 7)
+    assert _classify([1, 2, 3, 4, 7], stored_count=5, stored_max=5) == (["updated"], 0)
+    # same highest sequence, one more message (a row that used to be missing): only the count moved
+    assert _classify([1, 2, 3, 4, 5], stored_count=4, stored_max=5) == (["updated"], 0)
+    # neither moved: unchanged, and a lower highest sequence with the same count is not growth either
+    assert _classify([1, 2, 3, 4, 5], stored_count=5, stored_max=5) == ([], 1)
+    assert _classify([1, 2, 3, 4, 5], stored_count=5, stored_max=6) == ([], 1)
+    assert _classify([1, 2, 3, 4], stored_count=5, stored_max=5) == ([], 1)
+
+
+def test_the_status_flip_alone_publishes_and_never_moves_a_completed_session_back():
+    assert _classify([1, 2, 3, 4, 5], 5, 5, status="COMPLETED", stored_status="IN_PROGRESS") == (["updated"], 0)
+    assert _classify([1, 2, 3, 4, 5], 5, 5, status="IN_PROGRESS", stored_status="COMPLETED") == ([], 1)
 
 
 def test_mitra_session_id_conflict_is_a_session_error_dead_lettered_others_still_published(monkeypatch):
@@ -382,7 +408,7 @@ def test_gforms_all_new_responses_published_with_report(monkeypatch):
     assert meta["config_version_id"] == GFORMS_ACTIVE_CONFIG["config_version_id"]
     assert "sessions_new" not in meta  # the Mitra report keys are not used for Google Forms
 
-    h.config.assert_awaited_once_with(PERSONAS["Youth"]["program_id"], "google_forms")
+    h.config.assert_awaited_once_with(PERSONAS["Youth"]["program_id"], "google_forms", tenant_code="mitra")
     h.state.assert_not_called()
     (call,) = h.refs.await_args_list
     assert call.args[0] == "mitra" and sorted(call.args[1]) == sorted(_refs_of(file_bytes))
@@ -601,7 +627,7 @@ def test_known_refs_and_session_state_fake_connection_chunking(monkeypatch):
 # --------------------------------------------------------------------------------------------------
 # REAL POSTGRES (opt-in): get_known_source_refs / get_mitra_session_state
 # --------------------------------------------------------------------------------------------------
-DB_URL = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DB_URL = pg_support.SERVER_URL
 
 
 @pytest.mark.skipif(DB_URL is None, reason="FEEDBACK_TEST_DATABASE_URL not set (empty scratch DB with schema.sql applied)")
