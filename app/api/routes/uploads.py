@@ -1,7 +1,5 @@
-import asyncio
-import json
-import uuid
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, Form, UploadFile, File, BackgroundTasks, HTTPException
@@ -26,13 +24,12 @@ from app.api.services import uploads as upload_service
 from app.config import settings
 from app.services.feedback_constants import FEEDBACK_REPORT_TYPE
 from app.database.db import db
-from app.database.operations import (
-    fetch_failed_submission_for_retry,
-    fetch_retryable_failed_submissions,
+from app.database.operations import fetch_retryable_submission_for_retry
+from app.services.retry import (
+    dispatch_all_retry_workflows,
+    retry_single_submission,
 )
 from app.temporal.client import get_temporal_client
-from app.temporal.workflows import ConfigDrivenProcessingWorkflow
-from temporalio.exceptions import WorkflowAlreadyStartedError
 
 logger = logging.getLogger("analytics_service.api.routes.uploads")
 
@@ -110,11 +107,11 @@ async def retry_step(
     _token: HTTPAuthorizationCredentials = Depends(verify_auth_token),
 ):
     """
-    Retry a single failed submission. Automatically resumes from the failed
+    Retry a single failed or stuck submission. Automatically resumes from the failed
     step using the persisted process status in the database.
     """
     async with db.pool.acquire() as conn:
-        row = await fetch_failed_submission_for_retry(
+        row = await fetch_retryable_submission_for_retry(
             conn, body.submission_id, body.session_id, body.tenant_code
         )
 
@@ -124,166 +121,57 @@ async def retry_step(
                 detail=f"Submission not found with submission_id='{body.submission_id}', session_id='{body.session_id}', and tenant_code='{body.tenant_code}'."
             )
 
-        # Status check
-        if row["status"] != "failed":
+        # Status check: Allow 'failed' and stuck 'processing' submissions to be retried
+        if row["status"] not in ("failed", "processing"):
             raise HTTPException(
                 status_code=400,
-                detail=f"Submission status is '{row['status']}'. Only failed submissions can be retried."
+                detail=f"Submission status is '{row['status']}'. Only failed or stuck processing submissions can be retried."
             )
-
-        # Parse process_status
-        process_status = row.get("process_status") or {}
-        if isinstance(process_status, str):
-            try:
-                process_status = json.loads(process_status)
-            except Exception:
-                process_status = {}
-
-        sub_type = row["submission_type"]
-        process_steps = settings.get_process_config(sub_type)
-        existing_steps = (process_status or {}).get("steps", [])
 
         submission_id = row["submission_id"]
         session_id = row["session_id"]
+        sub_type = row["submission_type"]
 
-    # DB connection released — now build payload and dispatch to Temporal
+    # DB connection released — delegate liveness, reconciliation, claim & dispatch to shared service
+    client = await get_temporal_client()
+    outcome = await retry_single_submission(client, row)
 
-    if not process_steps:
+    if outcome.status == "no_steps":
         raise HTTPException(
             status_code=400,
             detail=f"No process steps configured for submission type '{sub_type}'. Cannot retry."
         )
-
-    # Stable workflow ID prevents concurrent duplicate retries for the same submission
-    workflow_id = f"step-retry-{submission_id}-{body.tenant_code}"
-
-    payload = {
-        "submission_id": submission_id,
-        "session_id": session_id,
-        "tenant_code": body.tenant_code,
-        "submission_type": sub_type,
-        "process_steps": process_steps,
-        "existing_steps": existing_steps,
-        "process_status": process_status,
-    }
-
-    # Dispatch to Temporal using shared singleton client
-    client = await get_temporal_client()
-    try:
-        await client.start_workflow(
-            ConfigDrivenProcessingWorkflow.run,
-            payload,
-            id=workflow_id,
-            task_queue=settings.TEMPORAL_QUEUE,
+    if outcome.status == "already_running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Submission '{submission_id}' is currently actively executing in Temporal (workflow: '{outcome.active_wf}')."
         )
-    except WorkflowAlreadyStartedError:
+    if outcome.status == "reconciled":
+        return StepRetryResponse(
+            workflow_id=outcome.workflow_id,
+            submission_id=submission_id,
+            session_id=session_id,
+            message=f"Submission '{submission_id}' was already completed in Temporal; status reconciled to 'success'.",
+        )
+    if outcome.status == "claim_rejected":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Submission '{submission_id}' cannot be claimed for retry (exceeded max retry attempts or invalid status).",
+        )
+    if outcome.status == "already_started":
         raise HTTPException(
             status_code=409,
             detail=f"A retry workflow for submission '{submission_id}' is already running.",
         )
 
     return StepRetryResponse(
-        workflow_id=workflow_id,
+        workflow_id=outcome.workflow_id,
         submission_id=submission_id,
         session_id=session_id,
         message="Retry workflow started.",
     )
 
 
-async def _dispatch_all_retry_workflows(
-    tenant_code: Optional[str],
-    cutoff: str,
-    sweep_id: str,
-) -> None:
-    """
-    Background worker: pages through ALL retryable failed submissions (100 at a time)
-    and fires an individual ConfigDrivenProcessingWorkflow for each one.
-    Only submissions that failed BEFORE this sweep started are picked up,
-    so failures that occur during the sweep are not re-fetched mid-run.
-    No parent workflow is created in Temporal — only individual step-retry-* entries appear.
-    """
-    client = await get_temporal_client()
-    total_success = 0
-    total_failed = 0
-    page = 0
-    cursor_updated_at = None
-    cursor_submission_id = None
-
-    while True:
-        async with db.pool.acquire() as conn:
-            rows = await fetch_retryable_failed_submissions(
-                conn,
-                tenant_code,
-                settings.BATCH_SIZE,
-                failed_before=cutoff,
-                cursor_updated_at=cursor_updated_at,
-                cursor_submission_id=cursor_submission_id,
-            )
-
-        if not rows:
-            break
-
-        # Advance keyset cursor to the last row of the current page
-        cursor_updated_at = rows[-1]["updated_at"]
-        cursor_submission_id = rows[-1]["submission_id"]
-
-        page += 1
-        tasks = []
-        for row in rows:
-            process_status = row.get("process_status") or {}
-            if isinstance(process_status, str):
-                try:
-                    process_status = json.loads(process_status)
-                except Exception:
-                    process_status = {}
-
-            sub_type = row["submission_type"]
-            process_steps = settings.get_process_config(sub_type)
-
-            if not process_steps:
-                logger.warning(f"[{sweep_id}] Skipping submission '{row['submission_id']}' — no steps configured for type '{sub_type}'")
-                continue
-
-            tasks.append(
-                client.start_workflow(
-                    ConfigDrivenProcessingWorkflow.run,
-                    {
-                        "submission_id": row["submission_id"],
-                        "session_id": row.get("session_id"),
-                        "tenant_code": row["tenant_code"],
-                        "submission_type": sub_type,
-                        "process_steps": process_steps,
-                        "existing_steps": (process_status or {}).get("steps", []),
-                        "process_status": process_status,
-                    },
-                    # Stable ID: prevents duplicate retries if called twice
-                    id=f"step-retry-{row['submission_id']}-{row['tenant_code']}",
-                    task_queue=settings.TEMPORAL_QUEUE,
-                )
-            )
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        page_success = sum(1 for r in results if not isinstance(r, Exception))
-        page_failed = len(results) - page_success
-        for r in results:
-            if isinstance(r, Exception) and not isinstance(r, WorkflowAlreadyStartedError):
-                logger.warning(f"[{sweep_id}] Failed to dispatch retry workflow: {r}")
-
-        total_success += page_success
-        total_failed += page_failed
-        logger.info(
-            f"[{sweep_id}] Page {page}: dispatched {len(rows)} "
-            f"({page_success} ok, {page_failed} skipped/failed) — running total {total_success}."
-        )
-
-        if len(rows) < settings.BATCH_SIZE:
-            # Last page — no more rows to fetch
-            break
-
-    logger.info(
-        f"[{sweep_id}] Bulk retry sweep complete for tenant_code={tenant_code or 'all'}: "
-        f"{total_success} started, {total_failed} skipped/failed across {page} page(s)."
-    )
 
 
 @uploads_router.post("/retry-step/all", response_model=BulkRetryResponse, tags=["Step Retry"])
@@ -307,7 +195,7 @@ async def retry_all_failed(
     sweep_id = f"bulk-retry-sweep-{tenant_label}-{uuid.uuid4().hex[:8]}"
 
     background_tasks.add_task(
-        _dispatch_all_retry_workflows,
+        dispatch_all_retry_workflows,
         body.tenant_code,
         cutoff,
         sweep_id,

@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Step-level retry cron configuration
     ENABLE_RETRY_CRON: bool = Field(default=False)
     RETRY_CRON_SCHEDULE: str = Field(default="0 2 * * *")  # 2:00 AM daily
+    STUCK_PROCESSING_MIN_AGE_MINUTES: int = Field(
+        default=15,
+        gt=0,
+        description="Minimum minutes a submission must be in 'processing' before it can be retried by bulk sweep."
+    )
 
     # ShikshaLokam -> Analytics Migration cron configuration
     ENABLE_MIGRATION_CRON: bool = Field(default=False)

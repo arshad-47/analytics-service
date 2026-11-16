@@ -1610,7 +1610,7 @@ async def copy_parent_analysis_results(
         return 0
 
 
-async def fetch_retryable_failed_submissions(
+async def fetch_retryable_submissions(
     conn: asyncpg.Connection,
     tenant_code: Optional[str] = None,
     limit: int = None,
@@ -1618,20 +1618,30 @@ async def fetch_retryable_failed_submissions(
     cursor_updated_at: Optional[Any] = None,
     cursor_submission_id: Optional[str] = None,
     max_retry_attempts: int = 5,
+    stuck_processing_min_age_minutes: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Fetches submissions with status = 'failed' for retry using keyset pagination.
+    Fetches retryable submissions (status = 'failed', or stuck status = 'processing'
+    older than stuck_processing_min_age_minutes) using keyset pagination.
     Only submissions with fewer than max_retry_attempts recorded retries are returned.
     """
     if limit is None:
         raise ValueError("limit must be provided by the caller; do not rely on a hardcoded default.")
+    if stuck_processing_min_age_minutes is None:
+        from app.config import settings
+        stuck_processing_min_age_minutes = settings.STUCK_PROCESSING_MIN_AGE_MINUTES
+
     cutoff_dt = datetime.fromisoformat(failed_before) if isinstance(failed_before, str) else failed_before
+    cursor_dt = datetime.fromisoformat(cursor_updated_at) if isinstance(cursor_updated_at, str) else cursor_updated_at
     rows = await conn.fetch(
         """
         SELECT submission_id, session_id, tenant_code, submission_type, status,
                process_status, updated_at
         FROM submissions
-        WHERE status = 'failed'
+        WHERE (
+            status = 'failed'
+            OR (status = 'processing' AND updated_at < now() - make_interval(mins => $7::int))
+          )
           AND ($1::text IS NULL OR tenant_code = $1)
           AND ($3::timestamptz IS NULL OR updated_at < $3)
           AND (
@@ -1645,15 +1655,15 @@ async def fetch_retryable_failed_submissions(
         tenant_code,
         limit,
         cutoff_dt,
-        cursor_updated_at,
+        cursor_dt,
         cursor_submission_id,
         max_retry_attempts,
+        stuck_processing_min_age_minutes,
     )
     return [dict(row) for row in rows]
 
 
-
-async def fetch_failed_submission_for_retry(
+async def fetch_retryable_submission_for_retry(
     conn: asyncpg.Connection,
     submission_id: str,
     session_id: str,
@@ -1666,7 +1676,7 @@ async def fetch_failed_submission_for_retry(
     """
     row = await conn.fetchrow(
         """
-        SELECT submission_id, session_id, tenant_code, submission_type, status, process_status
+        SELECT submission_id, session_id, tenant_code, submission_type, status, process_status, updated_at
         FROM submissions
         WHERE submission_id = $1
           AND session_id    = $2
@@ -1677,3 +1687,99 @@ async def fetch_failed_submission_for_retry(
         tenant_code,
     )
     return dict(row) if row else None
+
+
+async def claim_submission_for_retry(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Atomically claims a submission for retry by incrementing
+    process_status->>'retry_attempt' and touching updated_at.
+    Guarded to only claim submissions with status in ('failed', 'processing')
+    and retry_attempt < 5.
+    Returns dict with 'retry_attempt' and updated 'process_status', or None if rejected.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE submissions
+        SET updated_at = now(),
+            process_status = jsonb_set(
+                COALESCE(process_status, '{}'::jsonb),
+                '{retry_attempt}',
+                to_jsonb(COALESCE((process_status->>'retry_attempt')::int, 0) + 1)
+            )
+        WHERE submission_id = $1
+          AND tenant_code = $2
+          AND status IN ('failed', 'processing')
+          AND COALESCE((process_status->>'retry_attempt')::int, 0) < 5
+        RETURNING (process_status->>'retry_attempt')::int AS retry_attempt, process_status;
+        """,
+        submission_id,
+        tenant_code,
+    )
+    if not row:
+        return None
+
+    ps = row["process_status"]
+    if isinstance(ps, str):
+        try:
+            ps = json.loads(ps)
+        except Exception:
+            ps = {}
+    return {
+        "retry_attempt": row["retry_attempt"] or 1,
+        "process_status": ps or {},
+    }
+
+
+async def rollback_submission_claim(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+) -> None:
+    """
+    Rolls back / decrements retry_attempt if start_workflow fails due to WorkflowAlreadyStartedError,
+    preventing in-flight workflows from prematurely burning one of their 5 retry attempts.
+    """
+    await conn.execute(
+        """
+        UPDATE submissions
+        SET process_status = jsonb_set(
+            COALESCE(process_status, '{}'::jsonb),
+            '{retry_attempt}',
+            to_jsonb(GREATEST(COALESCE((process_status->>'retry_attempt')::int, 1) - 1, 0))
+        )
+        WHERE submission_id = $1 AND tenant_code = $2;
+        """,
+        submission_id,
+        tenant_code,
+    )
+
+
+async def reconcile_completed_submission(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+) -> None:
+    """
+    Reconciles a submission stuck in 'processing' whose Temporal workflow has COMPLETED.
+    Updates DB status to 'success'.
+    """
+    await conn.execute(
+        """
+        UPDATE submissions
+        SET status = 'success',
+            process_status = jsonb_set(
+                COALESCE(process_status, '{}'::jsonb),
+                '{status}',
+                '"success"'::jsonb
+            ),
+            updated_at = now()
+        WHERE submission_id = $1 AND tenant_code = $2;
+        """,
+        submission_id,
+        tenant_code,
+    )
+

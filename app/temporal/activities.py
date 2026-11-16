@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -7,6 +8,7 @@ from temporalio import activity
 from app.config import settings
 from app.database.db import db
 from app.database.operations import insert_llm_log, get_submission_type_and_payload
+from app.services.retry import dispatch_all_retry_workflows
 
 logger = logging.getLogger("analytics_service.temporal.activities")
 
@@ -67,54 +69,19 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
 
 
 @activity.defn
-async def fetch_failed_submissions_activity(params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+async def trigger_bulk_retry_activity(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Retrieves failed submissions for bulk retry.
+    Called by the Temporal cron schedule (TriggerBulkRetryWorkflow) to run the same
+    bulk retry sweep as POST /v1/retry-step/all — liveness check, reconciliation,
+    claim, and client.start_workflow — all inside this activity (no HTTP call needed).
     """
     params = params or {}
-    tenant_code = params.get("tenant_code")  # None = all tenants
-    limit = params.get("limit", settings.BATCH_SIZE)
-    failed_before = params.get("failed_before")
-    cursor_updated_at = params.get("cursor_updated_at")
-    cursor_submission_id = params.get("cursor_submission_id")
-    max_retry_attempts = params.get("max_retry_attempts", 5)
+    tenant_code = params.get("tenant_code")
+    result = await dispatch_all_retry_workflows(tenant_code, on_page=activity.heartbeat)
+    logger.info("Cron bulk retry sweep complete: sweep_id=%s", result.get("sweep_id"))
+    return result
 
-    async with db.pool.acquire() as conn:
-        from app.database.operations import fetch_retryable_failed_submissions
-        rows = await fetch_retryable_failed_submissions(
-            conn,
-            tenant_code,
-            limit,
-            failed_before=failed_before,
-            cursor_updated_at=cursor_updated_at,
-            cursor_submission_id=cursor_submission_id,
-            max_retry_attempts=max_retry_attempts,
-        )
 
-        results = []
-        for row in rows:
-            process_status = row.get("process_status")
-            if isinstance(process_status, str):
-                try:
-                    process_status = json.loads(process_status)
-                except Exception:
-                    process_status = {}
-
-            existing_steps = (process_status or {}).get("steps", [])
-            sub_type = row["submission_type"]
-            process_steps = settings.get_process_config(sub_type)
-
-            results.append({
-                "submission_id": row["submission_id"],
-                "session_id": row.get("session_id"),
-                "tenant_code": row["tenant_code"],
-                "submission_type": sub_type,
-                "process_steps": process_steps,
-                "existing_steps": existing_steps,
-                "process_status": process_status,
-                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-            })
-        return results
 
 
 

@@ -121,9 +121,17 @@ class IngestionConsumer:
                 task_queue=settings.TEMPORAL_QUEUE
             )
             
-            # Update status in PostgreSQL to 'processing'
+            # Update status in PostgreSQL to 'processing' only if still 'pending'
             async with db.pool.acquire() as conn:
-                await update_submission_status(conn, submission_id, tenant_code, "processing")
+                await conn.execute(
+                    """
+                    UPDATE submissions
+                    SET status = 'processing', updated_at = now()
+                    WHERE submission_id = $1 AND tenant_code = $2 AND status = 'pending'
+                    """,
+                    submission_id,
+                    tenant_code,
+                )
                 
             logger.info(f"Workflow {workflow_id} triggered successfully.")
         except Exception as e:

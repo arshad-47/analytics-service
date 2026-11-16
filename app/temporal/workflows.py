@@ -8,7 +8,7 @@ with workflow.unsafe.imports_passed_through():
     from app.temporal.activities import (
         update_status_activity,
         fetch_pending_submissions_activity,
-        fetch_failed_submissions_activity
+        trigger_bulk_retry_activity,
     )
     from app.temporal.deface_blur_activity import deface_blur_activity
     from app.temporal.pii_and_abusive_activity import pii_and_abusive_language_detection_activity
@@ -235,9 +235,9 @@ class ConfigDrivenProcessingWorkflow:
             # Find the name of the first failed step for diagnostic tracking
             failed_step_name = next((s["name"] for s in steps_execution if s.get("status") == "failed"), None)
 
-            # Carry forward the retry_attempt counter from the existing process_status
+            # Carry forward the retry_attempt counter from process_status (already claimed upon dispatch)
             prior_process_status = payload.get("process_status") or {}
-            retry_attempt = (prior_process_status.get("retry_attempt") or 0) + 1
+            retry_attempt = prior_process_status.get("retry_attempt") or 1
 
             # Update status to 'failed' with error details
             await workflow.execute_activity(
@@ -374,102 +374,7 @@ class BatchProcessingWorkflow:
         }
 
 
-@workflow.defn
-class BulkStepRetryWorkflow:
-    @workflow.run
-    async def run(self, params: Dict[str, Any], carry_over: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Fetches all retryable failed submissions and fans out child
-        ConfigDrivenProcessingWorkflow instances in bounded chunks.
-        """
-        tenant_code = params.get("tenant_code")
-        batch_size = params.get("batch_size") or settings.BATCH_SIZE
-        max_retry_attempts = params.get("max_retry_attempts", 5)
 
-        carry_over = carry_over or {}
-        total_processed = carry_over.get("total_processed", 0)
-        total_success = carry_over.get("total_success", 0)
-        total_failed = carry_over.get("total_failed", 0)
-        chunk_index = carry_over.get("chunk_index", 0)
-        cutoff = carry_over.get("cutoff") or workflow.now().isoformat()
-        cursor_updated_at = carry_over.get("cursor_updated_at")
-        cursor_submission_id = carry_over.get("cursor_submission_id")
-        processed_this_generation = 0
-
-        while True:
-            failed_list: List[Dict[str, Any]] = await workflow.execute_activity(
-                fetch_failed_submissions_activity,
-                {
-                    "tenant_code": tenant_code,
-                    "limit": batch_size,
-                    "failed_before": cutoff,
-                    "cursor_updated_at": cursor_updated_at,
-                    "cursor_submission_id": cursor_submission_id,
-                    "max_retry_attempts": max_retry_attempts,
-                },
-                start_to_close_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=2)
-            )
-
-            if not failed_list:
-                break
-
-            # Advance keyset cursor to the last row of the current page
-            cursor_updated_at = failed_list[-1].get("updated_at")
-            cursor_submission_id = failed_list[-1]["submission_id"]
-
-            chunk_index += 1
-            child_tasks = [
-                workflow.execute_child_workflow(
-                    ConfigDrivenProcessingWorkflow.run,
-                    sub,
-                    id=f"step-retry-{sub['submission_id']}-{sub['tenant_code']}"
-                )
-                for sub in failed_list
-            ]
-            results = await asyncio.gather(*child_tasks, return_exceptions=True)
-
-            success_count = sum(1 for r in results if not isinstance(r, Exception))
-            failed_count = len(results) - success_count
-
-            total_processed += len(failed_list)
-            total_success += success_count
-            total_failed += failed_count
-            processed_this_generation += len(failed_list)
-
-            workflow.logger.info(
-                f"BulkStepRetryWorkflow chunk {chunk_index}: {len(failed_list)} retries "
-                f"({success_count} succeeded, {failed_count} failed); running total {total_processed}."
-            )
-
-            if len(failed_list) < batch_size:
-                break
-
-            if processed_this_generation >= MAX_SUBMISSIONS_PER_RUN:
-                workflow.logger.info(
-                    f"BulkStepRetryWorkflow processed {processed_this_generation} retries in "
-                    f"this generation (running total {total_processed}) — continuing as new to keep "
-                    f"workflow history bounded. Remaining retryable failures continue in the next generation."
-                )
-                workflow.continue_as_new(args=[params, {
-                    "total_processed": total_processed,
-                    "total_success": total_success,
-                    "total_failed": total_failed,
-                    "chunk_index": chunk_index,
-                    "cutoff": cutoff,
-                    "cursor_updated_at": cursor_updated_at,
-                    "cursor_submission_id": cursor_submission_id,
-                }])
-
-        if total_processed == 0:
-            return {"processed_count": 0, "message": "No retryable failed submissions found."}
-
-        return {
-            "processed_count": total_processed,
-            "success_count": total_success,
-            "failed_count": total_failed,
-            "chunks": chunk_index,
-        }
 
 
 @workflow.defn
@@ -488,6 +393,24 @@ class MigrationWorkflow:
                 maximum_attempts=2,
                 initial_interval=timedelta(seconds=30),
             ),
+        )
+
+
+@workflow.defn
+class TriggerBulkRetryWorkflow:
+    @workflow.run
+    async def run(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Lightweight scheduled workflow that runs the bulk retry sweep
+        via trigger_bulk_retry_activity.
+        """
+        params = params or {}
+        return await workflow.execute_activity(
+            trigger_bulk_retry_activity,
+            {"tenant_code": params.get("tenant_code")},
+            start_to_close_timeout=timedelta(hours=2),
+            heartbeat_timeout=timedelta(minutes=5),
+            retry_policy=RetryPolicy(maximum_attempts=1),
         )
 
 
