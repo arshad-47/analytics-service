@@ -1,0 +1,83 @@
+name: tests
+
+# Runs the whole pytest suite, including the opt-in real-Postgres tests, on every pull request and on pushes to the
+# main and release branches. tests/pg_support.py creates one scratch database per test module on the service
+# container below (FEEDBACK_TEST_DATABASE_URL names the SERVER only) and drops it afterwards.
+on:
+  pull_request:
+  push:
+    branches: [main, "release-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # a Postgres SERVER (a role with CREATEDB); the tests never touch the database this URL names
+      FEEDBACK_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      # every other setting the tests need is set by tests/conftest.py before the app is imported
+      # the PG tests may be skipped at most this many times (they are not skipped at all when the server is reachable)
+      MAX_SKIPPED_TESTS: "0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-prod.txt
+
+      # the image's own requirements (Dockerfile) plus what the tests import and requirements.txt already lists
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-prod.txt --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install "pytest>=8.0.0" "httpx>=0.24.0" "json5>=0.14.0"
+
+      - name: Run the tests
+        run: >-
+          pytest tests -q
+          --ignore=tests/unit_testing.py --ignore=tests/test_hf_thematic.py
+          -p no:cacheprovider -rs --junitxml=junit.xml
+
+      # a green run in which the Postgres tests silently skipped would prove nothing
+      - name: Assert the Postgres tests really ran
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse("junit.xml").getroot()
+          cases = list(root.iter("testcase"))
+          # an expected failure (xfail) is reported by pytest as a <skipped type="pytest.xfail">: it is not a skip
+          skipped = [c for c in cases if c.find("skipped") is not None and c.find("skipped").get("type") != "pytest.xfail"]
+          pg = [c for c in cases if "_pg" in c.get("classname", "") and c.find("skipped") is None]
+          limit = int(os.environ["MAX_SKIPPED_TESTS"])
+          print(f"{len(cases)} tests, {len(skipped)} skipped (allowed: {limit}), {len(pg)} ran in *_pg modules")
+          if len(skipped) > limit:
+              sys.exit("too many skipped tests: the real-Postgres tests did not run")
+          if len(pg) == 0:
+              sys.exit("no test of a *_pg module ran")
+          PY
