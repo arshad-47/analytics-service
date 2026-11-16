@@ -206,7 +206,7 @@ def test_every_upload_config_has_the_required_settings_at_their_defaults(block):
     validation.validate_feedback_config_keys(config)       # raises on a missing or invalid required setting
     assert config["max_csv_upload_bytes"] == defaults["max_csv_upload_bytes"]
     assert config["ingestion_schema"] == defaults["ingestion_schema"]
-    assert config["process_steps"] == defaults["process_steps"] == []        # extraction is opt-in
+    assert config["process_steps"] == [{"name": "feedback_metadata_extraction"}]
 
 
 @pytest.mark.parametrize("persona", list(PERSONAS))
