@@ -637,11 +637,29 @@ LANGUAGE plpgsql AS $fn$
 BEGIN
     -- The only deterministic backfill: a config whose active version already names its session_type (valid
     -- persona key, same rule as SAFE_CODE_RE) gets that value in the column. Anything else is the operator's call.
-    UPDATE config c SET session_type = v.config ->> 'session_type', updated_at = now()
-    FROM config_version v
-    WHERE v.config_id = c.id AND v.is_active AND c.session_type IS NULL
-      AND jsonb_typeof(v.config -> 'session_type') = 'string'
-      AND (v.config ->> 'session_type') ~ '^[A-Za-z0-9._-]{1,64}$';
+    -- A row whose target key (tenant, source, type, program, session_type) is already held by another row, or is
+    -- named by another unlabelled row too, stays NULL: `migrate-legacy` resolves such duplicates. The block never
+    -- raises either (an old unique index of an earlier release can still object): then nothing is backfilled.
+    BEGIN
+        UPDATE config c SET session_type = v.config ->> 'session_type', updated_at = now()
+        FROM config_version v
+        WHERE v.config_id = c.id AND v.is_active AND c.session_type IS NULL
+          AND jsonb_typeof(v.config -> 'session_type') = 'string'
+          AND (v.config ->> 'session_type') ~ '^[A-Za-z0-9._-]{1,64}$'
+          AND NOT EXISTS (
+              SELECT 1 FROM config o
+              WHERE o.id <> c.id AND o.tenant_code = c.tenant_code AND o.config_source = c.config_source
+                AND o.config_type = c.config_type AND o.program_id IS NOT DISTINCT FROM c.program_id
+                AND o.session_type = v.config ->> 'session_type')
+          AND NOT EXISTS (
+              SELECT 1 FROM config o JOIN config_version ov ON ov.config_id = o.id AND ov.is_active
+              WHERE o.id <> c.id AND o.tenant_code = c.tenant_code AND o.config_source = c.config_source
+                AND o.config_type = c.config_type AND o.program_id IS NOT DISTINCT FROM c.program_id
+                AND o.session_type IS NULL AND jsonb_typeof(ov.config -> 'session_type') = 'string'
+                AND ov.config ->> 'session_type' = v.config ->> 'session_type');
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
 
     IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema()
                    AND indexname = 'uq_config_tenant_source_type_program_session_type') THEN

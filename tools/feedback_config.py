@@ -1,6 +1,7 @@
 """
 Show, migrate and change the per-bot feedback settings that live in the persona's upload config (config_version),
-not in .env: max_csv_upload_bytes, ingestion_schema, process_steps and the optional expect_stages.
+not in .env: max_csv_upload_bytes, ingestion_schema, process_steps, adapter and the optional expect_stages,
+column_map and completion_map.
 
     python tools/feedback_config.py show    [--session-type Youth_Voice] [--tenant-code T] [--source S]
                                             [--program-id UUID | --program-name NAME]
@@ -14,6 +15,8 @@ not in .env: max_csv_upload_bytes, ingestion_schema, process_steps and the optio
     python tools/feedback_config.py set --session-type Youth_Voice --source mitra \
                                         --key expect_stages --json '["AGE_IDENTIFICATION", "STATE_IDENTIFICATION"]'
     python tools/feedback_config.py set --session-type Youth_Voice --source mitra --key expect_stages --unset
+    python tools/feedback_config.py set --session-type Youth_Voice --source mitra \
+                                        --key column_map --json '{"message": "Chat Text"}'
 
 A persona is identified by (tenant, program, session_type, source): a session_type is not unique across programs
 and a source is a free label. `set` therefore needs --session-type and --source and refuses (listing the
@@ -44,7 +47,8 @@ DATABASE_URL like the application does. Prints JSON (settings, counts); never re
 
 `show` and `set` also validate the adapter-related keys of the whole config (adapter, column_map, completion_map and
 the keys that belong to the other adapter): a problem shows under "adapter_config" in `show`, and `set --key adapter`
-refuses a switch the config would not survive.
+refuses a switch the config would not survive; a change to column_map / completion_map is checked the same way. The
+check runs again on the config read under the row lock, right before the new version is written.
 
 A change is picked up by the Kafka consumers only when their config cache entry expires (60 seconds): for up to one
 minute events are still validated under the old config (the upload route reads the config uncached).
@@ -60,16 +64,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.database import feedback_legacy_upgrade, feedback_operations  # noqa: E402
 from app.database.db import db  # noqa: E402
-from app.services.feedback_constants import (  # noqa: E402
-    CONFIG_KEY_ADAPTER,
-    CONFIG_KEY_EXPECT_STAGES,
-    CONFIG_KEY_INGESTION_SCHEMA,
-    CONFIG_KEY_MAX_CSV_UPLOAD_BYTES,
-    CONFIG_KEY_PROCESS_STEPS,
-)
+from app.services.feedback_config_validation import SETTABLE_CONFIG_KEYS  # noqa: E402
+from app.services.feedback_constants import CONFIG_KEY_MAX_CSV_UPLOAD_BYTES  # noqa: E402
 
-KEYS = (CONFIG_KEY_ADAPTER, CONFIG_KEY_MAX_CSV_UPLOAD_BYTES, CONFIG_KEY_INGESTION_SCHEMA, CONFIG_KEY_PROCESS_STEPS,
-        CONFIG_KEY_EXPECT_STAGES)
+KEYS = SETTABLE_CONFIG_KEYS  # every key the setter accepts (adapter, ..., expect_stages, column_map, completion_map)
 
 
 def parse_set_value(key: str, value_text, json_text):
@@ -81,7 +79,7 @@ def parse_set_value(key: str, value_text, json_text):
     if value_text is not None and json_text is not None:
         raise ValueError("give either --value or --json, not both")
     if value_text is None and json_text is None:
-        raise ValueError("give --value (a number) or --json (a JSON text); --unset only works for expect_stages")
+        raise ValueError("give --value (a number) or --json (a JSON text); --unset only works for the optional settings")
     if value_text is not None:
         if key != CONFIG_KEY_MAX_CSV_UPLOAD_BYTES:
             raise ValueError(f"--value is only for {CONFIG_KEY_MAX_CSV_UPLOAD_BYTES}; use --json for {key}")
@@ -172,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     setting.add_argument("--key", required=True, choices=KEYS, help="the setting to change")
     setting.add_argument("--value", help="a number (max_csv_upload_bytes only), for example 50000000")
     setting.add_argument("--json", help="a JSON text (any setting), for example '[{\"name\": \"x\"}]'")
-    setting.add_argument("--unset", action="store_true", help="remove the optional expect_stages")
+    setting.add_argument("--unset", action="store_true", help="remove an optional setting (expect_stages, column_map, completion_map)")
     setting.add_argument("--note", help="change note stored on the new config version")
     setting.add_argument("--dry-run", action="store_true", help="validate and print, write nothing")
     return parser

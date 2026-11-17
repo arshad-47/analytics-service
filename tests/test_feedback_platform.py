@@ -179,7 +179,7 @@ def test_session_type_check_uses_the_mapped_column_and_counts_only():
 def test_stage_report_uses_the_mapped_columns():
     config = ptm_config(expect_stages=["ATTENDEE"])
     report = report_unexpected_stages(ptm_df(ptm_rows()), config)
-    assert report["sessions"] == 1 and report["unexpected_stages"] == {"NEXT_Q": 1}
+    assert report == {"sessions": 1, "sessions_with_unexpected_stages": 1, "unexpected_stage_count": 1}
 
 
 def test_bot_id_column_can_be_mapped():
@@ -542,11 +542,12 @@ def test_the_file_check_never_echoes_the_session_type_cells():
     assert "9876543210" not in error and "Govt" not in error
 
 
-def test_the_stage_report_still_only_names_key_like_stages():
+def test_the_stage_report_never_names_a_stage():
     rows = ptm_rows(count=3)
     rows[0]["topic"] = HOSTILE
     report = report_unexpected_stages(ptm_df(rows), ptm_config(expect_stages=["ATTENDEE"]))
-    assert HOSTILE not in json.dumps(report) and report["other_stage_values"] == 1
+    assert HOSTILE not in json.dumps(report) and "unexpected_stages" not in report
+    assert report["unexpected_stage_count"] >= 1
 
 
 # =============================================================================================

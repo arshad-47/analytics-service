@@ -372,7 +372,7 @@ def test_a_blank_line_in_the_middle_is_skipped_too(tmp_path):
 
 
 def test_headers_match_case_insensitively_and_a_bom_is_dropped(tmp_path):
-    header = ["﻿ Session_Type "] + HEADER[1:2] + ["SESSION"] + HEADER[3:4] + HEADER[5:]
+    header = ["\ufeff Session_Type "] + HEADER[1:2] + ["SESSION"] + HEADER[3:4] + HEADER[5:]
     rows = []
     for r in basic_rows():
         rows.append([r[2], r[1], r[4], r[3]] + r[5:])
@@ -384,7 +384,7 @@ def test_headers_match_case_insensitively_and_a_bom_is_dropped(tmp_path):
     summary = sme.split_export(src, tmp_path / "out", BIG)
     assert sorted(f["name"] for f in summary["files"]) == ["Parent_Voice.csv", "Youth_Voice.csv"]
     first_line = (tmp_path / "out" / "Youth_Voice.csv").read_text(encoding="utf-8").splitlines()[0]
-    assert first_line.startswith("﻿") is False or True    # the header row is written as read (no BOM char kept)
+    assert not first_line.startswith("\ufeff")    # the header row is written as read: no BOM character is kept
 
 
 def test_a_bom_only_file_with_the_default_names_works(tmp_path):
@@ -480,3 +480,198 @@ def test_a_part_that_fills_the_limit_exactly_is_allowed_and_one_byte_less_splits
     assert sorted(p.name for p in (tmp_path / "split").glob("Youth_Voice*.csv")) == [
         "Youth_Voice_part1.csv", "Youth_Voice_part2.csv"]
     assert [f["sessions"] for f in split["files"]] == [1, 1]
+
+
+# ------------------------------------------------------------------------------------ CodeRabbit round 2 (PR 36)
+
+def test_python_310_csv_writer_alone_does_not_quote_a_bare_carriage_return():
+    """The reproduction of the finding: with lineterminator '\\n' the stdlib writer leaves 'a\\rb' unquoted and the
+    reader then sees two records. Kept as a canary: the tool's own encoder must not depend on it."""
+    import io
+    buf = io.StringIO(newline="")
+    csv.writer(buf, lineterminator="\n").writerow(["a\rb", "x"])
+    if buf.getvalue() == "a\rb,x\n":                                  # Python 3.10: the writer is the culprit
+        assert len(list(csv.reader(io.StringIO(buf.getvalue(), newline="")))) == 2
+    assert sme._encode_text(["a\rb", "x"]) == '"a\rb",x\n'
+
+
+def write_csv_quoted(path, rows, header=HEADER):
+    """An input file whose cells with CR / LF are properly quoted (the '\\r\\n' terminator makes the stdlib writer
+    quote both); write_csv would write a bare '\\r' unquoted and produce a malformed input."""
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\r\n")
+        w.writerow(header)
+        w.writerows(rows)
+    return path
+
+
+@pytest.mark.parametrize("message", ["a\rb", "a\nb", "a\r\nb", "\r", "\n", 'say "hi"\r', "plain"])
+def test_cells_with_cr_or_lf_round_trip_through_the_split(tmp_path, message):
+    rows = [make_row("Youth_Voice", "y1", 2, message=message), make_row("Youth_Voice", "y1", 3, message="next")]
+    src = write_csv_quoted(tmp_path / "in.csv", rows)
+    summary = sme.split_export(src, tmp_path / "out", BIG)
+    _, out_rows = read_csv(tmp_path / "out" / "Youth_Voice.csv")
+    assert out_rows == rows                                           # the same records, the same cells
+    assert summary["totals"]["rows"] == 2 and summary["files"][0]["rows"] == len(out_rows)
+    # the size accounting counted exactly what was written
+    assert summary["files"][0]["bytes"] == len(sme._encode_row(HEADER)) + sum(len(sme._encode_row(r)) for r in rows)
+
+
+def test_a_header_cell_with_a_carriage_return_is_quoted_and_counted_too(tmp_path):
+    header = list(HEADER)
+    header[1] = "bot\rname"
+    rows = [make_row("Youth_Voice", "y1", 2)]
+    src = write_csv_quoted(tmp_path / "in.csv", rows, header=header)
+    summary = sme.split_export(src, tmp_path / "out", BIG)
+    out_header, out_rows = read_csv(tmp_path / "out" / "Youth_Voice.csv")
+    assert out_header == header and out_rows == rows
+    assert summary["files"][0]["bytes"] == (tmp_path / "out" / "Youth_Voice.csv").stat().st_size
+
+
+def test_ordinary_rows_are_encoded_as_before_one_newline_per_row():
+    assert sme._encode_text(["a", "b,c", 'd"e', ""]) == 'a,"b,c","d""e",\n'
+    assert sme._encode_text([""]) == '""\n'
+
+
+def _failing_close_fdopen(monkeypatch, parts):
+    """os.fdopen wrapper: the files opened for the rows (after the `parts` header files) fail on close() the way a
+    full disk does when the buffer is flushed (after really closing the descriptor). Returns the list of closes."""
+    real = sme.os.fdopen
+    calls = {"n": 0}
+    closes = []
+
+    class Handle:
+        def __init__(self, handle, fails):
+            self._h, self._fails = handle, fails
+
+        def __getattr__(self, name):
+            return getattr(self._h, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._h.close()
+
+        def close(self):
+            self._h.close()
+            closes.append(self._fails)
+            if self._fails:
+                raise OSError(28, "No space left on device")
+
+    def fdopen(fd, *args, **kwargs):
+        calls["n"] += 1
+        return Handle(real(fd, *args, **kwargs), calls["n"] > parts)
+
+    monkeypatch.setattr(sme.os, "fdopen", fdopen)
+    return closes
+
+
+def test_a_failing_close_removes_every_temporary_file_and_publishes_nothing(tmp_path, monkeypatch):
+    rows = [make_row("Youth_Voice", "y1", 2), make_row("Parent_Voice", "p1", 2), make_row("Educator_Voice", "e1", 2)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    closes = _failing_close_fdopen(monkeypatch, parts=3)
+    with pytest.raises(OSError, match="No space left"):
+        sme.split_export(src, tmp_path / "out", BIG)
+    assert closes.count(True) == 3                       # every writer was closed, not only up to the first failure
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == []      # no .tmp, no part, no summary
+
+
+def test_a_failing_close_is_an_error_exit_not_a_traceback(tmp_path, monkeypatch, capsys):
+    src = write_csv(tmp_path / "in.csv", [make_row("Youth_Voice", "y1", 2)])
+    _failing_close_fdopen(monkeypatch, parts=1)
+    assert sme.main([str(src), "--out-dir", str(tmp_path / "out")]) == 1
+    assert "No space left" in capsys.readouterr().err
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_a_routing_error_removes_the_temporary_files_even_when_closing_fails_too(tmp_path, monkeypatch):
+    rows = [make_row("Youth_Voice", "y1", 2), make_row("Youth_Voice", "y2", 2)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    _failing_close_fdopen(monkeypatch, parts=1)
+    real_writerow = sme._RowWriter.writerow
+    seen = {"n": 0}
+
+    def boom(self, row):
+        seen["n"] += 1
+        if seen["n"] == 3:                                # header, y1 row, then the second data row fails
+            raise RuntimeError("routing failed")
+        return real_writerow(self, row)
+
+    monkeypatch.setattr(sme._RowWriter, "writerow", boom)
+    with pytest.raises(RuntimeError, match="routing failed"):             # the cause, not the close error
+        sme.split_export(src, tmp_path / "out", BIG)
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_the_number_of_open_output_files_is_bounded_and_the_output_is_the_same(tmp_path, monkeypatch):
+    sessions = [f"s{i}" for i in range(12)]
+    rows = []
+    for n in (1, 2):                                      # interleaved: every part gets a row in each round
+        rows += [make_row("Youth_Voice", s, n) for s in sessions]
+    src = write_csv(tmp_path / "in.csv", rows)
+    one = len(sme._encode_row(rows[0]))
+    limit = len(sme._encode_row(HEADER)) + 2 * one        # one session per part: 12 parts
+
+    real = sme.os.fdopen
+    live, peak = set(), {"n": 0}
+
+    class Tracked:
+        def __init__(self, handle):
+            self._h = handle
+            live.add(id(self))
+            peak["n"] = max(peak["n"], len(live))
+
+        def __getattr__(self, name):
+            return getattr(self._h, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+        def close(self):
+            live.discard(id(self))
+            self._h.close()
+
+    monkeypatch.setattr(sme.os, "fdopen", lambda fd, *a, **k: Tracked(real(fd, *a, **k)))
+    bounded = sme.split_export(src, tmp_path / "bounded", limit, max_open_files=3)
+    assert len(bounded["files"]) == 12 and peak["n"] <= 3
+    monkeypatch.undo()
+    wide = sme.split_export(src, tmp_path / "wide", limit, max_open_files=64)
+    for f in bounded["files"]:
+        assert (tmp_path / "bounded" / f["name"]).read_bytes() == (tmp_path / "wide" / f["name"]).read_bytes()
+        out_header, out_rows = read_csv(tmp_path / "bounded" / f["name"])
+        assert out_header == HEADER and len(out_rows) == 2            # one header, rows in input order
+    assert wide["totals"] == bounded["totals"]
+
+
+def test_a_session_type_naming_the_part_file_of_another_is_refused_before_anything_is_written(tmp_path):
+    """Youth_Voice needs two files (Youth_Voice_part1.csv, _part2.csv) and a session type is literally Youth_Voice_part1."""
+    rows = [make_row("Youth_Voice", "y1", 2), make_row("Youth_Voice", "y2", 2), make_row("Youth_Voice_part1", "z", 2)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    limit = len(sme._encode_row(HEADER)) + len(sme._encode_row(rows[0]))
+    with pytest.raises(sme.SplitError, match="same file name"):
+        sme.split_export(src, tmp_path / "out", limit)
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("bad", ["../outside", "/abs/path", "a/b", "a\\b"])
+def test_a_traversing_session_type_creates_nothing_outside_out_dir(tmp_path, bad):
+    src = write_csv(tmp_path / "in.csv", [make_row(bad, "y1", 2)])
+    with pytest.raises(sme.SplitError):
+        sme.split_export(src, tmp_path / "work" / "out", BIG, force=True)
+    assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file()) == ["in.csv"]
+
+
+def test_collision_detection_is_one_pass(tmp_path):
+    """8,000 distinct names: with the old per-name scan of every name this took minutes (4 x 10^8 comparisons)."""
+    import time
+    n = 8000
+    session_types = [f"T{i:05d}" for i in range(n)]
+    rows = [make_row(t, f"s{i}", 2) for i, t in enumerate(session_types)]
+    src = write_csv(tmp_path / "in.csv", rows)
+    started = time.monotonic()
+    sme.split_export(src, tmp_path / "out", BIG, max_open_files=16)
+    assert time.monotonic() - started < 30

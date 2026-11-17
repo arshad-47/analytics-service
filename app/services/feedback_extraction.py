@@ -647,12 +647,40 @@ def _is_year_group(group: str) -> bool:
     return len(group) == 4 and YEAR_MIN <= int(group) <= YEAR_MAX
 
 
+class _RunStats:
+    """
+    What `_run_is_number` needs to know about a run of digit groups, kept as running counts so that a run that grows
+    group by group (the numbers-only chain of consecutive messages) is judged in O(1) per added group instead of
+    rescanning everything accumulated so far.
+    """
+    __slots__ = ("count", "digits", "all_years", "all_short")
+
+    def __init__(self, groups: Sequence[str] = ()) -> None:
+        self.count = 0              # number of groups
+        self.digits = 0             # their total digits
+        self.all_years = True       # every group is a year from YEAR_MIN to YEAR_MAX (also true for no group)
+        self.all_short = True       # every group has one or two digits (also true for no group)
+        self.add(groups)
+
+    def add(self, groups: Sequence[str]) -> None:
+        for g in groups:
+            self.count += 1
+            self.digits += len(g)
+            if self.all_years and not _is_year_group(g):
+                self.all_years = False
+            if self.all_short and len(g) > 2:
+                self.all_short = False
+
+    def is_number(self, policy: PiiPolicy) -> bool:
+        if self.all_years:
+            return False
+        short_groups = self.count > 1 and self.all_short
+        needed = policy.min_digit_run_short_groups if short_groups else policy.min_digit_run
+        return self.digits >= needed
+
+
 def _run_is_number(groups: Sequence[str], policy: PiiPolicy) -> bool:
-    if all(_is_year_group(g) for g in groups):
-        return False
-    short_groups = len(groups) > 1 and all(len(g) <= 2 for g in groups)
-    needed = policy.min_digit_run_short_groups if short_groups else policy.min_digit_run
-    return sum(len(g) for g in groups) >= needed
+    return _RunStats(groups).is_number(policy)
 
 
 def _is_numbers_only(text: str, groups: Sequence[str]) -> bool:
@@ -686,7 +714,9 @@ def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple
     scanned = text
     if "@" in text:
         # E-mail addresses and handles: the whole space-delimited token is masked. The URL check below does not see
-        # a token that holds an '@' (blanked, so positions stay), as before.
+        # such a token (blanked, so positions stay: the domain of 'asha@gmail.com' is not a link of its own), but ONLY
+        # a token that matched: a token that holds an '@' without being an address or handle ('https://x.org/@asha_k',
+        # 'medium.com/@asha_k': a '/' precedes the '@') stays visible to the URL scan, or it would reach the model.
         pieces: List[str] = []
         last = 0
         blanked = False
@@ -700,6 +730,8 @@ def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple
             elif _HANDLE_RE.search(token) is not None:
                 kinds.append(PII_KIND_EMAIL)
                 spans.append((match.start(), match.end(), MASK_HANDLE))
+            else:
+                continue
             pieces.append(text[last:match.start()])
             pieces.append(" " * len(token))
             last = match.end()
@@ -758,7 +790,7 @@ def _scan_rows(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy):
                         key=lambda pair: pair[1]["sequence"])
     url_re = _url_regex(tuple(policy.url_tlds))
     for column in _PII_COLUMNS:
-        chain: List[str] = []                       # digit groups of consecutive numbers-only messages
+        chain = _RunStats()                         # digit groups of consecutive numbers-only messages (running counts)
         members: List[Tuple[Tuple[int, str], str, int, int]] = []   # (key, text, start, end) of those messages
         masked_members = 0                          # how many of `members` already carry their number span
         for index, row in respondent:
@@ -770,9 +802,9 @@ def _scan_rows(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy):
             if PII_KIND_NUMBER in row_kinds:
                 add(PII_KIND_NUMBER)
             if len(runs) == 1 and _is_numbers_only(text, runs[0][0]):
-                chain.extend(runs[0][0])
+                chain.add(runs[0][0])
                 members.append((key, text, runs[0][1], runs[0][2]))
-                if len(members) > 1 and _run_is_number(chain, policy):
+                if len(members) > 1 and chain.is_number(policy):
                     add(PII_KIND_NUMBER)
                     # every message of the chain is a part of the number, the ones before this message too
                     for m_key, m_text, m_start, m_end in members[masked_members:]:
@@ -783,7 +815,7 @@ def _scan_rows(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy):
                             found.setdefault(m_key, (m_text, []))[1].append(m_span)
                     masked_members = len(members)
             else:
-                chain, members, masked_members = [], [], 0
+                chain, members, masked_members = _RunStats(), [], 0
             for kind in row_kinds:
                 add(kind)
             if len(spans) > 0:

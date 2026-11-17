@@ -209,25 +209,28 @@ async def dispatch_all_retry_workflows(
         # taken only when a feedback row needs the config tables, and each persona is read once. A row whose config
         # cannot give steps is skipped (it stays failed, looked at again by the next sweep). The cursor above already
         # moved past the whole scanned page, so skipped rows never shorten a page or end the sweep early.
-        steps_by_id: Dict[str, Any] = {}
+        # Keyed by (tenant_code, submission_id): a submission_id is only unique per tenant, and an all-tenant page can
+        # hold the same id twice (two tenants), each with its own persona config.
+        steps_by_key: Dict[Any, Any] = {}
         async with contextlib.AsyncExitStack() as page_resources:
             steps_conn = None
             for row in rows:
                 try:
                     if is_feedback_type(row["submission_type"]) and steps_conn is None:
                         steps_conn = await page_resources.enter_async_context(db.pool.acquire())
-                    steps_by_id[row["submission_id"]] = await resolve_process_steps(
+                    steps_by_key[(row["tenant_code"], row["submission_id"])] = await resolve_process_steps(
                         row, conn=steps_conn, memo=persona_memo
                     )
                 except ValueError as exc:
                     logger.warning(
-                        f"[{sweep_id}] Skipping submission '{row['submission_id']}' — cannot resolve its process steps: {exc}"
+                        f"[{sweep_id}] Skipping submission '{row['submission_id']}' (tenant '{row['tenant_code']}') — "
+                        f"cannot resolve its process steps: {exc}"
                     )
-                    steps_by_id[row["submission_id"]] = exc
+                    steps_by_key[(row["tenant_code"], row["submission_id"])] = exc
 
         async def _process_row(row: Dict[str, Any]) -> str:
             sub_id = row["submission_id"]
-            resolved = steps_by_id[sub_id]
+            resolved = steps_by_key[(row["tenant_code"], sub_id)]
             if isinstance(resolved, Exception):
                 return "skipped"
             try:

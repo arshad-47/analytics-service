@@ -152,6 +152,11 @@ class TenantOwnershipError(ValueError):
     """An event names a leader category / program id that already belongs to ANOTHER tenant."""
 
 
+def _present(value: Any) -> bool:
+    """A value the event really carries: not None and not the empty string (explicit, never truthiness)."""
+    return value is not None and value != ""
+
+
 def _no_row_written(command_tag: Any) -> bool:
     """True when an INSERT ... ON CONFLICT DO UPDATE ... WHERE ran but wrote no row (command tag 'INSERT 0 0'): the
     conflicting row exists and its WHERE (same tenant) was false."""
@@ -184,7 +189,7 @@ async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant
 
     # 2. Upsert Leader Category (from flattened tags)
     leader_id = tags.get("leaderCategoryId")
-    if leader_id:
+    if _present(leader_id):
         result = await conn.execute(
             """
             INSERT INTO leader_category (id, name, description, tenant_code)
@@ -207,7 +212,17 @@ async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant
 
     # 3. Upsert Programs (depends on leader category)
     program_id = tags.get("programId")
-    if program_id and leader_id:
+    if _present(program_id) and not _present(leader_id):
+        # No leader category in the event, so the program is not written (programs.leaders_id is NOT NULL). The id is
+        # still stored on the submission, and submissions.program_id has no tenant in its foreign key: an id that
+        # belongs to ANOTHER tenant must be refused here, exactly as the upsert below refuses it. A program that does
+        # not exist yet keeps the old behaviour (the id is returned unchanged).
+        owner = await conn.fetchrow("SELECT tenant_code FROM programs WHERE id = $1", program_id)
+        if owner is not None and owner["tenant_code"] != tenant_code:
+            raise TenantOwnershipError(
+                f"programId {program_id} belongs to another tenant than {tenant_code!r}; rejecting the event."
+            )
+    if _present(program_id) and _present(leader_id):
         result = await conn.execute(
             """
             INSERT INTO programs (id, leaders_id, name, description, tenant_code)
@@ -538,6 +553,31 @@ async def _ingest_feedback_submission(
     return _already_stored_result(stored)
 
 
+def _persona_key(session_type: Any, source: Any, program_id: Any) -> tuple:
+    """What selects the extraction config of a session: session_type, source, program (a UUID in any spelling)."""
+    return (session_type, source, None if program_id is None else str(program_id).lower())
+
+
+async def _stored_persona(conn: asyncpg.Connection, submission_id: str, tenant_code: str) -> Optional[tuple]:
+    """
+    _persona_key of the stored feedback session, or None when it is not stored yet. Locks the submissions row, then the
+    feedback_submissions row, in the order of the extraction save (feedback_extraction_operations.save_extraction).
+    """
+    program_text = await conn.fetchval(
+        "SELECT program_id::text FROM submissions WHERE submission_id = $1 AND tenant_code = $2 FOR NO KEY UPDATE",
+        submission_id, tenant_code,
+    )
+    stored = await conn.fetchval(
+        "SELECT json_build_array(session_type, source)::text FROM feedback_submissions "
+        "WHERE submission_id = $1 AND tenant_code = $2 FOR UPDATE",
+        submission_id, tenant_code,
+    )
+    if stored is None:
+        return None
+    session_type, source = json.loads(stored)
+    return _persona_key(session_type, source, program_text)
+
+
 async def _write_feedback_submission(
     conn: asyncpg.Connection,
     event_payload: Dict[str, Any],
@@ -564,6 +604,11 @@ async def _write_feedback_submission(
 
     async with conn.transaction():
         program_id, leader_id = await upsert_metadata(conn, tags, tenant_code)
+
+        # The persona the stored session had before this event (session_type, source, program): it selects the
+        # extraction config, prompt and closing keys. Read under the row locks in the order the extraction save takes
+        # them (submissions, then feedback_submissions), so a persona change below is seen exactly once.
+        persona_before = await _stored_persona(conn, submission_id, tenant_code)
 
         # 1. submissions. Unlike story/discussion this must not reset status/updated_at on every conflict,
         # so the update is conditional and keeps identity fields (session_id, submission_date) once set.
@@ -730,7 +775,29 @@ async def _write_feedback_submission(
             )
             parents_set = len(parent_rows)
 
-        if len(upserted) > 0 or parents_set > 0:
+        persona_changed = False
+        if persona_before is not None:
+            program_now = await conn.fetchval(
+                "SELECT program_id FROM submissions WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            persona_changed = persona_before != _persona_key(session_type, source, program_now)
+        if persona_changed:
+            # The session moved to another persona (a redelivery that changed only session_type, source or program):
+            # what the OLD persona's extraction wrote no longer describes it. Drop its extracted fields and its
+            # extraction record, and go back to "not checked" (the PII flag), in this same transaction; the session
+            # goes back through processing below (the feedback_submissions row changed), so the new persona's
+            # extraction runs from scratch. llm_logs are an audit trail and stay.
+            await conn.execute(
+                "DELETE FROM feedback_extracted_data WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            await conn.execute(
+                "UPDATE feedback_submissions SET pii_detected = NULL, meta_data = meta_data - 'extraction' "
+                "WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+        elif len(upserted) > 0 or parents_set > 0:
             # New or edited messages, or a changed parent link (a bot row can become a respondent row): the PII check
             # of the older text no longer describes the session. Back to "not checked" (NULL) until the extraction
             # runs again, so an export never trusts a stale flag.
@@ -1154,6 +1221,40 @@ async def update_submission_status(
             """,
             submission_id, tenant_code, status
         )
+
+async def mark_pending_submission_config_failed(
+    conn: asyncpg.Connection, submission_id: str, tenant_code: str, reason: str
+) -> bool:
+    """
+    A feedback submission whose persona config cannot give its process steps is marked 'failed' with the reason in its
+    process_status (no retry_attempt is recorded, so the bulk retry picks it up once the config is fixed) instead of
+    staying 'pending': a pending row that can never be resolved would keep returning at the head of every batch
+    sweep and starve the other submissions. Identifiers and the config problem only, no content.
+
+    The write only applies to a row that is STILL 'pending'. The caller read it as pending and then awaited the config
+    lookup; in that window the Kafka consumer or a workflow may have moved the row to 'processing' (or it finished),
+    and a blind write would replace that state with 'failed', which a later retry sweep would take for a dead row and
+    start a second run on top of the live one. Returns True when the row was marked, False when it was no longer
+    pending (nothing is written then). Nothing legitimately replaces a non-pending row here: the consumer calls this
+    for a row it has just stored as pending, and the pending-queue sweep only selects pending rows.
+    """
+    process_status = {
+        "status": "failed",
+        "error_message": f"Cannot resolve the process steps of the persona config: {reason}",
+        "steps": [],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "failed_at_step": None,
+    }
+    result = await conn.execute(
+        """
+        UPDATE submissions
+        SET status = 'failed', process_status = $3, updated_at = now()
+        WHERE submission_id = $1 AND tenant_code = $2 AND status = 'pending'
+        """,
+        submission_id, tenant_code, json.dumps(process_status),
+    )
+    return result == "UPDATE 1"
+
 
 async def insert_llm_log(
     conn: asyncpg.Connection,

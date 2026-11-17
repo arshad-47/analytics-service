@@ -1410,28 +1410,26 @@ def test_report_is_none_without_expect_stages(config):
     assert report_unexpected_stages(_stage_df(), config) is None
 
 
-def test_report_counts_sessions_per_unexpected_stage(config):
+def test_report_counts_unexpected_stages_and_their_sessions_without_naming_them(config):
     config["expect_stages"] = ["STATE_IDENTIFICATION"]
     report = report_unexpected_stages(_stage_df(), config)
-    # THANK_YOU / CLOSING are closing keys; SCHOOL_TYPE is in 2 sessions (probes do not count twice); MYSTERY in 1
-    assert report == {
-        "sessions": 3, "sessions_with_unexpected_stages": 2, "unexpected_stage_count": 2,
-        "unexpected_stages": {"SCHOOL_TYPE": 2, "MYSTERY": 1},
-    }
-    assert list(report["unexpected_stages"]) == ["SCHOOL_TYPE", "MYSTERY"]  # most frequent first
+    # THANK_YOU / CLOSING are closing keys; SCHOOL_TYPE is in 2 sessions (probes do not count twice) and MYSTERY in 1:
+    # two distinct unexpected values, two sessions. Counts only: no stage value from the file is in the report.
+    assert report == {"sessions": 3, "sessions_with_unexpected_stages": 2, "unexpected_stage_count": 2}
+    assert "SCHOOL_TYPE" not in json.dumps(report) and "MYSTERY" not in json.dumps(report)
 
 
 def test_report_with_everything_expected_is_empty(config):
     config["expect_stages"] = ["STATE_IDENTIFICATION", "SCHOOL_TYPE", "MYSTERY"]
     report = report_unexpected_stages(_stage_df(), config)
-    assert report["unexpected_stages"] == {} and report["sessions_with_unexpected_stages"] == 0
+    assert report["unexpected_stage_count"] == 0 and report["sessions_with_unexpected_stages"] == 0
 
 
 def test_report_is_aggregates_only(config):
     config["expect_stages"] = []
     flat = json.dumps(report_unexpected_stages(_stage_df(), config))
     for text in ("hello", "probe", "q3", "a2"):
-        assert text not in flat  # no message content, only stage names and counts
+        assert text not in flat  # no message content, only counts
 
 
 def test_report_never_changes_what_the_builder_does(config):
@@ -1444,47 +1442,42 @@ def test_report_never_changes_what_the_builder_does(config):
     assert events == baseline_events and skipped == baseline_skipped
 
 
-def test_report_lists_at_most_200_stages_and_says_so(config):
+def test_report_counts_any_number_of_distinct_stages_and_lists_none(config):
     config["expect_stages"] = ["X"]
     rows = []
     for n in range(205):
         rows += new_rows([("O", "", "h", "h"), ("B", f"STAGE_{n:03d}", "q", "q"), ("R", f"STAGE_{n:03d}", "a", "a")],
                          submission_id=str(500 + n), session=f"{n:032d}")
     report = report_unexpected_stages(make_df(rows), config)
-    assert report["unexpected_stage_count"] == 205 and len(report["unexpected_stages"]) == 200
-    assert report["truncated"] is True
+    assert report == {"sessions": 205, "sessions_with_unexpected_stages": 205, "unexpected_stage_count": 205}
 
 
 def test_report_without_a_stage_column_says_so(config):
     config["expect_stages"] = ["X"]
     df = _stage_df().drop(columns=["stage"])
     report = report_unexpected_stages(df, config)
-    assert report["unexpected_stages"] == {} and "missing" in report["note"]
+    assert report["unexpected_stage_count"] == 0 and "missing" in report["note"]
 
 
 # stage report privacy -------------------------------------------------------------------------------------------
 
-def test_stage_report_never_lists_text_that_is_not_a_stage_key():
+def test_stage_report_never_contains_a_value_from_the_stage_column():
+    """Inline #10: a misaligned stage cell can hold a name (`John_Smith` looks exactly like a stage key), text or a
+    number. Whatever the shape, only counts are reported: the report holds no free text from the CSV."""
     config = {**mitra_config_v1("Youth"), "expect_stages": ["STATE_IDENTIFICATION"]}
     leaked = "My name is Asha and I live near the old mill"
-    rows = new_rows([("O", "", "hello", "hello"), ("B", "STATE_IDENTIFICATION", "q", "q"),
-                     ("R", leaked, "a", "a"), ("B", "MYSTERY_STAGE", "q2", "q2"),
-                     ("R", "yes, 12 years", "a2", "a2")], submission_id="100", session="a" * 32)
+    values = [leaked, "yes, 12 years", "John_Smith", "MYSTERY_STAGE", "9876543210", "A" * 64, "A" * 65, "HAS-DASH"]
+    rows = new_rows([("O", "", "hello", "hello"), ("B", "STATE_IDENTIFICATION", "q", "q")]
+                    + [("R", value, "a", "a") for value in values], submission_id="100", session="a" * 32)
     report = report_unexpected_stages(make_df(rows), config)
     flat = json.dumps(report)
-    assert "Asha" not in flat and "mill" not in flat and "12 years" not in flat
-    assert report["unexpected_stages"] == {"MYSTERY_STAGE": 1}
-    assert report["unexpected_stage_count"] == 1
-    assert report["other_stage_values"] == 2              # a count, no text
-    assert report["sessions_with_unexpected_stages"] == 1
+    for value in values + ["Asha", "mill", "Smith", "12 years"]:
+        assert value not in flat
+    assert report == {"sessions": 1, "sessions_with_unexpected_stages": 1, "unexpected_stage_count": len(values)}
 
 
-def test_stage_report_key_pattern_boundaries_and_no_counter_when_all_are_keys():
+def test_stage_report_keys_are_only_the_counters():
     config = {**mitra_config_v1("Youth"), "expect_stages": ["X"]}
-    ok, too_long = "A" * 64, "A" * 65
-    rows = new_rows([("O", "", "h", "h"), ("B", ok, "q", "q"), ("B", too_long, "q", "q"), ("B", "HAS-DASH", "q", "q")],
-                    submission_id="1", session="a" * 32)
-    report = report_unexpected_stages(make_df(rows), config)
-    assert list(report["unexpected_stages"]) == [ok] and report["other_stage_values"] == 2
     rows = new_rows([("O", "", "h", "h"), ("B", "KEY_ONE", "q", "q")], submission_id="2", session="b" * 32)
-    assert "other_stage_values" not in report_unexpected_stages(make_df(rows), config)
+    assert set(report_unexpected_stages(make_df(rows), config)) == {
+        "sessions", "sessions_with_unexpected_stages", "unexpected_stage_count"}

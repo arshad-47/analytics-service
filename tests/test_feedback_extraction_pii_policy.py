@@ -5,6 +5,7 @@ shapes), its linear running time on pathological input, and its configuration (p
 SYNTHETIC data only; no database, no network.
 """
 import time
+import unicodedata
 
 import pytest
 
@@ -83,10 +84,10 @@ def test_the_session_with_many_pathological_rows_does_not_blow_up_with_the_numbe
 # ------------------------------------------------------------------------------------------------ B2: bypasses closed
 
 @pytest.mark.parametrize("text", [
-    "call 98765​43210",            # zero-width space between the digits
-    "call 98765­43210",            # soft hyphen
-    "call 98765‍43210",            # zero-width joiner
-    "call 98765﻿43210",            # BOM
+    "call 98765\u200b43210",           # zero-width space between the digits
+    "call 98765\u00ad43210",           # soft hyphen
+    "call 98765\u200d43210",           # zero-width joiner
+    "call 98765\ufeff43210",           # BOM
     "call 98765–43210",            # en dash
     "call 98765—43210",            # em dash
     "call 98765·43210",            # middle dot
@@ -95,7 +96,7 @@ def test_the_session_with_many_pathological_rows_does_not_blow_up_with_the_numbe
     "call 98765_43210",
     "call ph:98765;43210",
     "call 98765 – 43210",
-    "call ⁹⁸⁷⁶⁵⁴⁳⁲¹⁰",        # superscripts
+    "call \u2079\u2078\u2077\u2076\u2075\u2074\u00b3\u00b2\u00b9\u2070",   # superscripts, all ASSIGNED (see below)
     "call ⑨⑧⑦⑥⑤④③②①⓪",        # circled digits
     "call ９８７６５４３２１０",        # fullwidth digits
     "call ९८७६५४३२१०",        # Devanagari digits
@@ -108,6 +109,19 @@ def test_the_session_with_many_pathological_rows_does_not_blow_up_with_the_numbe
 ])
 def test_phone_shaped_digit_runs_are_flagged_whatever_the_separator_or_script(text):
     assert fx.PII_KIND_NUMBER in _kinds(text), text
+
+
+def test_the_superscript_case_really_exercises_superscript_digits():
+    """Every character of that case is an assigned digit-like code point that NFKC turns into 0-9 (U+2072 and U+2073
+    are unassigned, so a string holding them would only test that two unknown characters split the run)."""
+    superscripts = "\u2079\u2078\u2077\u2076\u2075\u2074\u00b3\u00b2\u00b9\u2070"
+    assert [unicodedata.category(ch) for ch in superscripts] == ["No"] * 10
+    assert unicodedata.normalize("NFKC", superscripts) == "9876543210"
+    assert all(unicodedata.name(ch).startswith("SUPERSCRIPT") for ch in superscripts)
+    assert fx.PII_KIND_NUMBER in _kinds("call " + superscripts)
+    # the invisible characters of the cases above are format characters, removed before matching
+    for invisible in ("\u200b", "\u00ad", "\u200d", "\ufeff"):
+        assert unicodedata.category(invisible) == "Cf"
 
 
 def test_a_number_answered_in_parts_is_flagged_when_the_parts_are_nothing_but_numbers():

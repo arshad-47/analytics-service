@@ -36,7 +36,12 @@ from typing import Any, Dict, List, Mapping, Optional
 from app.config import settings
 from app.database.db import db
 from app.database.operations import update_submission_status
-from app.services.feedback_adapter_config import wide_form_identity_problem
+from app.services.feedback_adapter_config import (
+    CONFIG_KEY_COLUMN_MAP,
+    CONFIG_KEY_COMPLETION_MAP,
+    validate_adapter_config,
+    wide_form_identity_problem,
+)
 from app.services.feedback_config_validation import (
     SETTABLE_CONFIG_KEYS,
     config_setting_problems,
@@ -99,9 +104,16 @@ def _program_id_selector(program_id: Optional[str]) -> Optional[str]:
 
 
 def _config_label(row: Mapping[str, Any]) -> str:
-    """tenant/program/session_type/source of a config row: identifiers only."""
-    program = row["program_name"] if row["program_name"] is not None else row["program_id"]
-    return f"{row['tenant_code']}/{program if program is not None else '-'}/{row['session_type']}/{row['config_source']}"
+    """tenant/program/session_type/source of a config row: identifiers only. The program shows as `name (id)`: two
+    programs of one tenant can share a name, so the name alone would give both configs the same label (and the same
+    result key); a program-less default shows as `-`."""
+    if row["program_id"] is None:
+        program = "-"
+    elif row["program_name"] is None:
+        program = str(row["program_id"])
+    else:
+        program = f"{row['program_name']} ({row['program_id']})"
+    return f"{row['tenant_code']}/{program}/{row['session_type']}/{row['config_source']}"
 
 
 def _result_keys(rows: List[Mapping[str, Any]]) -> Dict[Any, str]:
@@ -504,15 +516,18 @@ def _note(change_note: Optional[str], default: str) -> str:
 def _sessions_of_config_sql(config_program: str, config_type: str) -> str:
     """
     SQL condition (over `fs` = feedback_submissions and `s` = submissions) that selects the stored sessions a config
-    ROW governs, by THE RULE: the sessions of exactly its program; and, for a PROGRAM-LESS default config
-    (`config_program` is NULL), also the sessions of every program that has no config of its own for the session's
-    (tenant, session_type, source). A session whose program has its own config (even one without questionnaire
-    windows, even one without an active version) is never governed by the default. `config_program` / `config_type`
-    are the placeholders ("$4::uuid", "$6") of the caller's query.
+    ROW governs, by THE RULE (the one get_active_feedback_config applies): the sessions of exactly its program; and,
+    for a PROGRAM-LESS default config (`config_program` is NULL), also the sessions of every program that has no
+    config of its own for the session's (tenant, session_type, source). "Has a config of its own" means a config row
+    WITH AN ACTIVE VERSION: a program whose own row has no active version is served by the default at ingestion, so
+    its sessions belong to the default here too. A session whose program has an active config of its own (even one
+    without questionnaire windows) is never governed by the default. `config_program` / `config_type` are the
+    placeholders ("$4::uuid", "$6") of the caller's query.
     """
     return (
         f"(s.program_id IS NOT DISTINCT FROM {config_program} OR ({config_program} IS NULL AND NOT EXISTS ("
-        f"SELECT 1 FROM config own WHERE own.config_type = {config_type} AND own.tenant_code = fs.tenant_code "
+        f"SELECT 1 FROM config own JOIN config_version own_v ON own_v.config_id = own.id AND own_v.is_active "
+        f"WHERE own.config_type = {config_type} AND own.tenant_code = fs.tenant_code "
         f"AND own.session_type = fs.session_type AND own.config_source = fs.source AND own.program_id = s.program_id)))"
     )
 
@@ -875,7 +890,11 @@ async def set_questionnaire_version(
 # The per-bot settings of an upload config: show / migrate / set (tools/feedback_config.py)
 # ---------------------------------------------------------------------------------------------
 
+# The keys `show` / list_feedback_config display (the required settings and the optional expect_stages) ...
 _CONFIG_SETTING_KEYS = (*REQUIRED_FEEDBACK_CONFIG_KEYS, CONFIG_KEY_EXPECT_STAGES)
+# ... and the keys `set` may change: SETTABLE_CONFIG_KEYS (also the optional adapter keys column_map / completion_map).
+# The keys whose value interacts with the adapter: the resulting config is validated as a whole when one changes.
+_ADAPTER_BLOCK_KEYS = (CONFIG_KEY_ADAPTER, CONFIG_KEY_COLUMN_MAP, CONFIG_KEY_COMPLETION_MAP)
 
 
 async def _lock_and_read_active(conn, config_id) -> Optional[Dict[str, Any]]:
@@ -1042,10 +1061,12 @@ async def set_feedback_config_value(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Change one per-bot setting (adapter, max_csv_upload_bytes, ingestion_schema, process_steps, expect_stages) of a
-    persona's upload config without SQL: the value is validated (app/services/feedback_config_validation.py), then a
-    NEW config_version is written (the old one is deactivated and kept as history). `unset` removes the optional
-    expect_stages. Nothing is written when the value is already what is stored. With dry_run everything is computed
+    Change one per-bot setting (SETTABLE_CONFIG_KEYS: adapter, max_csv_upload_bytes, ingestion_schema, process_steps,
+    expect_stages, column_map, completion_map) of a persona's upload config without SQL: the value is validated
+    (app/services/feedback_config_validation.py), then a NEW config_version is written (the old one is deactivated and
+    kept as history). `unset` removes an optional setting (expect_stages, column_map, completion_map). A change to
+    adapter / column_map / completion_map is also validated as the whole adapter block (validate_adapter_config) on
+    the config read under the row lock, so a concurrent change cannot slip an incompatible combination in. Nothing is written when the value is already what is stored. With dry_run everything is computed
     and rolled back.
 
     The config is identified by session_type + source (both required: a source is a free label) plus the selectors
@@ -1061,11 +1082,12 @@ async def set_feedback_config_value(
     source = _selector("source", source)
     if session_type is None or source is None:
         raise ValueError("session_type and source are required")
-    if key not in _CONFIG_SETTING_KEYS or key not in SETTABLE_CONFIG_KEYS:
+    if key not in SETTABLE_CONFIG_KEYS:
         raise ValueError(f"key must be one of: {', '.join(SETTABLE_CONFIG_KEYS)}")
     if unset:
         if key in REQUIRED_FEEDBACK_CONFIG_KEYS:
-            raise ValueError(f"'{key}' is required and cannot be unset; only '{CONFIG_KEY_EXPECT_STAGES}' can")
+            optional = [k for k in SETTABLE_CONFIG_KEYS if k not in REQUIRED_FEEDBACK_CONFIG_KEYS]
+            raise ValueError(f"'{key}' is required and cannot be unset; only {', '.join(optional)} can")
     else:
         value = validate_config_value(key, value)
 
@@ -1094,6 +1116,13 @@ async def set_feedback_config_value(
                 if not unset:
                     new_config[key] = value
                 result["missing_keys"] = [k for k in REQUIRED_FEEDBACK_CONFIG_KEYS if k not in new_config]
+                if key in _ADAPTER_BLOCK_KEYS and CONFIG_KEY_ADAPTER in new_config:
+                    # Checked HERE, under the row lock, on the config as it will be written: a pre-check made before
+                    # the lock (the CLI's) can be outdated by a migrate-legacy that added column_map / completion_map.
+                    try:
+                        validate_adapter_config(new_config)
+                    except ValueError as exc:
+                        raise ValueError(f"the config would be invalid after this change: {exc}")
                 if new_config == config:
                     result["config_version"] = active["version"]
                 else:

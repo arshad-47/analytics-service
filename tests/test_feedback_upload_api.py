@@ -750,8 +750,8 @@ def test_expect_stages_reports_unexpected_stages_without_skipping_anything(clien
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files(_stages_file()))
     assert resp.status_code == 200, resp.text
     report = resp.json()["stage_report"]
-    assert report == {"sessions": 2, "sessions_with_unexpected_stages": 1, "unexpected_stage_count": 1,
-                      "unexpected_stages": {"NEW_STAGE": 1}}
+    assert report == {"sessions": 2, "sessions_with_unexpected_stages": 1, "unexpected_stage_count": 1}
+    assert "NEW_STAGE" not in resp.text   # counts only, no stage value from the file
     assert stores.insert.await_args.kwargs["meta_data"]["stage_report"] == report  # also on the upload record
     stores.upload.assert_called_once()  # the file is stored: report-only, never a rejection
 
@@ -766,7 +766,7 @@ def test_stage_report_is_absent_without_expect_stages(client, monkeypatch):
 def test_expect_stages_all_known_reports_nothing_unexpected(client, monkeypatch):
     _patch_upload_pipeline(monkeypatch, active=_active_with(expect_stages=["AGE_IDENTIFICATION", "LANG_Q"]))
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files(_stages_file(False)))
-    assert resp.json()["stage_report"]["unexpected_stages"] == {}
+    assert resp.json()["stage_report"]["unexpected_stage_count"] == 0
     assert resp.json()["stage_report"]["sessions_with_unexpected_stages"] == 0
 
 

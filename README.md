@@ -98,9 +98,9 @@ Install the dependencies (`requirements.txt` or `requirements-prod.txt`, plus `p
 pytest tests -q --ignore=tests/unit_testing.py --ignore=tests/test_hf_thematic.py -p no:cacheprovider
 ```
 
-* **No setup is needed.** `tests/conftest.py` sets every setting the suite reads (`AUTH_TOKEN`, a `DATABASE_URL` that nothing listens on, the processing mode, the LLM and storage defaults, ...) before the app is imported, with `os.environ.setdefault`, so a fresh clone, CI and a developer machine behave alike and no test depends on your `.env`. A unit test can never reach a real database or the LLM.
+* **No setup is needed.** `tests/conftest.py` sets the settings the suite reads (`AUTH_TOKEN`, a `DATABASE_URL` that nothing listens on, the processing mode, the LLM and storage defaults, ... the `TEST_ENVIRONMENT` table in that file) before the app is imported, with `os.environ.setdefault`. For those names a value in your `.env` is never used (an environment variable beats the `.env` file), so a fresh clone, CI and a developer machine behave alike. The condition: `setdefault` keeps a value that is **already exported in the shell** (or the CI environment), so a `DATABASE_URL` or an LLM setting (`OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, ...) that you exported would be used, and a unit test could then reach that database or the provider. For an isolated run, `unset` those variables first (for example `env -u DATABASE_URL -u OPENROUTER_API_KEY pytest tests ...`). A setting that is not in that table (for example the Temporal or Kafka addresses) still comes from your `.env` or its default; the tests never connect to those services.
 * **Real-Postgres tests are opt-in.** About one test in seven (every `tests/test_*_pg.py` file and the database parts of a few others) skip unless `FEEDBACK_TEST_DATABASE_URL` is set. It names a Postgres **server**, not a database to test in: any database on that server, with a role that has `CREATEDB`, for example `postgresql://postgres:postgres@localhost:5432/postgres`. For every test module that has such tests, `tests/pg_support.py` (through the module-scoped fixture in `tests/conftest.py`) creates a fresh, empty database `scratch_pg_<module>_<random>` on that server, points the module at it and drops it when the module is done. The destructive statements of the tests (`DELETE FROM config`, `DROP SCHEMA public`) can therefore only reach a database that the run itself created, and the modules are independent of each other and of their order. The database named in the URL is only used to connect and is never modified. If the role cannot create databases, or the server cannot be reached, the run stops at once with a message (the URL is never printed). A run that was killed can leave a `scratch_pg_*` database behind: drop it by hand.
-* **CI** (`.github/workflows/tests.yml`) runs the same command on every pull request and on pushes to `main` and `release-*`, against a `postgres:16` service container, and fails when any test was skipped (so a green run really exercised the Postgres tests).
+* **CI** (`.github/workflows/tests.yml`, tracked in the repository) runs the same test selection (the command above with `-n auto --dist loadfile` for parallel workers, and a JUnit report) on every pull request and on pushes to `main` and `release-*`, on Python 3.10 against a `postgres:16` service container, and a second step fails the job when any test was skipped (so a green run really exercised the Postgres tests). Reading the workflow is the reference; this bullet only summarises it.
 * **What not to run:** `tests/unit_testing.py` is the older harness; it is left out above because a run of it rewrites the tracked `tests/TEST_CASES.csv` (the `conftest.py` hook syncs each test's result into the sheet). Run it only on purpose, as `pytest tests/unit_testing.py` (a run that names this file keeps your own `DATABASE_URL`: three of its tests, `test_storage_015`, `test_upload_003` and `test_upload_013`, reach that database through the upload route), and restore the sheet with `git checkout -- tests/TEST_CASES.csv` if you did not mean to change it. `tests/test_hf_thematic.py` needs the Hugging Face models and is not part of the CI run. Never point `FEEDBACK_TEST_DATABASE_URL` at a production server.
 
 ---
@@ -186,8 +186,11 @@ names) is onboarded by adding config rows, with no code change.
 The rest of this section describes the 1 Million Voices program, the first user of these settings.
 
 `POST /v1/upload/` with `report_type=feedback` takes **one persona per upload** (the persona is the file's
-`session_type` column: `Youth_Voice`, `General_Public_Voice`, `Parent_Voice`, `Educator_Voice`; the `leader_category`
-form field must be the same persona) and rejects a body above the persona config's `max_csv_upload_bytes` (100 MB
+`session_type` column: `Youth_Voice`, `General_Public_Voice`, `Parent_Voice`, `Educator_Voice`). The `leader_category`
+form field is the persona's leader category **name** as stored for the program (`Youth`, `Parent`, `General Public`,
+`Educator` as seeded), not the `session_type`: together with `program_name` and `tenant_code` it selects the program, and
+the program's active upload config for `source` fixes the one `session_type` every row of the file must carry (a row of
+another persona rejects the whole file; a program or leader name that does not exist is a 404). The endpoint rejects a body above the persona config's `max_csv_upload_bytes` (100 MB
 when seeded; see step 4). The Mitra
 export holds all personas in one file, so it is prepared before upload. These are operator tools in `tools/`; the
 service never calls them.
@@ -244,8 +247,10 @@ stored; seeded 104857600), `ingestion_schema` (required / optional fields of the
 `STORY_KAFKA_SCHEMA`; an event that does not satisfy it goes to the DLQ), `process_steps` (steps run after ingestion,
 same format as `PROCESS_CONFIG_STORY`; the seed lists `feedback_metadata_extraction` for every upload config, so on a new database extraction (one paid LLM call per session)
 starts right after ingestion; a config with an empty list marks the submission success at ingestion; an existing database keeps its own list, change it with the `set --key process_steps` line below) and the optional `expect_stages` (list of stage names; an upload then
-reports, per stage that is neither expected nor a closing key, how many sessions carry it, in the upload response
-`stage_report` and in `csv_uploads.meta_data`; report-only, it never skips a session). A config that lacks one of the
+reports, in the upload response `stage_report` and in `csv_uploads.meta_data`, **counts only**: the sessions, the sessions that
+carry a stage that is neither expected nor a closing key, and how many distinct such stages there are. No stage value
+from the file is ever copied into the report (a misaligned column can hold a personal name that looks like a stage key),
+so look at the file's `stage` column to see which stage is new; report-only, it never skips a session). A config that lacks one of the
 required keys (`adapter`, `max_csv_upload_bytes`, `ingestion_schema`, `process_steps`), or has one of the wrong type, is rejected with a clear message (400 on upload, DLQ in the
 consumer). The Kafka consumer caches the schema per persona for 60 seconds. The seed (`seed_config.sql`, run at every start)
 never overwrites, so an existing
@@ -263,7 +268,8 @@ python tools/feedback_config.py set --session-type Youth_Voice --source mitra --
 
 `show` and `set` also validate the adapter-related keys of the whole config (`adapter`, `column_map`, `completion_map`
 and the keys that belong to the other adapter): a problem shows under `adapter_config`, and `set --key adapter` refuses a
-switch the config would not survive. The startup health check logs the same problems as one ERROR per config.
+switch the config would not survive; `set --key column_map` / `completion_map` (also accepted by `--unset`) are checked
+the same way, again on the config read under the row lock. The startup health check logs the same problems as one ERROR per config.
 
 **Which config applies (one rule everywhere).** For a (tenant, source, session_type) the config of the session's **own
 program** wins; when that program has none, the tenant's **program-less default** config (`program_id` NULL) for the same

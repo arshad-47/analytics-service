@@ -195,8 +195,8 @@ def test_pending_sweep_skips_marks_failed_and_logs_a_feedback_row_whose_config_i
     monkeypatch.setattr(ops, "get_feedback_process_steps", AsyncMock(
         side_effect=[ValueError("Feedback config of session_type 'Youth_Voice' (mitra) is missing 'process_steps'"),
                      [{"name": "from_config"}]]))
-    status = AsyncMock()
-    monkeypatch.setattr(ops, "update_submission_status", status)
+    status = AsyncMock(return_value=True)
+    monkeypatch.setattr(activities, "mark_pending_submission_config_failed", status)
 
     async def run():
         conn = install_fake_db(monkeypatch, activities)
@@ -208,9 +208,8 @@ def test_pending_sweep_skips_marks_failed_and_logs_a_feedback_row_whose_config_i
         # ... and it is marked failed with the reason (identifiers + config problem, no content)
         status.assert_awaited_once()
         args = status.await_args.args
-        assert args[1:4] == ("fb-bad", "mitra", "failed")
-        assert args[4]["status"] == "failed" and "missing 'process_steps'" in args[4]["error_message"]
-        assert "retry_attempt" not in args[4]  # the bulk retry picks it up once the config is fixed
+        assert args[1:3] == ("fb-bad", "mitra")
+        assert "missing 'process_steps'" in args[3]   # the reason; the helper stores it, with no retry_attempt (see the PG test)
         assert "fb-bad" in caplog.text and "mitra" in caplog.text
     asyncio.run(run())
 

@@ -7,8 +7,12 @@ from temporalio import activity
 
 from app.config import settings
 from app.database.db import db
-from app.database.feedback_operations import get_process_steps, mark_submission_config_failed
-from app.database.operations import insert_llm_log, get_submission_type_and_payload
+from app.database.feedback_operations import get_process_steps
+from app.database.operations import (
+    insert_llm_log,
+    get_submission_type_and_payload,
+    mark_pending_submission_config_failed,
+)
 from app.services.feedback_constants import FEEDBACK_REPORT_TYPE
 from app.services.retry import dispatch_all_retry_workflows
 
@@ -61,11 +65,15 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
         results = []
         # BatchProcessingWorkflow treats a page shorter than `limit` as "the queue is drained", so a feedback row
         # that is marked failed here must not shorten the page (or empty it while later rows are still pending):
-        # the page is refilled from the rows behind it. A returned row stays pending until its child workflow
-        # starts, so the refill asks for `limit` plus the rows already handled and skips those by identity.
+        # the page is refilled from the rows behind it. Every refill asks for exactly `limit` rows, however many
+        # rows were rejected so far: a row marked failed leaves the pending queue (it is no longer selected), and a
+        # row already returned stays pending but takes at most `limit` - len(results) places in the oldest-first
+        # order, so the next `limit` pending rows always hold every row still to be looked at. `handled` skips the
+        # returned rows by identity. (Asking for `limit` plus the rows handled so far made a backlog of invalid
+        # configs fetch 2x, 3x, ... the page size.)
         handled = set()
         while True:
-            asked = limit + len(handled)
+            asked = limit
             rows = await conn.fetch(
                 "SELECT submission_id, tenant_code, submission_type FROM submissions "
                 "WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1",
@@ -89,7 +97,11 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
                         "Cannot resolve the process steps of submission '%s' (tenant '%s', type '%s'); marking it failed: %s",
                         sub_id, tenant, sub_type, exc,
                     )
-                    await mark_submission_config_failed(conn, sub_id, tenant, str(exc))
+                    if not await mark_pending_submission_config_failed(conn, sub_id, tenant, str(exc)):
+                        logger.warning(
+                            "Submission '%s' (tenant '%s') is no longer pending; its failure was not written.",
+                            sub_id, tenant,
+                        )
                     continue
                 results.append({
                     "submission_id": sub_id,

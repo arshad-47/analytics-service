@@ -200,10 +200,16 @@ def detect(
             continue                             # a tie: no instant separates these two sessions
         if errors < best_errors:
             best_errors, best_at = errors, cut
-    while best_at < total and not novel[best_at]:
-        best_at += 1
-        while best_at < total and ordered[best_at - 1].start == ordered[best_at].start:
-            best_at += 1
+    # The step may start at a session with a new question. Sessions of one instant cannot be told apart, so the whole
+    # instant is skipped only when NONE of its sessions carries new-question evidence; when some do, the step stays at
+    # the instant (its old-only sessions are counted in the details, not allowed to hide the rest).
+    while best_at < total:
+        group_end = best_at + 1
+        while group_end < total and ordered[group_end].start == ordered[best_at].start:
+            group_end += 1
+        if any(novel[best_at:group_end]):
+            break
+        best_at = group_end
     if best_at >= total:
         result["reason"] = "no instant separates the new-question sessions from the rest"
         return result

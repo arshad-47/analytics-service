@@ -30,7 +30,6 @@ from app.services.feedback_adapter_config import (
     validate_adapter_config,
 )
 from app.services.feedback_config_validation import validate_feedback_config_keys
-from app.services.feedback_extraction_constants import DEFAULT_PII_MIN_DIGIT_RUN
 from app.services.feedback_versions import parse_versions, stamp_version
 from app.services.feedback_constants import (
     ADAPTER_CONVERSATION_ROWS,
@@ -46,23 +45,6 @@ _ISO_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 # names, NEVER a cell value: a misaligned or hostile file can hold respondent text in any column, and the problems go to
 # the DLQ, the logs, csv_uploads.meta_data and the 400 body.
 _SAMPLE_SIZE = 3
-# Distinct unexpected stage names listed in a stage report (the rest is only counted).
-_MAX_REPORTED_STAGES = 200
-# Only a value shaped like a stage key (AGE_IDENTIFICATION) may be named in the stage report; see report_unexpected_stages.
-_STAGE_KEY_PATTERN = re.compile(r"[A-Za-z0-9_]{1,64}")
-
-
-def _may_be_named_in_a_report(stage: str) -> bool:
-    """
-    A stage value is named in the report only when it is shaped like a stage key AND does not carry an identifying
-    number: a misaligned cell can hold a phone or id number (`9876543210` fits the key pattern). The numeric check is
-    the PII digit threshold of the extraction (DEFAULT_PII_MIN_DIGIT_RUN) applied to the digits of the whole value, so
-    a separator (`98765_43210`) or a letter prefix does not hide it; a real stage key has a handful of digits at most.
-    """
-    if _STAGE_KEY_PATTERN.fullmatch(stage) is None:
-        return False
-    return sum(1 for ch in stage if ch.isdigit()) < DEFAULT_PII_MIN_DIGIT_RUN
-
 
 
 # ---------------------------------------------------------------------------------------------
@@ -143,19 +125,19 @@ def check_feedback_file(df: pd.DataFrame, config: Dict[str, Any], expected_sessi
 
 def report_unexpected_stages(df: pd.DataFrame, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    The optional `expect_stages` check of a Mitra file (item 11): when the config lists expect_stages, count, per
-    stage that is neither in expect_stages nor in closing_keys, the sessions whose rows carry it. REPORT ONLY: it
-    never skips or rejects a session (stage names legitimately change between questionnaire versions). Aggregates
-    only (stage names and counts, no row content). Returns None when the config has no expect_stages, else
-    {"sessions", "sessions_with_unexpected_stages", "unexpected_stage_count", "unexpected_stages": {stage: sessions}}
-    (at most _MAX_REPORTED_STAGES stages listed, the most frequent first; "truncated": True when more exist).
-    Blank stages (the opening row) are ignored; a session is (submission_id, session).
+    The optional `expect_stages` check of a Mitra file (item 11): when the config lists expect_stages, count the stage
+    values that are neither in expect_stages nor in closing_keys and the sessions whose rows carry one. REPORT ONLY: it
+    never skips or rejects a session (stage names legitimately change between questionnaire versions). Blank stages
+    (the opening row) are ignored; a session is (submission_id, session).
 
-    Privacy: only values that look like a stage KEY (_STAGE_KEY_PATTERN) and carry no identifying number
-    (_may_be_named_in_a_report) are listed by name. A misaligned file whose
-    stage column holds message text would otherwise copy respondent text into the upload response and
-    csv_uploads.meta_data, so every other distinct value is only counted, under "other_stage_values" (a count, no
-    text; present only when it is above 0). Those sessions still count in "sessions_with_unexpected_stages".
+    COUNTS ONLY, never a stage value. A stage the config does not list is, by definition, not a value the service can
+    vouch for: a misaligned or hostile file can hold anything in that column (a personal name such as `John_Smith`
+    fits any "looks like a stage key" pattern; so does a phone number with a separator), and the report goes into the
+    upload response and csv_uploads.meta_data. No filter on the shape of the text can tell a new stage key from a
+    name, so no text from the file is copied. The operator who sees a non-zero count looks at the stage column of
+    the file itself (or adds the new stage to expect_stages).
+    Returns None when the config has no expect_stages, else
+    {"sessions", "sessions_with_unexpected_stages", "unexpected_stage_count" (distinct unexpected values)}.
     """
     if CONFIG_KEY_EXPECT_STAGES not in config:
         return None
@@ -165,7 +147,7 @@ def report_unexpected_stages(df: pd.DataFrame, config: Dict[str, Any]) -> Option
     stage_col, sub_col, sess_col = (lookup.get(roles[r].lower()) for r in ("stage", "submission_id", "session"))
     if stage_col is None or sub_col is None or sess_col is None:
         return {"sessions": 0, "sessions_with_unexpected_stages": 0, "unexpected_stage_count": 0,
-                "unexpected_stages": {}, "note": "stage, submission_id or session column is missing"}
+                "note": "stage, submission_id or session column is missing"}
     frame = pd.DataFrame({
         "sub": df[sub_col].astype(str).str.strip(),
         "sess": df[sess_col].astype(str).str.strip(),
@@ -173,21 +155,11 @@ def report_unexpected_stages(df: pd.DataFrame, config: Dict[str, Any]) -> Option
     })
     sessions = len(frame[["sub", "sess"]].drop_duplicates())
     unknown = frame[(frame["stage"] != "") & (~frame["stage"].isin(known))].drop_duplicates()
-    counts = unknown["stage"].value_counts()
-    key_like = [(stage, int(n)) for stage, n in counts.items() if _may_be_named_in_a_report(stage)]
-    other_stage_values = len(counts) - len(key_like)
-    ordered = sorted(key_like, key=lambda item: (-item[1], item[0]))
-    report: Dict[str, Any] = {
+    return {
         "sessions": sessions,
         "sessions_with_unexpected_stages": len(unknown[["sub", "sess"]].drop_duplicates()),
-        "unexpected_stage_count": len(ordered),
-        "unexpected_stages": dict(ordered[:_MAX_REPORTED_STAGES]),
+        "unexpected_stage_count": int(unknown["stage"].nunique()),
     }
-    if len(ordered) > _MAX_REPORTED_STAGES:
-        report["truncated"] = True
-    if other_stage_values > 0:
-        report["other_stage_values"] = other_stage_values
-    return report
 
 
 # ---------------------------------------------------------------------------------------------
@@ -426,12 +398,21 @@ def build_feedback_events(
                 blank_seq += 1
             elif _INT_RE.match(raw) is None:
                 bad_seq.append(i)
-            elif len(raw.lstrip("0")) > 10 or int(raw) > MAX_SEQUENCE:
-                too_large.append(i)  # beyond the 32-bit stored column (also avoids int() on a huge digit string)
-            elif int(raw) < 1:
-                non_positive.append(i)
             else:
-                seq_by_pos[i] = int(raw)
+                # Normalise ONCE: the digits without leading zeros. int() of a string above 4300 digits raises
+                # ValueError on Python 3.10.7+ and leading zeros count, so "0" * 5000 + "1" must never reach int(raw);
+                # the length is checked on the normalised digits and every conversion uses them.
+                digits = raw.lstrip("0")
+                if len(digits) > 10:
+                    too_large.append(i)  # beyond the 32-bit stored column
+                else:
+                    value = 0 if digits == "" else int(digits)
+                    if value > MAX_SEQUENCE:
+                        too_large.append(i)
+                    elif value < 1:
+                        non_positive.append(i)
+                    else:
+                        seq_by_pos[i] = value
         if blank_seq > 0:
             problems.append(f"sequence is missing in {blank_seq} row(s)")
         if len(bad_seq) > 0:

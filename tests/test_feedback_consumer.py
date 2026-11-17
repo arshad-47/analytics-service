@@ -745,7 +745,8 @@ def test_mitra_event_writes_null_source_ref():
         await insert_or_update_submission(conn, _feedback_event())
         fs_args = conn.fetchrow.await_args_list[1].args
         assert "INSERT INTO feedback_submissions" in fs_args[0] and fs_args[7] is None
-        conn.fetchval.assert_not_awaited()  # no google_forms lookup for mitra
+        # no google_forms lookup for mitra (the only fetchval calls are the persona pre-read of the write)
+        assert not any("source_ref" in c.args[0] for c in conn.fetchval.await_args_list)
     asyncio.run(run())
 
 
@@ -912,13 +913,14 @@ def test_realtime_trigger_marks_the_stored_row_failed_when_the_config_is_bad(mon
     async def run():
         consumer, conn, status_mock = _trigger_setup(monkeypatch, [])
         consumer.steps_mock.side_effect = ValueError("missing 'process_steps'")
-        failed = AsyncMock()
-        monkeypatch.setattr(consumer_module.feedback_operations, "update_submission_status", failed)
+        failed = AsyncMock(return_value=True)
+        monkeypatch.setattr(consumer_module, "mark_pending_submission_config_failed", failed)
         with caplog.at_level(logging.ERROR):
             await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")  # does not raise: no retry / DLQ
         failed.assert_awaited_once()
-        assert failed.await_args.args[1:4] == ("184884", "mitra", "failed")
-        assert "missing 'process_steps'" in failed.await_args.args[4]["error_message"]
+        # the shared helper that only writes while the row is still pending (see test_feedback_coderabbit_r2_platform_pg)
+        assert failed.await_args.args[1:3] == ("184884", "mitra")
+        assert "missing 'process_steps'" in failed.await_args.args[3]
         assert "184884" in caplog.text and "mitra" in caplog.text
         status_mock.assert_not_awaited()
         consumer.temporal_client.start_workflow.assert_not_awaited()

@@ -183,6 +183,7 @@ def test_cr8_the_pending_sweep_is_refilled_after_invalid_rows_are_marked_failed(
     async def mark(conn, sub_id, tenant, reason):
         marked.append(sub_id)
         queue[:] = [r for r in queue if r["submission_id"] != sub_id]
+        return True
 
     async def steps(conn, sub_type, sub_id, tenant, memo=None):
         if sub_id in bad:
@@ -190,7 +191,7 @@ def test_cr8_the_pending_sweep_is_refilled_after_invalid_rows_are_marked_failed(
         return [{"name": "feedback_metadata_extraction"}]
 
     monkeypatch.setattr(activities, "get_process_steps", steps)
-    monkeypatch.setattr(activities, "mark_submission_config_failed", mark)
+    monkeypatch.setattr(activities, "mark_pending_submission_config_failed", mark)
 
     async def fetch(sql, limit):
         return list(queue[:limit])
@@ -684,13 +685,13 @@ def test_cr15_an_identifying_number_in_the_stage_column_is_counted_never_named(v
     rows = new_rows([("O", "", "hello", "hello"), ("B", "STATE_IDENTIFICATION", "q", "q"), ("R", value, "a", "a"),
                      ("B", "MYSTERY_STAGE", "q2", "q2")], submission_id="100", session="a" * 32)
     report = report_unexpected_stages(make_df(rows), config)
-    assert value not in json.dumps(report)
-    assert report["unexpected_stages"] == {"MYSTERY_STAGE": 1}
-    assert report["other_stage_values"] == 1
-    assert report["sessions_with_unexpected_stages"] == 1
+    assert value not in json.dumps(report) and "MYSTERY_STAGE" not in json.dumps(report)   # inline #10: counts only
+    assert report == {"sessions": 1, "sessions_with_unexpected_stages": 1, "unexpected_stage_count": 2}
 
 
-def test_cr15_ordinary_stage_keys_with_a_few_digits_are_still_named():
+def test_cr15_ordinary_stage_keys_are_counted_too_never_named():
+    """Superseded rule (inline #10 of round 2): even a plain stage key is only counted; see test_feedback_uploads."""
+    import json
     from app.api.services.feedback_uploads import report_unexpected_stages
     from seed_support import mitra_config_v1
     from test_feedback_uploads import make_df, new_rows
@@ -698,7 +699,7 @@ def test_cr15_ordinary_stage_keys_with_a_few_digits_are_still_named():
     rows = new_rows([("O", "", "h", "h"), ("B", "Q12_ANSWER_2026", "q", "q"), ("B", "STAGE_7", "q", "q")],
                     submission_id="1", session="a" * 32)
     report = report_unexpected_stages(make_df(rows), config)
-    assert set(report["unexpected_stages"]) == {"Q12_ANSWER_2026", "STAGE_7"} and "other_stage_values" not in report
+    assert report["unexpected_stage_count"] == 2 and "Q12_ANSWER_2026" not in json.dumps(report)
 
 
 # --------------------------------------------------------------------------------------------------------------------

@@ -674,15 +674,16 @@ async def adapter_problem_after_set(
 ) -> Optional[str]:
     """
     For `tools/feedback_config.py set`: the reason the persona's config would NOT validate as a whole after the
-    change, or None. Only the `adapter` key interacts with the other adapter-related keys (switching to wide_form
-    while column_map is still there is refused), so only it is checked. Read-only, no lock: the write itself
-    (feedback_operations.set_feedback_config_value) re-reads the config under the row lock and validates the value.
+    change, or None. Only the adapter block (adapter, column_map, completion_map) interacts, so only a change to one
+    of them is checked (switching to wide_form while column_map is still there is refused). Read-only, no lock: this
+    is the early, friendly check; the write itself (feedback_operations.set_feedback_config_value) validates the
+    resulting block AGAIN on the config it re-reads under the row lock, which is the one that counts.
     Returns None when the selectors do not identify exactly one active config (the write reports that itself).
     """
     from app.database import feedback_operations as fo
     from app.database.db import db
 
-    if key != CONFIG_KEY_ADAPTER or unset:
+    if key not in fo._ADAPTER_BLOCK_KEYS:
         return None
     if not db.pool:
         await db.connect()
@@ -692,5 +693,7 @@ async def adapter_problem_after_set(
             program_name=program_name)
     if len(rows) != 1:
         return None
-    new_config = {**fo._as_dict(rows[0]["config"]), key: value}
+    new_config = {k: v for k, v in fo._as_dict(rows[0]["config"]).items() if not (unset and k == key)}
+    if not unset:
+        new_config[key] = value
     return adapter_config_problem(new_config)

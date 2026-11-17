@@ -76,11 +76,31 @@ class _Part:
     name: str = ""
 
 
-def _encode_row(row: Sequence[str]) -> bytes:
-    """Encode one row exactly as it will be written to an output file."""
+def _encode_text(row: Sequence[str]) -> str:
+    """One row exactly as it is written to an output file, '\\n'-terminated. Cells with a carriage return or a line
+    feed are quoted: Python's csv writer (3.10) quotes the characters of the line terminator only, so with '\\n' a
+    cell that holds just '\\r' would stay unquoted and the csv reader treats an unquoted '\\r' as the end of a row.
+    The row is therefore written with the '\\r\\n' terminator (which makes both characters trigger quoting) and
+    ends with '\\n'; nothing else about the encoding changes."""
     buf = io.StringIO(newline="")
-    csv.writer(buf, lineterminator="\n").writerow(row)
-    return buf.getvalue().encode("utf-8")
+    csv.writer(buf, lineterminator="\r\n").writerow(row)
+    return buf.getvalue()[:-2] + "\n"
+
+
+def _encode_row(row: Sequence[str]) -> bytes:
+    """Encode one row exactly as it will be written to an output file (the size accounting uses this)."""
+    return _encode_text(row).encode("utf-8")
+
+
+class _RowWriter:
+    """What every output file is written through, the header included: `writerow` writes `_encode_text(row)`, so the
+    bytes on disk are the bytes `_encode_row` counted."""
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def writerow(self, row: Sequence[str]) -> None:
+        self._handle.write(_encode_text(row))
 
 
 def _open_reader(path: Path):
@@ -203,14 +223,23 @@ class _WriterCache:
             old_handle.close()
         fd = os.open(path, os.O_WRONLY | os.O_APPEND)
         handle = os.fdopen(fd, "w", encoding="utf-8", newline="")
-        writer = csv.writer(handle, lineterminator="\n")
+        writer = _RowWriter(handle)
         self._open[key] = (handle, writer)
         return writer
 
     def close_all(self) -> None:
+        """Close EVERY open file, even when one close fails (a full disk fails when the buffer is flushed); the first
+        error is raised afterwards, so the caller knows an output may be incomplete."""
+        failure: Optional[BaseException] = None
         while len(self._open) > 0:
             _, (handle, _) = self._open.popitem(last=False)
-            handle.close()
+            try:
+                handle.close()
+            except OSError as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 def _file_name(prefix: str, stype: str, idx: int, nparts: int) -> str:
@@ -268,12 +297,13 @@ def split_export(
     # Every name is built from checked parts, so it cannot leave out_dir; the resolved path is verified anyway, and
     # two names that differ only in case (for example 'X_part1' of a type X and a type named 'x_part1') are refused.
     resolved_dir = out_dir.resolve()
-    lowered: Dict[str, str] = {}
+    written_names = set()
+    by_folded: Dict[str, str] = {}              # casefolded name -> the name first seen for it (one dict, one pass)
     for p in named:
         if (resolved_dir / p.name).resolve().parent != resolved_dir:
             raise SplitError("an output file name would fall outside --out-dir")
-        earlier = lowered.setdefault(p.name.casefold(), p.name)
-        if earlier == p.name and sum(1 for q in named if q.name == p.name) > 1:
+        earlier = by_folded.setdefault(p.name.casefold(), p.name)
+        if earlier == p.name and p.name in written_names:
             # Not only case: two outputs with the SAME name, for example the part 1 of 'X' (X_part1.csv, when X needs
             # several files) and a session type literally named 'X_part1' (X_part1.csv). Both would be written to
             # the same temporary file and the second rename would fail after rows were lost.
@@ -282,6 +312,7 @@ def split_export(
                 "'<type>_partN.csv', which another session type can also produce); rename a session type or use --prefix")
         if earlier != p.name:
             raise SplitError("two output file names differ only in case; they would collide on a case-insensitive file system")
+        written_names.add(p.name)
     if not force:
         existing = [p.name for p in named if (out_dir / p.name).exists()]
         if (out_dir / SUMMARY_NAME).exists():
@@ -300,6 +331,7 @@ def split_export(
     # simultaneously open files never depends on how many parts the export needs.
     tmp_paths: Dict[tuple, Path] = {}
     cache = _WriterCache(max_open_files)
+    published = False
     try:
         for stype, plist in parts.items():
             for i, part in enumerate(plist):
@@ -308,7 +340,7 @@ def split_export(
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
                 tmp_paths[(stype, i)] = tmp
                 with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                    csv.writer(fh, lineterminator="\n").writerow(header)
+                    _RowWriter(fh).writerow(header)
         sess_idx = _column_index(header, session_col)
         with _open_reader(input_path) as fh:
             reader = csv.reader(fh)
@@ -318,14 +350,21 @@ def split_export(
                     continue
                 key = route[row[sess_idx].strip()]
                 cache.writer(key, tmp_paths[key]).writerow(row)
-    except BaseException:
+        # Close EVERY writer (a full disk fails here, when the buffers are flushed) and only then publish: a failed
+        # close raises, and nothing has been renamed yet.
         cache.close_all()
-        for tmp in tmp_paths.values():
-            tmp.unlink(missing_ok=True)
-        raise
-    cache.close_all()
-    for (stype, i), tmp in tmp_paths.items():
-        tmp.replace(out_dir / parts[stype][i].name)
+        for (stype, i), tmp in tmp_paths.items():
+            tmp.replace(out_dir / parts[stype][i].name)
+        published = True
+    finally:
+        if not published:
+            try:
+                cache.close_all()          # a no-op after a successful close_all; its errors must not hide the cause
+            except OSError:
+                pass
+            finally:
+                for tmp in tmp_paths.values():
+                    tmp.unlink(missing_ok=True)
 
     summary = {
         "input_rows": total_rows,
@@ -355,8 +394,12 @@ def split_export(
         sfh.write(json.dumps(summary, indent=2) + "\n")
     summary_tmp.replace(out_dir / SUMMARY_NAME)
     written = {p.name for p in named}
+    # One directory listing, not one glob per session type (that is quadratic in the number of types); only the files
+    # this run did not write are looked at.
+    leftovers = [e for e in os.listdir(out_dir) if e.endswith(".csv") and "_part" in e and e not in written]
     stale = sorted(
-        f.name for stype in parts for f in out_dir.glob(f"{prefix}{stype}_part*.csv") if f.name not in written
+        name for name in leftovers
+        if any(name.startswith(f"{prefix}{stype}_part") for stype in parts)
     )
     if len(stale) > 0:
         log.warning(

@@ -33,7 +33,8 @@ def classify_failure(exc: BaseException, attempt: int) -> Optional[ApplicationEr
     missing prompt, a session that is not stored, an activity budget too small for any LLM call, a 4xx answer of the
     provider other than 408/409/425/429, and a bad model answer on the second attempt. Retryable: provider 5xx and
     429, timeouts and connection errors, a session that grew during the call (StaleExtractionError), the first bad
-    model answer.
+    model answer, and ExtractionBudgetExhaustedError (a slow database stall used the activity's budget before the
+    call: transient, no call was made, a fresh attempt gets a fresh budget).
     """
     deterministic = isinstance(exc, (ExtractionConfigError, PromptRenderError, ExtractionSetupError, ValueError))
     if isinstance(exc, LlmCallError):
@@ -80,7 +81,8 @@ async def feedback_metadata_extraction_activity(params: Dict[str, Any]) -> Dict[
     llm_timeout_seconds (None = use the extraction config's llm settings, then the global .env settings).
     The activity's time limit is sized by the workflow from the step's llm_timeout_seconds or the global setting
     (workflow code cannot read the database); a longer `llm.timeout_seconds` of the extraction config is CLAMPED to
-    the budget minus the margin (a WARNING names both numbers) instead of failing the run. To give a longer call
+    the budget minus the margin and minus the time the preparation already used (a WARNING names both numbers)
+    instead of failing the run; when the preparation used up the budget the step is retried. To give a longer call
     a bigger budget, set llm_timeout_seconds on the workflow step.
     A conversation without a respondent answer makes no LLM call. Like the other steps this does not set the
     submission's terminal status; the workflow does that once every step has completed.

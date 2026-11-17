@@ -401,7 +401,7 @@ a { color: var(--accent); }
     <div><b>Bad session in a file</b>Goes to the DLQ topic with its identifiers. The other sessions continue.</div>
     <div><b>Config missing or invalid</b>The event is dead-lettered with a hint to run <code>feedback_config.py migrate</code> (or <code>migrate-legacy</code> for a database created before <code>session_type</code> existed) and replay it. A stored session is marked failed, not retried in a loop.</div>
     <div><b>Session grew during the model call</b>The write is refused and the step retries on the new content. The PII flag is never left from older text.</div>
-    <div><b>LLM timeout longer than the activity allows</b>A timeout set in the extraction config that does not fit the activity time limit is shortened to fit (a warning names both numbers); the run is not refused. Set <code>llm_timeout_seconds</code> on the workflow step for a longer call.</div>
+    <div><b>LLM timeout longer than the activity allows</b>A timeout set in the extraction config that does not fit the activity time limit is shortened to fit, after subtracting the time the step already spent before the call (a warning names both numbers); the run is not refused. If a slow database used up the budget, no call is made and the step is retried. Set <code>llm_timeout_seconds</code> on the workflow step for a longer call.</div>
     <div><b>Model or provider error</b>Provider text is stripped from errors and logs. Temporal retries up to 3 times, then the step fails.</div>
     <div><b>Very long respondent message</b>Over the configured limit (default 20,000 characters per message, 200,000 per conversation): no model call, the session is flagged PII and its fields are stored as unmapped.</div>
   </div>

@@ -115,6 +115,7 @@ MAX_PROMPT_VARIABLE_CHARS = 4000
 # The Temporal activity timeout is derived from the effective LLM timeout (extraction_activity_timeout_seconds).
 ACTIVITY_MIN_SECONDS = 300      # the floor: database work and the pre-check come on top of the call
 ACTIVITY_MARGIN_SECONDS = 120   # added to the LLM timeout
+MIN_LLM_CALL_SECONDS = 30       # less than this left after preparation and the margin: no call is started, the step is retried
 ACTIVITY_MAX_SECONDS = 3600     # the ceiling; a configured llm timeout above (ceiling - margin) is rejected
 MAX_LLM_TIMEOUT_SECONDS = ACTIVITY_MAX_SECONDS - ACTIVITY_MARGIN_SECONDS
 

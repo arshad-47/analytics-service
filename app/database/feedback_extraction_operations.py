@@ -16,7 +16,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -36,6 +38,7 @@ from app.services.feedback_extraction_constants import (
     ACTIVITY_MARGIN_SECONDS,
     ANALYSIS_TYPE,
     CONFIG_TYPE_FEEDBACK_EXTRACTION,
+    MIN_LLM_CALL_SECONDS,
 )
 from app.services.llm import split_llm_usage
 
@@ -50,6 +53,15 @@ class ExtractionSetupError(RuntimeError):
     A deterministic setup problem: no extraction config for the session, a prompt that does not exist or has no active
     version, an activity budget too small for any LLM call. Retrying cannot fix it (the activity reports it as
     non-retryable). The message names configuration, never data.
+    """
+
+
+class ExtractionBudgetExhaustedError(RuntimeError):
+    """
+    The activity's time budget was used up BEFORE the LLM call (a slow connection, status update, input or prompt
+    load): too little is left for a useful call and the margin that keeps the write inside the budget. Transient, so
+    the activity reports it as RETRYABLE (a fresh attempt gets a fresh budget): failing the step on a database stall
+    would be worse than retrying, and no call was made, so nothing was billed and nothing was written.
     """
 
 
@@ -420,26 +432,49 @@ def resolve_llm_settings(config: ExtractionConfig, overrides: Mapping[str, Any])
     return {"model": model, "max_tokens": max_tokens, "timeout": timeout}
 
 
-def clamp_llm_timeout(timeout: int, activity_budget_seconds: int) -> int:
+# Preparation can use time the workflow's budget did not plan for; measured from the start of extract_submission.
+_monotonic = time.monotonic
+
+
+def clamp_llm_timeout(timeout: int, activity_budget_seconds: int, elapsed_seconds: float = 0.0) -> int:
     """
-    The LLM timeout that fits the Temporal activity's budget: min(timeout, budget - ACTIVITY_MARGIN_SECONDS).
+    The LLM timeout that fits what is left of the Temporal activity's budget:
+    min(timeout, budget - elapsed - ACTIVITY_MARGIN_SECONDS), so the call ends before the margin that the write
+    needs, whatever the connection, status update, input load and prompt load already used (`elapsed_seconds`,
+    measured by extract_submission from its own start).
     The workflow sizes the budget from the step's llm_timeout_seconds or the .env setting only (workflow code cannot
     read the database), so a longer `llm.timeout_seconds` of the extraction config can exceed it; that must not fail
     every submission, so the call is shortened instead (one WARNING with the two numbers, never any text). Giving a
-    longer call a bigger budget stays the job of `llm_timeout_seconds` on the workflow step. Only a budget with
-    nothing left after the margin is an ExtractionSetupError (deterministic, nothing can be called).
+    longer call a bigger budget stays the job of `llm_timeout_seconds` on the workflow step. A reduction caused only
+    by the elapsed preparation time (the timeout fits the budget on its own) is logged at INFO.
+    Two refusals, both before any call: a budget with nothing left after the margin is ExtractionSetupError
+    (deterministic, retrying cannot help, non-retryable); a budget that was fine but whose remainder the preparation
+    used up (less than MIN_LLM_CALL_SECONDS, or than the timeout itself when that is shorter) is
+    ExtractionBudgetExhaustedError (transient, RETRYABLE: a database stall is not a reason to fail the step).
     """
-    available = activity_budget_seconds - ACTIVITY_MARGIN_SECONDS
-    if available <= 0:
+    planned = activity_budget_seconds - ACTIVITY_MARGIN_SECONDS
+    if planned <= 0:
         raise ExtractionSetupError(
             f"the activity budget ({activity_budget_seconds} s) leaves no time for an LLM call after the "
             f"{ACTIVITY_MARGIN_SECONDS} s margin; set llm_timeout_seconds on the workflow step")
+    spent = math.floor(max(elapsed_seconds, 0.0))   # whole seconds only: a fraction of one is covered by the margin
+    available = planned - spent
+    if available < min(timeout, MIN_LLM_CALL_SECONDS):
+        raise ExtractionBudgetExhaustedError(
+            f"{spent} s of the {activity_budget_seconds} s activity budget went on "
+            f"preparation, too little is left for an LLM call after the {ACTIVITY_MARGIN_SECONDS} s margin; "
+            f"the step will be retried")
     if timeout <= available:
         return timeout
-    logger.warning(
-        "LLM timeout of %s s does not fit the activity budget of %s s; using %s s "
-        "(set llm_timeout_seconds on the workflow step to allow a longer call)",
-        timeout, activity_budget_seconds, available)
+    if timeout <= planned:
+        logger.info(
+            "LLM timeout of %s s shortened to %s s: %s s of the %s s activity budget went on preparation",
+            timeout, available, spent, activity_budget_seconds)
+    else:
+        logger.warning(
+            "LLM timeout of %s s does not fit the activity budget of %s s; using %s s "
+            "(set llm_timeout_seconds on the workflow step to allow a longer call)",
+            timeout, activity_budget_seconds, available)
     return available
 
 
@@ -483,13 +518,16 @@ async def extract_submission(
     failed LLM call raises LlmCallError carrying only the exception class and HTTP status, never the provider text.
     A 'failed' llm log is written only when a call was really made: a setup or prompt error before the call is not
     logged (and costs nothing). `activity_budget_seconds` (the Temporal activity's start_to_close_timeout, when run as
-    an activity) clamps an effective LLM timeout that does not fit the budget to budget - ACTIVITY_MARGIN_SECONDS (a
-    WARNING names both numbers); only a budget with nothing left raises ExtractionSetupError, before any call.
+    an activity) clamps an effective LLM timeout that does not fit the budget to budget - (time spent in this
+    function so far) - ACTIVITY_MARGIN_SECONDS (a WARNING names both numbers); a budget with nothing left raises
+    ExtractionSetupError (non-retryable), a budget the preparation used up raises ExtractionBudgetExhaustedError
+    (retryable), both before any call.
     """
     if llm_function is None:
         from app.services.llm import openrouter_chat_completion
         llm_function = openrouter_chat_completion
     overrides = llm_overrides if llm_overrides is not None else {}
+    started = _monotonic()   # the activity budget runs from here: the preparation below is part of it
 
     async with pool.acquire() as conn:
         if mark_processing:
@@ -499,7 +537,7 @@ async def extract_submission(
         prompt = await load_prompt_for_config(conn, config)
     llm = resolve_llm_settings(config, overrides)
     if activity_budget_seconds is not None:
-        llm["timeout"] = clamp_llm_timeout(llm["timeout"], activity_budget_seconds)
+        llm["timeout"] = clamp_llm_timeout(llm["timeout"], activity_budget_seconds, _monotonic() - started)
     prompt_version_id = prompt["id"]
     config_version_id = inputs["config_row"]["id"]
 

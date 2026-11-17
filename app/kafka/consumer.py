@@ -16,6 +16,7 @@ from app.database.operations import (
     delete_submission,
     update_submission_status,
     is_feedback_type,
+    mark_pending_submission_config_failed,
 )
 from app.services.feedback_config_cache import FeedbackConfigCache, InvalidCacheKeyError
 from app.services.feedback_config_validation import validate_ingestion_schema_config, validate_process_steps
@@ -234,7 +235,8 @@ class IngestionConsumer:
                         f"Cannot resolve the process steps of feedback submission {submission_id} (tenant: {tenant_code}); "
                         f"marking it 'failed' (fix the persona config, then retry it): {exc}"
                     )
-                    await feedback_operations.mark_submission_config_failed(conn, submission_id, tenant_code, str(exc))
+                    # only while the row is still 'pending' (a workflow may have taken it meanwhile)
+                    await mark_pending_submission_config_failed(conn, submission_id, tenant_code, str(exc))
                     return
         if is_feedback and len(feedback_steps) == 0:
             async with db.pool.acquire() as conn:
