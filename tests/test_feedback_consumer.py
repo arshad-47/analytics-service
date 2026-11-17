@@ -918,7 +918,7 @@ def test_realtime_trigger_marks_the_stored_row_failed_when_the_config_is_bad(mon
         with caplog.at_level(logging.ERROR):
             await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")  # does not raise: no retry / DLQ
         failed.assert_awaited_once()
-        # the shared helper that only writes while the row is still pending (see test_feedback_coderabbit_r2_platform_pg)
+        # the shared helper that only writes while the row is still pending
         assert failed.await_args.args[1:3] == ("184884", "mitra")
         assert "missing 'process_steps'" in failed.await_args.args[3]
         assert "184884" in caplog.text and "mitra" in caplog.text
