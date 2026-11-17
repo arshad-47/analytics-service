@@ -246,7 +246,7 @@ Google Forms each have one): `adapter` (see above), `max_csv_upload_bytes` (size
 stored; seeded 104857600), `ingestion_schema` (required / optional fields of the Kafka event, same structure as
 `STORY_KAFKA_SCHEMA`; an event that does not satisfy it goes to the DLQ), `process_steps` (steps run after ingestion,
 same format as `PROCESS_CONFIG_STORY`; the seed lists `feedback_metadata_extraction` for every upload config, so on a new database extraction (one paid LLM call per session)
-starts right after ingestion; a config with an empty list marks the submission success at ingestion; an existing database keeps its own list, change it with the `set --key process_steps` line below) and the optional `expect_stages` (list of stage names; an upload then
+starts right after ingestion, and with the seeded `pii.masking_prompt_name` of the extraction config each session makes a second call that masks personal data and abusive language in the answers first (`docs/feedback-extraction-and-dots-queries.md`, section 1, step 6b); a config with an empty list marks the submission success at ingestion; an existing database keeps its own list, change it with the `set --key process_steps` line below) and the optional `expect_stages` (list of stage names; an upload then
 reports, in the upload response `stage_report` and in `csv_uploads.meta_data`, **counts only**: the sessions, the sessions that
 carry a stage that is neither expected nor a closing key, and how many distinct such stages there are. No stage value
 from the file is ever copied into the report (a misaligned column can hold a personal name that looks like a stage key),

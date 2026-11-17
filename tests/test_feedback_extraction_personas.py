@@ -6,6 +6,7 @@ the persona prompts of seed_prompts.sql, and the contract between them (`prompt_
 network, no LLM. SYNTHETIC conversations only.
 """
 import json
+import dataclasses
 import re
 from pathlib import Path
 
@@ -200,7 +201,7 @@ def test_persona_prompt_names_are_unique_and_seeded_once(sql):
     for name in PERSONA_PROMPT_NAMES.values():
         assert len(re.findall(r"VALUES \('" + re.escape(name) + r"', 'feedback_metadata_extraction'", sql)) == 1
     # never overwritten: every prompt_version insert of the feedback prompts is DO NOTHING
-    block = sql[sql.index("Feedback Metadata Extraction prompt"):]
+    block = sql[sql.index("Feedback Metadata Extraction prompt"):sql.index("Feedback PII and Abusive-Language Detection (optional")]
     assert "DO UPDATE" not in block
     assert block.count("ON CONFLICT (prompt_id, version) DO NOTHING;") == 5
     assert block.count("ON CONFLICT (name) DO NOTHING;") == 5
@@ -374,7 +375,10 @@ def test_every_seeded_config_states_its_limits_pii_policy_and_placeholders_expli
     assert config.limits == fx.Limits(20000, 4000, 200000, 120, 500)                       # the documented defaults
     assert raw["pii"]["min_digit_run"] == 8 and raw["pii"]["min_digit_run_short_groups"] == 10
     assert tuple(raw["pii"]["url_tlds"]) == fx.DEFAULT_PII_URL_TLDS
-    assert config.pii_policy == fx.DEFAULT_PII_POLICY
+    # the defaults plus the model-based masking prompt that every persona switches on
+    assert raw["pii"]["masking_prompt_name"] == "Feedback PII and Abusive-Language Detection"
+    assert config.pii_policy == dataclasses.replace(
+        fx.DEFAULT_PII_POLICY, masking_prompt_name="Feedback PII and Abusive-Language Detection")
     assert all(isinstance(t, dict) and set(t) == {"name", "description"} for t in raw["pii"]["types"])
     assert config.pii_types == PII_TYPES and set(config.pii_type_descriptions) == set(PII_TYPES)
     assert "id_number" in config.pii_type_descriptions and "Aadhaar" in config.pii_type_descriptions["id_number"]   # program data

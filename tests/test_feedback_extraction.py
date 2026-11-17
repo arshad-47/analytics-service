@@ -121,7 +121,7 @@ def test_extraction_config_ids_are_stable_and_distinct_per_session_type():
 
 def test_seed_prompt_only_uses_variables_the_renderer_knows():
     sql = SEED_PROMPTS.read_text(encoding="utf-8")
-    block = sql[sql.index("Feedback Metadata Extraction prompt"):]
+    block = sql[sql.index("Feedback Metadata Extraction prompt"):sql.index("Feedback PII and Abusive-Language Detection (optional")]
     used = set(re.findall(r"\{\{\s*([A-Za-z_]+)\s*\}\}", block))
     known = {"persona", "fields", "field_names", "pii_types", "output_format", "conversation_id", "conversation"}
     assert used <= known

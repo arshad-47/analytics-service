@@ -56,6 +56,7 @@ def _four_field_raw(persona="Youth"):
         if school_name in by_name:
             raw["fields"].append(dict(by_name[school_name], name="school_type"))
     raw["prompt_name"] = "Feedback Metadata Extraction"       # the program-neutral template prompt of seed_prompts.sql
+    raw["pii"].pop("masking_prompt_name", None)               # these tests count one call per session; the masking call has its own file
     return raw
 
 
@@ -146,6 +147,19 @@ class FakeLlm:
     def __call__(self, prompt, model=None, max_tokens=None, timeout=None):
         self.calls.append({"prompt": prompt, "model": model, "max_tokens": max_tokens, "timeout": timeout})
         return self.answer, {"prompt_tokens": 120, "completion_tokens": 40, "total_tokens": 160, "cost": 0.0001}
+
+
+def _with_masking(extraction_fake):
+    """For tests on the SEEDED configs (they switch the masking call on): answers it with every answer unchanged."""
+    mark = "Analyse the following answers:\n"
+
+    def call(prompt, model=None, max_tokens=None, timeout=None):
+        if mark in prompt:
+            pairs = json.loads(prompt.split(mark, 1)[1].strip())
+            return json.dumps({k: {"masked_text": v["answer"], "pii_found": [], "abusive_language": False}
+                               for k, v in pairs.items()}), {"prompt_tokens": 1, "completion_tokens": 1}
+        return extraction_fake(prompt, model=model, max_tokens=max_tokens, timeout=timeout)
+    return call
 
 
 async def _rows(conn, sid):
@@ -764,8 +778,8 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         clean = await _add(conn)
         flagged = await _add(conn)
         unchecked = await _add(conn)
-        await extract_submission(pool, clean, "mitra", llm_function=FakeLlm(_seed_answer("Youth")))
-        await extract_submission(pool, flagged, "mitra", llm_function=FakeLlm(_seed_answer("Youth", pii=(True, ["name"]))))
+        await extract_submission(pool, clean, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Youth"))))
+        await extract_submission(pool, flagged, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Youth", pii=(True, ["name"])))))
         for query in queries:
             await conn.fetch(query)                                    # every documented query is valid SQL
 
@@ -796,7 +810,7 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
 
         # the other personas' queries select their own sessions only and use their own column names
         parent = await _add(conn, persona="Parent", version="V1")
-        await extract_submission(pool, parent, "mitra", llm_function=FakeLlm(_seed_answer("Parent")))
+        await extract_submission(pool, parent, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Parent"))))
         parent_rows = await conn.fetch(queries[1])
         assert [r["submission_id"] for r in parent_rows] == [parent]
         prow = dict(parent_rows[0])
@@ -805,10 +819,10 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         assert "gender" not in prow and not (SENSITIVE["Parent"] & set(prow))
         assert [r["submission_id"] for r in await conn.fetch(queries[0])] == [clean]
         general = await _add(conn, persona="General Public")
-        await extract_submission(pool, general, "mitra", llm_function=FakeLlm(_seed_answer("General Public", state="Kerala")))
+        await extract_submission(pool, general, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("General Public", state="Kerala"))))
         assert [(r["submission_id"], r["state"], r["age"]) for r in await conn.fetch(queries[2])] == [(general, "Kerala", 17)]
         educator = await _add(conn, persona="Educator", version="V1")
-        await extract_submission(pool, educator, "mitra", llm_function=FakeLlm(_seed_answer("Educator")))
+        await extract_submission(pool, educator, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Educator"))))
         erow = [dict(r) for r in await conn.fetch(queries[3])]
         assert [r["submission_id"] for r in erow] == [educator]
         assert erow[0]["teaching_level"] == _seed_values("Educator")["teaching_level"]
@@ -818,7 +832,7 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         unmapped = await _add(conn)
         answer = json.loads(_seed_answer("Youth"))
         answer["fields"]["state"] = {"value": None, "raw": "somewhere"}
-        await extract_submission(pool, unmapped, "mitra", llm_function=FakeLlm(json.dumps(answer)))
+        await extract_submission(pool, unmapped, "mitra", llm_function=_with_masking(FakeLlm(json.dumps(answer))))
         review = await conn.fetch(queries[8])
         assert [(r["submission_id"], r["raw_value"], r["questionnaire_version"]) for r in review] == [(unmapped, "somewhere", "V2")]
         # the status columns tell not_provided from unmapped (both have a NULL value); an integer out of range is unmapped
@@ -828,7 +842,7 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         answer["fields"]["district"] = {"value": "N/A", "raw": "n/a"}
         answer["fields"]["gender"] = {"value": None, "raw": None}
         answer["fields"]["age"] = {"value": 250, "raw": "250"}
-        await extract_submission(pool, placeholder, "mitra", llm_function=FakeLlm(json.dumps(answer)))
+        await extract_submission(pool, placeholder, "mitra", llm_function=_with_masking(FakeLlm(json.dumps(answer))))
         by_id = {r["submission_id"]: r for r in await conn.fetch(queries[0])}
         assert (by_id[placeholder]["state"], by_id[placeholder]["state_status"]) == (None, "unmapped")
         assert (by_id[placeholder]["district"], by_id[placeholder]["district_status"]) == (None, "not_provided")

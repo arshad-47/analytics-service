@@ -37,6 +37,14 @@
 -- `-- CONFIG <config_type> <config_source> <session_type>` (tests/seed_support.py reads the file through
 -- these markers, so keep the layout of a block as it is).
 -- =========================================================================
+-- =========================================================================
+-- 0. The tenant (created here when this database does not have it yet; an existing tenant is never touched.
+--    ON CONFLICT DO NOTHING without a column also ignores a clash on the unique name, so it can never fail the start)
+-- =========================================================================
+
+INSERT INTO tenant (name, code, created_by)
+VALUES ('Mitra', 'mitra', 'seed')
+ON CONFLICT DO NOTHING;
 
 -- =========================================================================
 -- 1. Leader categories and programs (one per persona; the program is named "1M Voice")
@@ -1510,6 +1518,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
     }
   ],
   "pii": {
+    "masking_prompt_name": "Feedback PII and Abusive-Language Detection",
     "types": [
       {
         "name": "name",
@@ -1824,6 +1833,7 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
     }
   ],
   "pii": {
+    "masking_prompt_name": "Feedback PII and Abusive-Language Detection",
     "types": [
       {
         "name": "name",
@@ -2052,6 +2062,7 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
     }
   ],
   "pii": {
+    "masking_prompt_name": "Feedback PII and Abusive-Language Detection",
     "types": [
       {
         "name": "name",
@@ -2286,6 +2297,7 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
     }
   ],
   "pii": {
+    "masking_prompt_name": "Feedback PII and Abusive-Language Detection",
     "types": [
       {
         "name": "name",

@@ -14,6 +14,9 @@ from typing import Dict, Tuple
 # Workflow step name, prompt analysis_type and the llm_logs.analysis_type of the step.
 STEP_NAME = "feedback_metadata_extraction"
 ANALYSIS_TYPE = STEP_NAME
+# Prompt analysis_type and llm_logs.analysis_type of the optional model-based masking call that runs before the
+# extraction call (`pii.masking_prompt_name` of the extraction config; app/services/feedback_pii_masking.py).
+PII_MASKING_ANALYSIS_TYPE = "feedback_pii_and_abusive_language_detection"
 
 CONFIG_TYPE_FEEDBACK_EXTRACTION = "feedback_extraction"
 CONFIG_SOURCE_ANY = "any"

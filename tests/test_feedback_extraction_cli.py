@@ -89,6 +89,7 @@ def _four_field_raw(persona):
         if school_name in by_name:
             raw["fields"].append(dict(by_name[school_name], name="school_type"))
     raw["prompt_name"] = "Feedback Metadata Extraction"       # the program-neutral template prompt of seed_prompts.sql
+    raw["pii"].pop("masking_prompt_name", None)               # one call per session here; the masking call has its own test
     return raw
 
 
@@ -175,6 +176,37 @@ def _call(capsys, argv):
 
 def _count(sql, *args):
     return _with_conn(lambda conn: conn.fetchval(sql, *args))
+
+
+@needs_db
+def test_the_optional_masking_call_counts_as_a_second_billed_call_in_the_aggregates(scratch, capsys, monkeypatch):
+    sid = _store("Youth", "has-pii")
+    raw = _four_field_raw("Youth")
+    raw["pii"]["masking_prompt_name"] = "Feedback PII and Abusive-Language Detection"
+    _with_conn(lambda conn: conn.execute(
+        "UPDATE config_version SET config = $2::jsonb WHERE config_id = $1::uuid",
+        extraction_config_id("Youth_Voice"), json.dumps(raw)))
+    mark = "Analyse the following answers:\n"
+
+    def fake(prompt, model=None, max_tokens=None, timeout=None):
+        if mark in prompt:
+            pairs = json.loads(prompt.split(mark, 1)[1].strip())
+            return json.dumps({k: {"masked_text": "<PERSON>", "pii_found": [{"type": "PERSON"}], "abusive_language": False}
+                               for k in pairs}), {"prompt_tokens": 7, "completion_tokens": 3}
+        answer = {"fields": {"state": {"value": "Karnataka", "raw": MARKER}, "district": {"value": "Mysuru", "raw": MARKER},
+                             "gender": {"value": "Female", "raw": MARKER}, "school_type": {"value": None, "raw": None}},
+                  "pii": {"detected": False, "types": []}}
+        return json.dumps(answer), {"prompt_tokens": 100, "completion_tokens": 20}
+
+    monkeypatch.setattr(llm_module, "openrouter_chat_completion", fake)
+    code, out, err = _call(capsys, ["run", "--session-type", "Youth_Voice"])
+    assert code == 0 and err == "" and MARKER not in out and "<PERSON>" not in out
+    result = json.loads(out)
+    assert result["submissions"]["processed"] == 1 and result["submissions"]["llm_calls"] == 2
+    assert result["tokens"] == {"prompt": 107, "completion": 23}
+    assert result["pii"] == {"detected": 1, "not_detected": 0, "types": {"name": 1}}
+    assert _count("SELECT pii_detected FROM feedback_submissions WHERE submission_id = $1", sid) is True
+    assert _count("SELECT count(*) FROM llm_logs") == 2
 
 
 @needs_db

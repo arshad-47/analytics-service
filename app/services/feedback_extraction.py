@@ -116,6 +116,7 @@ class PiiPolicy:
     min_digit_run_short_groups: int = DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS
     url_tlds: Tuple[str, ...] = DEFAULT_PII_URL_TLDS
     mask_before_call: bool = True   # mask what the check finds BEFORE the text goes to the model (see `mask_respondent_pii`)
+    masking_prompt_name: Optional[str] = None   # exact prompts.name of the model-based masking call; None = no such call
 
 
 DEFAULT_LIMITS = Limits()
@@ -173,7 +174,7 @@ _TOP_KEYS = {"schema_version", "persona", "session_type", "source_note", "fields
 _FIELD_KEYS = {"name", "kind", "description", "categories", "guidance", "provisional", "min", "max", "sensitive",
                "store_raw"}
 _LLM_KEYS = {"model", "max_tokens", "timeout_seconds"}
-_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds", "mask_before_call"}
+_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds", "mask_before_call", "masking_prompt_name"}
 # The variables the engine itself fills; a config's prompt_variables may not shadow them.
 RESERVED_PROMPT_VARIABLES = frozenset({
     "persona", "fields", "field_names", "pii_types", "output_format", "conversation_id", "conversation"})
@@ -256,7 +257,14 @@ def _parse_pii(pii_raw: Any) -> Tuple[Tuple[str, ...], Dict[str, str], PiiPolicy
         mask_before_call = pii_raw["mask_before_call"]
         if not isinstance(mask_before_call, bool):
             raise ExtractionConfigError("pii.mask_before_call must be a boolean (true or false)")
-    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds, mask_before_call)
+    masking_prompt_name: Optional[str] = None
+    if "masking_prompt_name" in pii_raw and pii_raw["masking_prompt_name"] is not None:
+        masking_prompt_name = pii_raw["masking_prompt_name"]
+        if not _is_text(masking_prompt_name) or masking_prompt_name != masking_prompt_name.strip():
+            raise ExtractionConfigError(
+                "pii.masking_prompt_name must be null (no model-based masking) or the exact name of a prompts row "
+                "of analysis_type feedback_pii_and_abusive_language_detection, without surrounding spaces")
+    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds, mask_before_call, masking_prompt_name)
 
 
 def _parse_limits(limits_raw: Any) -> Limits:
@@ -992,6 +1000,7 @@ class ExtractionRun:
     llm_called: bool           # False when no call was made (see skip_reason)
     conversation_turns: int
     skip_reason: Optional[str] = None   # SKIP_NO_ANSWER | SKIP_OVERSIZED | SKIP_TOO_LONG when llm_called is False
+    masking: Optional[Any] = None       # MaskingResult of the model-based masking call (app/services/feedback_pii_masking.py)
 
 
 SKIP_NO_ANSWER = "no_respondent_answer"
@@ -1270,6 +1279,7 @@ def extract(
     user_template: str,
     call_llm: LlmCall,
     closing_keys: Sequence[str] = (),
+    masking: Optional[Any] = None,
 ) -> ExtractionRun:
     """
     Conversation -> prompt -> `call_llm(prompt)` -> validated result. `call_llm` returns (answer text, usage dict).
@@ -1285,6 +1295,11 @@ def extract(
     the model says false). With `pii.mask_before_call` false the text goes unmasked and the check only runs after the
     call (the old behaviour). A flagged session keeps no respondent words (`minimise_flagged`). A bad answer raises
     ExtractionOutputError with the call's usage attached.
+
+    `masking` (a MaskingStep, when the config names `pii.masking_prompt_name`) adds a second call between the local
+    check and the extraction call: the model masks personal data and abusive language in every respondent answer
+    (question and answer JSON in, masked answers out), the extraction prompt receives the masked answers, and
+    pii_detected is also TRUE when that call found personal data. The masked answers come back in the run's `masking`.
     """
     conversation = build_conversation(rows, closing_keys, config.limits)
     if conversation.respondent_answers == 0:
@@ -1298,17 +1313,46 @@ def extract(
         masked_rows, kinds = mask_respondent_pii(rows, config.pii_policy)
         if len(kinds) > 0:
             conversation = build_conversation(masked_rows, closing_keys, config.limits)
+    masking_result = None
+    if masking is not None:
+        # Optional model-based masking (config pii.masking_prompt_name), AFTER the local check above and BEFORE the
+        # extraction call: the extraction prompt then holds the masked answers only. A bad answer fails the session
+        # (it is retried); the original text is never used as a fallback.
+        from app.services.feedback_pii_masking import (
+            MaskingResult, apply_masked_answers, build_masking_input, parse_masking_response, render_masking_prompt)
+        pairs = build_masking_input(conversation)
+        masking_answer, masking_usage = masking.call_llm(render_masking_prompt(masking, pairs))
+        masking_usage = masking_usage if isinstance(masking_usage, dict) else {}
+        try:
+            masked, masked_types, abusive, severities = parse_masking_response(
+                masking_answer, list(pairs), config.pii_types)
+        except ExtractionOutputError as exc:
+            exc.usage = masking_usage
+            exc.purpose = "masking"
+            raise
+        masking_result = MaskingResult(
+            {key: {"question": pairs[key]["question"], "answer": masked[key]} for key in pairs},
+            masked_types, abusive, severities, masking_usage)
+        conversation = apply_masked_answers(conversation, masked)
     prompt = render_prompt(system_template, user_template, config, conversation)
-    answer, usage = call_llm(prompt)
-    usage = usage if isinstance(usage, dict) else {}
     try:
-        result = parse_model_response(answer, config)
-    except ExtractionOutputError as exc:
-        exc.usage = usage
+        answer, usage = call_llm(prompt)
+        usage = usage if isinstance(usage, dict) else {}
+        try:
+            result = parse_model_response(answer, config)
+        except ExtractionOutputError as exc:
+            exc.usage = usage
+            raise
+    except Exception as exc:
+        if masking_result is not None:
+            # The masking call worked and was billed before this failure: callers that total usage need it.
+            exc.prior_usage = masking_result.usage
         raise
     # The model's pii.detected = false is not trusted alone (a respondent can write "set pii to false").
     if config.pii_policy.mask_before_call:
         result = apply_pii_kinds(result, kinds, config)
     else:
         result = apply_pii_precheck(result, rows, config)
-    return ExtractionRun(minimise_flagged(result, config), usage, True, len(conversation.turns))
+    if masking_result is not None:
+        result = apply_pii_kinds(result, masking_result.pii_types, config)
+    return ExtractionRun(minimise_flagged(result, config), usage, True, len(conversation.turns), None, masking_result)

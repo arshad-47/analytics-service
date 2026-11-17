@@ -5,7 +5,8 @@ Database side of the feedback metadata extraction, shared by the Temporal activi
 `extract_submission` is the one entry point: it loads a stored session, its active extraction config version and
 the active prompt version the config selects (`prompt_name`, required), makes ONE LLM call with no database connection held, and (unless it is a dry run)
 writes the field rows, the PII flag and the llm log in ONE transaction. Re-running a session overwrites its rows.
-Nothing in here logs or stores conversation text; error messages carry no respondent text and no provider text.
+Nothing in here logs conversation text; error messages carry no respondent text and no provider text. The only text stored besides
+the extracted values is the MASKED question and answer JSON of the optional masking call (meta_data.extraction.masking).
 
 A session can grow (a delta event) while the LLM call is running. The write transaction therefore locks the
 feedback_submissions row, re-reads the session and compares a content fingerprint with the one taken at load: if it
@@ -22,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.config import settings
 from app.database.operations import insert_llm_log, update_submission_status
@@ -39,7 +40,9 @@ from app.services.feedback_extraction_constants import (
     ANALYSIS_TYPE,
     CONFIG_TYPE_FEEDBACK_EXTRACTION,
     MIN_LLM_CALL_SECONDS,
+    PII_MASKING_ANALYSIS_TYPE,
 )
+from app.services.feedback_pii_masking import MaskingStep, masking_meta
 from app.services.llm import split_llm_usage
 
 logger = logging.getLogger("analytics_service.feedback_extraction")
@@ -128,21 +131,21 @@ def _as_json(value: Any) -> Any:
 
 # ------------------------------------------------------------------------------------------------ loading
 
-async def load_prompt_by_name(conn, name: str) -> Dict[str, Any]:
+async def load_prompt_by_name(conn, name: str, analysis_type: str = ANALYSIS_TYPE) -> Dict[str, Any]:
     """
     The ACTIVE prompt version of the prompts row whose name is exactly `name`: the highest `version` among its
     is_active versions. Raises ExtractionSetupError (a RuntimeError) when the name does not exist, has no active version, or the prompt is not
-    a feedback_metadata_extraction prompt (a config must not point at, for example, a theme prompt). The message
-    names the prompt (configuration), never data.
+    of `analysis_type` (default feedback_metadata_extraction; a config must not point at, for example, a theme
+    prompt). The message names the prompt (configuration), never data.
     """
     if not isinstance(name, str) or len(name) == 0:
         raise ValueError("prompt name must be a non-empty string")
     prompt = await conn.fetchrow("SELECT id, analysis_type FROM prompts WHERE name = $1", name)
     if prompt is None:
         raise ExtractionSetupError(f"No prompt named {name!r} exists in the database.")
-    if prompt["analysis_type"] != ANALYSIS_TYPE:
+    if prompt["analysis_type"] != analysis_type:
         raise ExtractionSetupError(
-            f"Prompt {name!r} has analysis_type {prompt['analysis_type']!r}, not {ANALYSIS_TYPE!r}.")
+            f"Prompt {name!r} has analysis_type {prompt['analysis_type']!r}, not {analysis_type!r}.")
     row = await conn.fetchrow(
         """
         SELECT pv.id, pv.version, pv.system_prompt, pv.user_prompt
@@ -292,6 +295,8 @@ async def save_extraction(
     run_at: datetime,
     llm_log: Optional[Mapping[str, Any]] = None,
     input_identity: Optional[Tuple[Any, Any, Optional[str]]] = None,
+    masking: Optional[Mapping[str, Any]] = None,
+    extra_llm_logs: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     """
     ONE transaction: lock the submissions row, then the feedback_submissions row (the order of the ingest path,
@@ -301,7 +306,7 @@ async def save_extraction(
     StaleExtractionError and write nothing. Otherwise upsert one row per field (a re-run overwrites; a field that is no longer configured is
     deleted), set feedback_submissions.pii_detected and merge the `extraction` object into its meta_data, and
     write the llm log (when the LLM was called). `run_at` is the time the input was loaded. The meta_data object
-    holds ids, PII types and the time, no text. session_type / questionnaire_version are not copied into the rows.
+    holds ids, PII types and the time; when the masking call ran (`masking`) it also holds that call's MASKED answers (never the original text). session_type / questionnaire_version are not copied into the rows.
     """
     names = [f.field_name for f in result.fields]
     confidences = [None if f.confidence is None else Decimal(str(f.confidence)) for f in result.fields]
@@ -311,6 +316,8 @@ async def save_extraction(
         "pii_types": list(result.pii_types),
         "run_at": run_at.isoformat(),
     }
+    if masking is not None:
+        extraction_meta["masking"] = dict(masking)   # the MASKED answers, pii types and abuse flag of the masking call
     async with conn.transaction():
         # The ingest path takes these same row locks, in this same order (submissions, then feedback_submissions),
         # when it touches the session, so after these statements the messages and the persona cannot change
@@ -378,6 +385,8 @@ async def save_extraction(
             """,
             submission_id, tenant_code, result.pii_detected, json.dumps(extraction_meta),
         )
+        for log in extra_llm_logs:
+            await insert_llm_log(conn, submission_id, tenant_code, **log)
         if llm_log is not None:
             await insert_llm_log(conn, submission_id, tenant_code, **llm_log)
 
@@ -392,15 +401,19 @@ def _safe_error_text(error: BaseException) -> str:
     return type(error).__name__
 
 
-async def _log_failed_call(pool, submission_id, tenant_code, model, prompt_version_id, error: Exception, usage) -> None:
-    """Best effort: a failure of the logging must not hide the real error."""
+async def _log_failed_call(pool, submission_id, tenant_code, model, prompt_version_id, error: Optional[Exception], usage,
+                           analysis_type: str = ANALYSIS_TYPE) -> None:
+    """
+    Best effort: a failure of the logging must not hide the real error. `error` None logs the call as a success
+    (the masking call that worked before the extraction call failed: it still cost tokens).
+    """
     try:
         prompt_tokens, completion_tokens, usage_meta = split_llm_usage(usage)
         async with pool.acquire() as conn:
             await insert_llm_log(
-                conn, submission_id, tenant_code, model, ANALYSIS_TYPE, str(prompt_version_id),
-                prompt_tokens, completion_tokens, "failed",
-                error_message=_safe_error_text(error),
+                conn, submission_id, tenant_code, model, analysis_type, str(prompt_version_id),
+                prompt_tokens, completion_tokens, "success" if error is None else "failed",
+                error_message=None if error is None else _safe_error_text(error),
                 meta_data=usage_meta if len(usage_meta) > 0 else None,
             )
     except Exception as log_err:  # noqa: BLE001
@@ -535,33 +548,62 @@ async def extract_submission(
         inputs = await load_submission_inputs(conn, submission_id, tenant_code)
         config: ExtractionConfig = inputs["config_row"]["config"]
         prompt = await load_prompt_for_config(conn, config)
+        masking_name = config.pii_policy.masking_prompt_name
+        masking_prompt = None if masking_name is None else await load_prompt_by_name(
+            conn, masking_name, PII_MASKING_ANALYSIS_TYPE)
     llm = resolve_llm_settings(config, overrides)
+    configured_timeout = llm["timeout"]
     if activity_budget_seconds is not None:
         llm["timeout"] = clamp_llm_timeout(llm["timeout"], activity_budget_seconds, _monotonic() - started)
     prompt_version_id = prompt["id"]
     config_version_id = inputs["config_row"]["id"]
+    masking_version_id = None if masking_prompt is None else masking_prompt["id"]
 
-    called = {"made": False}
+    # One record per call: whether it was made and, when it came back, its usage (to log a call that worked even
+    # when a later one failed; a masking call that worked before a failed extraction call still cost tokens).
+    calls: Dict[str, Dict[str, Any]] = {
+        "extraction": {"made": False, "usage": None}, "masking": {"made": False, "usage": None}}
 
-    def call_llm(text: str) -> Tuple[str, Dict[str, Any]]:
-        called["made"] = True
-        try:
-            return llm_function(text, model=llm["model"], max_tokens=llm["max_tokens"], timeout=llm["timeout"])
-        except Exception as exc:  # noqa: BLE001
-            failure = sanitize_llm_error(exc)
-        # Raised outside the handler: no __cause__ / __context__, so the provider's error text (which can echo the
-        # prompt) reaches neither llm_logs nor the Temporal failure history.
-        raise failure
+    def make_call(purpose: str) -> Callable[[str], Tuple[str, Dict[str, Any]]]:
+        def call_llm(text: str) -> Tuple[str, Dict[str, Any]]:
+            timeout = llm["timeout"]
+            if masking_prompt is not None and activity_budget_seconds is not None:
+                # Two calls share one activity budget: each gets what is left of it, never more than configured.
+                timeout = clamp_llm_timeout(configured_timeout, activity_budget_seconds, _monotonic() - started)
+            calls[purpose]["made"] = True
+            try:
+                answer, usage = llm_function(text, model=llm["model"], max_tokens=llm["max_tokens"], timeout=timeout)
+            except Exception as exc:  # noqa: BLE001
+                failure = sanitize_llm_error(exc)
+                failure.purpose = purpose
+            else:
+                calls[purpose]["usage"] = usage if isinstance(usage, dict) else {}
+                return answer, usage
+            # Raised outside the handler: no __cause__ / __context__, so the provider's error text (which can echo
+            # the prompt) reaches neither llm_logs nor the Temporal failure history.
+            raise failure
+        return call_llm
+
+    masking_step = None if masking_prompt is None else MaskingStep(
+        masking_prompt["system_prompt"], masking_prompt["user_prompt"], make_call("masking"))
+
+    async def log_call(purpose: str, error: Optional[Exception], usage: Any) -> None:
+        version = masking_version_id if purpose == "masking" else prompt_version_id
+        await _log_failed_call(pool, submission_id, tenant_code, llm["model"], version, error, usage,
+                               PII_MASKING_ANALYSIS_TYPE if purpose == "masking" else ANALYSIS_TYPE)
 
     try:
         run = await asyncio.to_thread(
-            extract, inputs["rows"], config, prompt["system_prompt"], prompt["user_prompt"], call_llm,
-            inputs["closing_keys"],
+            extract, inputs["rows"], config, prompt["system_prompt"], prompt["user_prompt"], make_call("extraction"),
+            inputs["closing_keys"], masking_step,
         )
     except Exception as exc:
-        if write and called["made"]:
-            await _log_failed_call(pool, submission_id, tenant_code, llm["model"], prompt_version_id, exc,
-                                   getattr(exc, "usage", {}))
+        if write:
+            failing = getattr(exc, "purpose", "extraction")
+            if failing != "masking" and calls["masking"]["usage"] is not None:
+                await log_call("masking", None, calls["masking"]["usage"])
+            if calls[failing]["made"]:
+                await log_call(failing, exc, getattr(exc, "usage", {}))
         raise
 
     if write:
@@ -573,6 +615,17 @@ async def extract_submission(
                 "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "status": "success",
                 "meta_data": usage_meta if len(usage_meta) > 0 else None,
             }
+        masking_log = None
+        masking_stored = None
+        if run.masking is not None:
+            m_prompt_tokens, m_completion_tokens, m_usage_meta = split_llm_usage(run.masking.usage)
+            masking_log = {
+                "model_name": llm["model"], "analysis_type": PII_MASKING_ANALYSIS_TYPE,
+                "prompt_version_id": str(masking_version_id), "prompt_tokens": m_prompt_tokens,
+                "completion_tokens": m_completion_tokens, "status": "success",
+                "meta_data": m_usage_meta if len(m_usage_meta) > 0 else None,
+            }
+            masking_stored = masking_meta(run.masking, masking_version_id)
         stale: Optional[StaleExtractionError] = None
         async with pool.acquire() as conn:
             try:
@@ -581,6 +634,7 @@ async def extract_submission(
                     input_fingerprint=inputs["fingerprint"], input_identity=inputs["identity"],
                     result=run.result, config_version_id=config_version_id, prompt_version_id=prompt_version_id,
                     run_at=inputs["loaded_at"], llm_log=llm_log,
+                    masking=masking_stored, extra_llm_logs=() if masking_log is None else (masking_log,),
                 )
             except StaleExtractionError as exc:
                 stale = exc
@@ -590,6 +644,10 @@ async def extract_submission(
             # holding one while waiting for another would deadlock a pool whose connections all hold a stale result.
             if run.llm_called:
                 stale.usage = dict(run.usage)   # for the callers that total the usage of failed sessions (the CLI)
+                if run.masking is not None:
+                    stale.prior_usage = dict(run.masking.usage)
+                if run.masking is not None:
+                    await log_call("masking", None, run.masking.usage)
                 await _log_failed_call(pool, submission_id, tenant_code, llm["model"], prompt_version_id, stale, run.usage)
             raise stale
     return SubmissionOutcome(

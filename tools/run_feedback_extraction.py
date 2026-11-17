@@ -85,6 +85,14 @@ def _new_aggregates(session_type: str, dry_run: bool) -> Dict[str, Any]:
     }
 
 
+def _add_usage(agg: Dict[str, Any], usage: Any) -> None:
+    """One more billed call: it counts in llm_calls and the token totals."""
+    agg["submissions"]["llm_calls"] += 1
+    prompt_tokens, completion_tokens, _ = split_llm_usage(usage if isinstance(usage, dict) else {})
+    agg["tokens"]["prompt"] += prompt_tokens
+    agg["tokens"]["completion"] += completion_tokens
+
+
 def _add_outcome(agg: Dict[str, Any], outcome, top: int, values: Dict[str, Counter]) -> None:
     subs = agg["submissions"]
     subs["processed"] += 1
@@ -93,6 +101,8 @@ def _add_outcome(agg: Dict[str, Any], outcome, top: int, values: Dict[str, Count
         prompt_tokens, completion_tokens, _ = split_llm_usage(outcome.run.usage)
         agg["tokens"]["prompt"] += prompt_tokens
         agg["tokens"]["completion"] += completion_tokens
+        if outcome.run.masking is not None:      # the optional masking call is a second, billed call of the session
+            _add_usage(agg, outcome.run.masking.usage)
     else:
         # no call was made: no respondent answer, or a respondent message too long to send (flagged pii TRUE)
         subs[outcome.run.skip_reason] += 1
@@ -125,13 +135,12 @@ def _call_was_made(exc: BaseException) -> bool:
 
 def _add_failed_call(agg: Dict[str, Any], exc: BaseException) -> None:
     """The call of a failed session still happened and was billed: it counts in llm_calls and the token totals."""
+    prior = getattr(exc, "prior_usage", None)
+    if isinstance(prior, dict):                  # a masking call that worked before the failing one
+        _add_usage(agg, prior)
     if not _call_was_made(exc):
         return
-    agg["submissions"]["llm_calls"] += 1
-    usage = getattr(exc, "usage", None)
-    prompt_tokens, completion_tokens, _ = split_llm_usage(usage if isinstance(usage, dict) else {})
-    agg["tokens"]["prompt"] += prompt_tokens
-    agg["tokens"]["completion"] += completion_tokens
+    _add_usage(agg, getattr(exc, "usage", None))
 
 
 def _finish(agg: Dict[str, Any], top: int, values: Dict[str, Counter]) -> Dict[str, Any]:

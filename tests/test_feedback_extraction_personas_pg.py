@@ -159,6 +159,19 @@ def _messages():
     return [row(1, "How old are you?", "AGE_IDENTIFICATION", None), row(2, "fourteen", "AGE_IDENTIFICATION", 1)]
 
 
+def _with_masking(extraction_fake):
+    """Answers the masking prompt (every answer unchanged, nothing found) and passes the rest to `extraction_fake`."""
+    mark = "Analyse the following answers:\n"
+
+    def call(prompt, model=None, max_tokens=None, timeout=None):
+        if mark in prompt:
+            pairs = json.loads(prompt.split(mark, 1)[1].strip())
+            return json.dumps({k: {"masked_text": v["answer"], "pii_found": [], "abusive_language": False}
+                               for k, v in pairs.items()}), {"prompt_tokens": 1, "completion_tokens": 1}
+        return extraction_fake(prompt, model=model, max_tokens=max_tokens, timeout=timeout)
+    return call
+
+
 def test_each_persona_extracts_with_its_own_prompt_and_stores_every_dots_field_and_the_integer_as_a_decimal_string():
     async def body(conn, pool):
         for persona, p in PERSONAS.items():
@@ -170,7 +183,8 @@ def test_each_persona_extracts_with_its_own_prompt_and_stores_every_dots_field_a
             answer = json.dumps({"fields": values, "pii": {"detected": False, "types": []}})
             sid = await _add(conn, persona, _messages())
             fake = FakeLlm(answer)
-            await extract_submission(pool, sid, "mitra", llm_function=fake)
+            await extract_submission(pool, sid, "mitra", llm_function=_with_masking(fake))
+            # the seeded config switches the masking call on: it comes first, then the persona's own extraction prompt
             assert len(fake.calls) == 1
             assert f"Feedback Metadata Extraction and PII Check - {persona}" in fake.calls[0]["prompt"]
             rows = {r["field_name"]: r for r in await conn.fetch(
