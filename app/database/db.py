@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 from pathlib import Path
 
 import asyncpg
@@ -9,16 +8,6 @@ from app.config import settings
 from app.database.feedback_config_health import run_startup_checks as check_feedback_config_health
 
 logger = logging.getLogger("analytics_service.db")
-
-# Every statement of seed_config.sql is guarded by `WHERE EXISTS (SELECT 1 FROM tenant WHERE code = '<tenant>')`: the
-# tenant is an environment-level row the seed never creates. The tenants a seed needs are read from its text.
-_SEED_TENANT_GUARD = re.compile(r"FROM tenant WHERE code = '([^']+)'")
-
-
-def seed_tenant_codes(seed_sql: str) -> list:
-    """The tenant codes the statements of a seed file are guarded by (sorted, distinct)."""
-    return sorted(set(_SEED_TENANT_GUARD.findall(seed_sql)))
-
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 SCHEMA_FILE = BASE_DIR / "schema.sql"
@@ -116,19 +105,9 @@ class Database:
                 await conn.execute(seed_themes_sql)
 
                 # Versioned configs (feedback personas, programs, upload and extraction configs) from
-                # seed_config.sql: idempotent, never overwrites existing rows. Each statement is guarded by the
-                # tenant it belongs to, so it inserts nothing while that tenant does not exist (it never creates one).
+                # seed_config.sql: idempotent, never overwrites existing rows. It creates the 'mitra' tenant when this
+                # database does not have it yet (an existing tenant is never touched), then the rows that belong to it.
                 seed_config_sql = SEED_CONFIG_FILE.read_text(encoding="utf-8")
-                missing_tenants = [
-                    code for code in seed_tenant_codes(seed_config_sql)
-                    if await conn.fetchval("SELECT 1 FROM tenant WHERE code = $1", code) is None
-                ]
-                if len(missing_tenants) > 0:
-                    logger.warning(
-                        "Config seed: tenant(s) %s do not exist in this database, so the seed statements guarded "
-                        "by them insert nothing (the rest of the seed ran); create the tenant and restart to seed it.",
-                        ", ".join(repr(code) for code in missing_tenants),
-                    )
                 await conn.execute(seed_config_sql)
 
                 # Log an ERROR per feedback config that lacks / has invalid settings (never raises)

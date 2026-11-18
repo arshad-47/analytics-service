@@ -20,8 +20,8 @@
 -- Other kinds of config are added to this file in the same pattern (one CONFIG block each).
 --
 -- Rules every block follows (the file is a seed, never a migration):
---   * The whole seed is a NO-OP when tenant 'mitra' does not exist (the tenant is an environment row;
---     this file never creates it).
+--   * It creates the tenant 'mitra' when this database does not have it yet (section 0), then everything that
+--     belongs to it. An existing tenant is a NO-OP: it is never touched or renamed.
 --   * Nothing is ever overwritten. leader_category / programs / config are inserted ON CONFLICT DO NOTHING
 --     under fixed ids; version 1 of a config is inserted ONLY while that config has no version row at
 --     all, so a config edited with a new config_version (old one deactivated, kept as history), or one

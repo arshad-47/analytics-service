@@ -254,16 +254,19 @@ def test_seed_does_not_overwrite_google_forms_edits():
     run_db(body)
 
 
-def test_seed_skips_when_tenant_missing():
+def test_seed_creates_the_tenant_and_its_rows_on_an_empty_database():
     async def runner():
         conn = await asyncpg.connect(DSN)
         tx = conn.transaction()
         await tx.start()
         try:
             await conn.execute(pg_support.schema_sql())
-            await seed_config(conn)  # no tenant row: the seed is a no-op
-            for table in ("tenant", "leader_category", "programs", "config", "config_version"):
-                assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 0, table
+            assert await conn.fetchval("SELECT count(*) FROM tenant") == 0
+            await seed_config(conn)  # no tenant row yet: the seed creates 'mitra', then everything that belongs to it
+            assert await conn.fetchval("SELECT count(*) FROM tenant WHERE code = 'mitra'") == 1
+            for table in ("leader_category", "programs", "config", "config_version"):
+                assert await conn.fetchval(f"SELECT count(*) FROM {table}") > 0, table
+            assert await conn.fetchval("SELECT count(*) FROM config") == SEED_CONFIG_COUNT
         finally:
             await tx.rollback()
             await conn.close()

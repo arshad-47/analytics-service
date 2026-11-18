@@ -35,6 +35,7 @@ from app.config import settings
 from app.database import feedback_config_health as health
 from app.database import feedback_legacy_upgrade as up
 from app.database import feedback_operations as fo
+import app.database.db as db_module
 from app.database.db import db
 from test_feedback_upgrade import legacy_gforms, legacy_mitra
 
@@ -153,13 +154,29 @@ def _run(body, *, legacy=True, rows=True, second_bot=False, check_name="config_c
     return asyncio.run(main())
 
 
-async def _startup():
-    """The real startup path of every process: schema.sql, the seeds, the health check."""
+class _NoSeed:
+    """Stands in for db.SEED_CONFIG_FILE: a seed with nothing in it."""
+
+    @staticmethod
+    def read_text(encoding="utf-8"):
+        return "SELECT 1;"
+
+
+async def _startup(seed=False):
+    """
+    The real startup path of every process: schema.sql, the seeds, the health check. These tests are about upgrading
+    the data of the previous release, so by default the config seed is left out (seed_config.sql creates the 'mitra'
+    tenant and its 11 configs, which would sit next to the legacy rows being counted); `seed=True` runs it as well.
+    """
     pool = await asyncpg.create_pool(DSN, min_size=1, max_size=2)
     db.pool = pool
+    saved = db_module.SEED_CONFIG_FILE
+    if not seed:
+        db_module.SEED_CONFIG_FILE = _NoSeed()
     try:
         await db.initialize_schema()
     finally:
+        db_module.SEED_CONFIG_FILE = saved
         db.pool = None
         await pool.close()
 
@@ -221,7 +238,7 @@ def test_startup_does_not_crash_on_a_database_with_several_config_rows_per_progr
         names = await _index_names(conn)
         assert LEGACY_INDEX in names and INDEX not in names     # the old key stays until the new one can exist
         assert await conn.fetchval("SELECT ensure_config_unique_index()") is False
-        # nothing was damaged: the rows and versions are as they were (the seed added no config: its tenant is absent)
+        # nothing was damaged: the rows and versions are as they were (this startup runs without the config seed)
         assert await conn.fetchval(
             "SELECT string_agg(config_id::text || version::text || is_active::text || config::text, '|' "
             "ORDER BY config_id, version) FROM config_version") == versions_before
@@ -232,21 +249,19 @@ def test_startup_does_not_crash_on_a_database_with_several_config_rows_per_progr
     _run(body, second_bot=True)
 
 
-def test_the_seed_message_names_the_missing_tenant_and_says_what_still_ran(caplog):
+def test_the_seed_creates_its_tenant_and_configs_next_to_the_legacy_rows_and_touches_none_of_them(caplog):
     async def body(conn, ids):
-        with caplog.at_level(logging.INFO, logger="analytics_service.db"):
-            await _startup()
-        seed = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Config seed")]
-        assert len(seed) == 1 and "'mitra'" in seed[0] and "do not exist" in seed[0] and "insert nothing" in seed[0]
-        assert "skipped" not in seed[0]
-        assert await conn.fetchval("SELECT count(*) FROM config WHERE tenant_code = 'mitra'") == 0
-        await _tenant(conn, "mitra")
-        caplog.clear()
-        with caplog.at_level(logging.INFO, logger="analytics_service.db"):
-            await _startup()
+        legacy_before = await conn.fetchval(
+            "SELECT string_agg(id::text || name, '|' ORDER BY id) FROM config")
+        with caplog.at_level(logging.WARNING, logger="analytics_service.db"):
+            await _startup(seed=True)
+            await _startup(seed=True)                                   # a restart changes nothing
+        assert await conn.fetchval("SELECT count(*) FROM tenant WHERE code = 'mitra'") == 1
+        assert await conn.fetchval("SELECT count(*) FROM config WHERE tenant_code = 'mitra'") == 11
+        assert await conn.fetchval(
+            "SELECT string_agg(id::text || name, '|' ORDER BY id) FROM config WHERE tenant_code = $1", TENANT) == legacy_before         # the legacy tenant's rows are as they were
         assert not [r for r in caplog.records if r.getMessage().startswith("Config seed")]
-        assert await conn.fetchval("SELECT count(*) FROM config WHERE tenant_code = 'mitra'") > 0
-    _run(body, rows=False)
+    _run(body)
 
 
 def test_a_database_without_collisions_gets_the_new_index_and_loses_the_old_one_at_startup():
