@@ -160,7 +160,7 @@ MAX_PROMPT_VARIABLE_CHARS = 4000
 
 # The Temporal activity timeout is derived from the effective LLM timeout (extraction_activity_timeout_seconds).
 ACTIVITY_MIN_SECONDS = 300      # the floor: database work and the pre-check come on top of the call
-ACTIVITY_MARGIN_SECONDS = 120   # added to the LLM timeout
+ACTIVITY_MARGIN_SECONDS = 120   # added to the time of the two LLM calls (masking, then extraction)
 MIN_LLM_CALL_SECONDS = 30       # less than this left after preparation and the margin: no call is started, the step is retried
 ACTIVITY_MAX_SECONDS = 3600     # the ceiling; a configured llm timeout above (ceiling - margin) is rejected
 MAX_LLM_TIMEOUT_SECONDS = ACTIVITY_MAX_SECONDS - ACTIVITY_MARGIN_SECONDS
@@ -168,10 +168,11 @@ MAX_LLM_TIMEOUT_SECONDS = ACTIVITY_MAX_SECONDS - ACTIVITY_MARGIN_SECONDS
 
 def extraction_activity_timeout_seconds(llm_timeout_seconds) -> int:
     """
-    start_to_close_timeout (seconds) of the extraction activity for an effective LLM timeout: the timeout plus a
-    margin, never below the floor and never above the ceiling. Pure, so the workflow can call it. Anything that is not
+    start_to_close_timeout (seconds) of the extraction activity for an effective LLM timeout: room for TWO calls of that
+    timeout (the masking call, then the extraction call, which share one activity) plus a margin, never below the floor
+    and never above the ceiling. Pure, so the workflow can call it. Anything that is not
     a positive integer (None, a bool, 0) means 'no explicit timeout' and gives the floor.
     """
     if isinstance(llm_timeout_seconds, bool) or not isinstance(llm_timeout_seconds, int) or llm_timeout_seconds <= 0:
         return ACTIVITY_MIN_SECONDS
-    return min(max(ACTIVITY_MIN_SECONDS, llm_timeout_seconds + ACTIVITY_MARGIN_SECONDS), ACTIVITY_MAX_SECONDS)
+    return min(max(ACTIVITY_MIN_SECONDS, 2 * llm_timeout_seconds + ACTIVITY_MARGIN_SECONDS), ACTIVITY_MAX_SECONDS)

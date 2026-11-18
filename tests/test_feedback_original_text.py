@@ -214,3 +214,38 @@ def test_a_session_skipped_for_size_says_not_answered_everywhere_and_stays_on_th
     assert run.llm_called is False and run.result.pii_detected is True
     assert [(f.value, f.status) for f in run.result.fields] == [("Not answered", "unmapped")] * 2
     assert all("size limit" in f.justification and f.raw_value is None for f in run.result.fields)
+
+
+# ------------------------------------------------------------------------------------------------ review follow-ups
+
+def test_text_after_a_spreadsheet_formula_is_still_scanned_for_contact_details():
+    text = "=SUM(1) Contact: person@example.org"
+    masked, kinds = fx.mask_respondent_pii([{"sequence": 2, "parent_id": "p", "question_key": None, "message": text, "translated_message": None}])
+    assert "email" in kinds and masked[0]["message"] == "=SUM(1) Contact: [email removed]"      # the formula itself stays
+    _, kinds = fx.mask_respondent_pii([{"sequence": 2, "parent_id": "p", "question_key": None,
+                                        "message": '=HYPERLINK("http://x.org","a") see www.ashablog.in', "translated_message": None}])
+    assert "other" in kinds                                                                       # the link after the formula, not the one inside it
+    for formula_only in ('=HYPERLINK("http://x.org","click")', "=SUM(1", '=IMPORTXML("www.x.com","//a")'):
+        _, kinds = fx.mask_respondent_pii([{"sequence": 2, "parent_id": "p", "question_key": None, "message": formula_only, "translated_message": None}])
+        assert kinds == ()
+
+
+def _masking_answer(pii_type):
+    return json.dumps({"2": {"masked_text": "my name is <PERSON>", "abusive_language": False, "abusive_spans": [],
+                             "pii_found": [{"type": pii_type, "justification": "a name"}]}})
+
+
+def test_a_finding_stores_a_known_type_or_other_never_free_text_from_the_model():
+    for given, stored in (("PERSON", "person"), ("person", "person"), ("Asha Verma", "other"), ("a long sentence naming Asha", "other")):
+        details = pm.parse_masking_details(_masking_answer(given), ["2"], PII_TYPES)
+        assert details[4][0]["type"] == stored, given
+        assert "Asha" not in json.dumps(details[4])
+    details = pm.parse_masking_details(json.dumps({"2": {"masked_text": "x", "pii_found": [{"justification": "n"}]}}), ["2"], PII_TYPES)
+    assert details[4][0]["type"] is None                                                        # no type given: none stored
+
+
+def test_a_two_letter_name_quoted_in_a_justification_is_dropped_like_longer_ones():
+    pairs = {"2": {"question": "q", "answer": "I am Jo and I teach"}}
+    masked = {"2": "I am <PERSON> and I teach"}
+    out = pm.scrub_findings([_finding("2", "Jo is a first name"), _finding("2", "A person's name")], pairs, masked)
+    assert [("justification" in f) for f in out] == [False, True]

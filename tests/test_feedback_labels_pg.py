@@ -190,3 +190,28 @@ def test_the_identity_of_a_session_includes_the_fields_its_questionnaire_version
     assert persona_identity("Youth_Voice", "mitra", "P1", ("a", "b")) != persona_identity("Youth_Voice", "mitra", "P1", ("a",))
     assert persona_identity("Youth_Voice", "mitra", "P1", ("a",)) == persona_identity("Youth_Voice", "mitra", "P1", ("a",))
     assert persona_identity("Youth_Voice", "mitra", "P1") == ("Youth_Voice", "mitra", "P1", ())
+
+
+def test_a_config_version_activated_while_the_call_ran_makes_the_write_stale_and_writes_nothing():
+    async def body(conn, pool):
+        sid = await _session(conn, masking=None)
+        await _use_config(conn, sid, "V1")
+        async with pool.acquire() as c:
+            inputs = await load_submission_inputs(c, sid, "mitra")
+        config = inputs["config_row"]["config"]
+        cid = extraction_config_id("Youth_Voice")
+        # an operator activates the next version of the config (the same fields) while the LLM call is running
+        await conn.execute("UPDATE config_version SET is_active = FALSE WHERE config_id = $1::uuid", cid)
+        await conn.execute(
+            "INSERT INTO config_version (config_id, version, is_active, config, created_by, change_note) "
+            "SELECT config_id, 2, TRUE, config, 'ops', 'next' FROM config_version WHERE config_id = $1::uuid AND version = 1", cid)
+        async with pool.acquire() as c:
+            with pytest.raises(StaleExtractionError, match="config in force changed"):
+                await save_extraction(
+                    c, submission_id=sid, tenant_code="mitra", input_fingerprint=inputs["fingerprint"],
+                    result=fx.empty_result(config), config_version_id=inputs["config_row"]["id"],
+                    prompt_version_id=inputs["config_row"]["id"], run_at=inputs["loaded_at"],
+                    input_identity=inputs["identity"], config=config)
+        assert await _rows(conn, sid) == {}
+        assert (await _meta(conn, sid))[0] is None
+    _run(body)

@@ -379,6 +379,16 @@ async def save_extraction(
                 f"feedback session {submission_id} was moved to another persona (session_type, source, program) or "
                 f"relabelled to a questionnaire version that asks other fields "
                 f"while its extraction was running; nothing was written, it must run again for the new persona")
+        if input_identity is not None:
+            # The config the run used must still be the active one for this session: when an operator activated another
+            # version while the call ran (and a relabel may have moved the session to a label that version asks other
+            # fields for), the result describes the old config and must not be saved.
+            applicable = await load_extraction_config(
+                conn, tenant_code, feedback["session_type"], master["program_id"], feedback["source"])
+            if str(applicable["id"]) != str(config_version_id):
+                raise StaleExtractionError(
+                    f"feedback session {submission_id}: the extraction config in force changed while its extraction "
+                    f"was running; nothing was written, it must run again under the current config")
         await conn.execute(
             """
             INSERT INTO feedback_extracted_data (

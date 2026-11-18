@@ -380,11 +380,19 @@ def test_a_failed_call_is_logged_once_as_before(monkeypatch):
 # ------------------------------------------------------------------------------------------------ A20 timeout
 
 @pytest.mark.parametrize("llm_timeout, expected", [
-    (None, 300), (0, 300), (True, 300), ("60", 300), (60, 300), (180, 300), (181, 301), (600, 720), (1200, 1320),
-    (3480, 3600), (10000, 3600),
+    (None, 300), (0, 300), (True, 300), ("60", 300), (60, 300), (90, 300), (91, 302), (180, 480), (600, 1320),
+    (1200, 2520), (1740, 3600), (3480, 3600), (10000, 3600),
 ])
 def test_the_activity_timeout_follows_the_llm_timeout_within_bounds(llm_timeout, expected):
     assert constants.extraction_activity_timeout_seconds(llm_timeout) == expected
+
+
+@pytest.mark.parametrize("llm_timeout", [60, 90, 180, 600, 1200])
+def test_the_masking_call_and_the_extraction_call_each_get_the_full_timeout_inside_the_activity_budget(llm_timeout):
+    budget = constants.extraction_activity_timeout_seconds(llm_timeout)
+    masking = ops.clamp_llm_timeout(llm_timeout, budget, 0)
+    extraction = ops.clamp_llm_timeout(llm_timeout, budget, masking)      # the masking call used its whole timeout
+    assert (masking, extraction) == (llm_timeout, llm_timeout)
 
 
 def test_a_configured_llm_timeout_above_the_ceiling_is_refused_by_the_parser():

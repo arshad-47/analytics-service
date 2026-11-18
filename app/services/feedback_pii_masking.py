@@ -166,6 +166,13 @@ def parse_masking_details(text: Any, expected: Sequence[str], pii_types: Sequenc
         if name not in types:
             types.append(name)
 
+    def _finding_type(word: Any) -> Any:
+        """The type a finding stores: one of the known masking types, else 'other', so whatever the model puts in `type`
+        (a name, a sentence) never reaches the shareable metadata as free text. None stays None (no type given)."""
+        if not isinstance(word, str):
+            return None
+        return word.strip().lower() if word.strip().lower() in MASKING_TYPE_TO_PII_TYPE else "other"
+
     for key in expected:
         entry = _entry(parsed.get(key))
         if entry is None:
@@ -179,7 +186,7 @@ def parse_masking_details(text: Any, expected: Sequence[str], pii_types: Sequenc
             for item in found:
                 kind = item.get("type") if isinstance(item, dict) else None
                 add_type(kind)
-                findings.append(_finding(key, "pii", "type", kind, item))
+                findings.append(_finding(key, "pii", "type", _finding_type(kind), item))
         elif found is True:
             add_type(None)
         for tag in _PII_TAG_RE.findall(masked_text):
@@ -200,7 +207,7 @@ def parse_masking_details(text: Any, expected: Sequence[str], pii_types: Sequenc
 
 _SPACE_SPLIT_RE = re.compile(r"\s+")
 _EDGE_PUNCTUATION = ",.;:!?()[]{}<>\"'/\\|*~`"
-MIN_SCRUB_WORD_CHARS = 3
+MIN_SCRUB_WORD_CHARS = 2
 
 
 def _words(text: str) -> List[str]:

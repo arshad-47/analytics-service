@@ -132,7 +132,7 @@ class PiiPolicy:
     min_digit_run: int = DEFAULT_PII_MIN_DIGIT_RUN
     min_digit_run_short_groups: int = DEFAULT_PII_MIN_DIGIT_RUN_SHORT_GROUPS
     url_tlds: Tuple[str, ...] = DEFAULT_PII_URL_TLDS
-    mask_before_call: bool = True   # mask what the check finds BEFORE the text goes to the model (see `mask_respondent_pii`)
+    mask_before_call: bool = True   # mask what the check finds in the text of the masking call (and of the extraction call when extraction_text is 'masked'), see `mask_respondent_pii`
     masking_prompt_name: Optional[str] = None   # exact prompts.name of the model-based masking call; None = no such call
     extraction_text: str = EXTRACTION_TEXT_ORIGINAL   # what the extraction call reads: 'original' or 'masked' (see EXTRACTION_TEXTS)
 
@@ -897,8 +897,28 @@ def _number_span(text: str, start: int, end: int) -> _Span:
 
 
 # A spreadsheet formula typed as an answer ('=HYPERLINK("http://x.org","a")', '@SUM(1+1)'): a function call after = + - @. It is
-# not a handle or a link and must not flag the session; its digits are still checked.
+# not a handle or a link and must not flag the session; its digits are still checked, and whatever follows the formula
+# ('=SUM(1) Contact: person@example.org') is scanned like any other text.
 _FORMULA_CALL_RE = re.compile(r"^\s*[=+\-@]\s*[A-Za-z_][A-Za-z0-9_.]*\(")
+
+
+def _formula_end(text: str, start: int) -> int:
+    """The index just after the closing parenthesis of the formula call whose '(' ends at `start` (quoted text is skipped);
+    the end of the text when the parentheses never balance (the whole answer is then the formula). Linear."""
+    depth = 1
+    quoted = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == '"':
+            quoted = not quoted
+        elif not quoted:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+    return len(text)
 
 
 def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple[List[str], List[_Span], List[Tuple[List[str], int, int]]]:
@@ -913,8 +933,12 @@ def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple
         if _run_is_number(groups, policy):
             kinds.append(PII_KIND_NUMBER)
             spans.append(_number_span(text, start, end))
-    if _FORMULA_CALL_RE.match(text) is not None:
-        return kinds, spans, runs
+    formula = _FORMULA_CALL_RE.match(text)
+    if formula is not None:
+        end = _formula_end(text, formula.end())
+        if end >= len(text):
+            return kinds, spans, runs
+        text = " " * end + text[end:]        # the formula is blanked (positions stay); the rest of the answer is scanned
     scanned = text
     if "@" in text:
         # E-mail addresses and handles: the whole space-delimited token is masked. The URL check below does not see
@@ -1041,7 +1065,7 @@ def mask_respondent_pii(rows: Sequence[Mapping[str, Any]], policy: PiiPolicy = D
     """
     (rows for the prompt, kinds): the same check as `pii_precheck_kinds`, and every hit REPLACED in a copy of the
     rows by a short placeholder ('[number removed]', '[email removed]', '[handle removed]', '[link removed]'), so that
-    what the check finds never reaches the model. Both columns (`message`, `translated_message`) of every respondent
+    what the check finds is not in the text of whichever call is given these rows. Both columns (`message`, `translated_message`) of every respondent
     row are masked; a number answered in parts is masked in every message of the chain. Only a column that holds a
     hit changes (it comes back normalised the way the check read it: NFKC, no format characters, one line); every other
     column, every bot row and the input rows themselves stay exactly as they were. The input is never modified and the
@@ -1703,12 +1727,15 @@ def extract(
     limits.max_conversation_chars as a whole, makes no call either: it is pii_detected TRUE ('other'), fields
     unmapped (these checks look at the ORIGINAL text, before any masking, so they do not depend on it).
 
-    The deterministic PII check runs BEFORE the call (`pii.mask_before_call`, default true): what it finds in the
-    respondent rows (numbers, e-mail addresses, handles, links) is replaced by a placeholder in the text the model
-    receives (`mask_respondent_pii`), so none of it reaches the AI provider. The model still extracts the other
-    fields, and pii_detected is TRUE when the model says so OR the check found something (a hit is recorded even when
-    the model says false). With `pii.mask_before_call` false the text goes unmasked and the check only runs after the
-    call (the old behaviour). A flagged session keeps everything it extracted: the flag marks it, and what to exclude
+    The deterministic PII check runs BEFORE the calls (`pii.mask_before_call`, default true): what it finds in the
+    respondent rows (numbers, e-mail addresses, handles, links) is replaced by a placeholder in the text the MASKING call
+    receives and, when `pii.extraction_text` is 'masked', in the text the extraction call receives (`mask_respondent_pii`),
+    so none of it reaches the AI provider in that text. With the default `pii.extraction_text` 'original' the extraction
+    call is given the respondent's own words (a deliberate choice: the metadata is analysed on them, and only the masked
+    copy may be shared), so numbers, addresses, handles and links of an answer DO reach the provider in THAT call; the
+    check still runs and sets the flag. The model extracts the fields, and pii_detected is TRUE when the model says so OR
+    the check found something (a hit is recorded even when the model says false). With `pii.mask_before_call` false the
+    text goes unmasked and the check only runs after the call (the old behaviour). A flagged session keeps everything it extracted: the flag marks it, and what to exclude
     from an export is decided by the query that makes it. A bad answer raises ExtractionOutputError with the call's
     usage attached.
 
