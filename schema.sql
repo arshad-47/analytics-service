@@ -713,9 +713,10 @@ CREATE TABLE feedback_extracted_data (
     submission_id         TEXT NOT NULL,
     tenant_code           TEXT NOT NULL,
     field_name            TEXT NOT NULL, -- state | district | gender | school_type ... (the extraction config's field names)
-    value                 TEXT, -- the band / canonical value; NULL when not provided or unmapped
+    value                 TEXT, -- the band / label, NEVER empty: 'Not answered' (not_provided), 'N/A' (not_applicable), a fallback label (unmapped); several labels joined by ', ' for a multi-value field
+    value_list            TEXT[], -- the individual labels of value (one for a single-value field); count categories with it
     raw_value             TEXT, -- the respondent's words as the model returned them; kept for unmapped values
-    status                TEXT NOT NULL CHECK (status IN ('extracted', 'not_provided', 'unmapped')),
+    status                TEXT NOT NULL CHECK (status IN ('extracted', 'not_provided', 'unmapped', 'not_applicable')),
     confidence            NUMERIC CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)), -- only if the model gave one
     justification         TEXT, -- the model's own short reason for the value (or for leaving it empty); NULL if it gave none
     config_version_id     UUID REFERENCES config_version(id) ON DELETE SET NULL, -- the extraction config version used
@@ -731,8 +732,27 @@ CREATE TABLE feedback_extracted_data (
 
 -- Databases created before the justification existed: the column is added here at every startup.
 ALTER TABLE feedback_extracted_data ADD COLUMN IF NOT EXISTS justification TEXT;
+ALTER TABLE feedback_extracted_data ADD COLUMN IF NOT EXISTS value_list TEXT[];
+-- Databases created before 'not_applicable' existed: replace the CHECK on status (a no-op on a new database and on every later start).
+DO $$
+DECLARE
+    old_check RECORD;
+BEGIN
+    FOR old_check IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'feedback_extracted_data'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%not_provided%' AND pg_get_constraintdef(oid) NOT LIKE '%not_applicable%'
+    LOOP
+        EXECUTE format('ALTER TABLE feedback_extracted_data DROP CONSTRAINT %I', old_check.conname);
+        ALTER TABLE feedback_extracted_data ADD CONSTRAINT feedback_extracted_data_status_check
+            CHECK (status IN ('extracted', 'not_provided', 'unmapped', 'not_applicable'));
+    END LOOP;
+END $$;
 
 -- session_type and questionnaire_version are NOT copied here (a copy would go stale when
 -- tools/questionnaire_versions.py relabels sessions): join feedback_submissions for them.
 CREATE INDEX IF NOT EXISTS idx_feedback_extracted_field_value
     ON feedback_extracted_data (field_name, value);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_extracted_value_list
+    ON feedback_extracted_data USING GIN (value_list);

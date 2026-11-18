@@ -173,7 +173,7 @@ def test_the_named_prompt_is_used_and_its_version_is_recorded_everywhere():
         assert await conn.fetchval("SELECT prompt_version_id::text FROM llm_logs WHERE submission_id = $1", sid) == str(ids[1])
         # integer stored as the canonical decimal string
         assert (rows["age"]["value"], rows["age"]["status"]) == ("17", "extracted")
-        assert (rows["disability"]["value"], rows["disability"]["status"]) == (None, "not_provided")
+        assert (rows["disability"]["value"], rows["disability"]["status"]) == ("Not answered", "not_provided")
     _run(body)
 
 
@@ -233,8 +233,9 @@ def test_integer_values_are_stored_canonical_and_out_of_range_or_text_is_unmappe
     async def body(conn, pool):
         await _add_prompt(conn, CUSTOM_PROMPT, [(1, True, "v1")])
         await _set_config(conn, _config(prompt_name=CUSTOM_PROMPT))
-        for given, status, value in ((" 017 ", "extracted", "17"), (250, "unmapped", None), ("seventeen", "unmapped", None),
-                                     (17.5, "unmapped", None), (None, "not_provided", None)):
+        for given, status, value in ((" 017 ", "extracted", "17"), (250, "unmapped", "Invalid response"),
+                                     ("seventeen", "unmapped", "Invalid response"), (17.5, "unmapped", "Invalid response"),
+                                     (None, "not_provided", "Not answered")):
             sid = await _add_session(conn)
             await extract_submission(pool, sid, "mitra", llm_function=FakeLlm(_answer(age=given)))
             age = (await _rows(conn, sid))["age"]
@@ -342,9 +343,9 @@ def test_cli_show_config_lists_the_prompt_name_and_the_field_flags(capsys, monke
     shown = json.loads(named[1])
     assert named[0] == 0 and len(shown) == 1 and shown[0]["summary"]["prompt_name"] == CUSTOM_PROMPT
     assert shown[0]["summary"]["fields"] == [
-        {"name": "age", "kind": "integer", "sensitive": False, "provisional": False},
-        {"name": "gender", "kind": "category", "sensitive": False, "provisional": False},
-        {"name": "district", "kind": "free_text", "sensitive": False, "provisional": False},
-        {"name": "disability", "kind": "category", "sensitive": True, "provisional": False},
+        {"name": "age", "kind": "integer", "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None},
+        {"name": "gender", "kind": "category", "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None},
+        {"name": "district", "kind": "free_text", "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None},
+        {"name": "disability", "kind": "category", "sensitive": True, "provisional": False, "multi": False, "versions": None, "applies_when": None},
     ]
     assert json.loads(generic[1])[0]["summary"]["prompt_name"] == "(none)"

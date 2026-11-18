@@ -394,7 +394,10 @@ def test_the_old_migrate_alone_leaves_restamp_aborting_and_migrate_legacy_fixes_
             await _with_pool(lambda: fo.restamp_questionnaire_versions(tenant_code=TENANT, dry_run=True))
         await _with_pool(lambda: up.migrate_legacy(tenant_code=TENANT, session_type_map=_all_mapping()))
         result = await _with_pool(lambda: fo.restamp_questionnaire_versions(tenant_code=TENANT, dry_run=True))
-        assert result["changed"] == 0 and len(result["session_types"]) == 2
+        # CHANGED (was: 0): the legacy sessions carry bot id 90, so their label is the rank of that bot (V1, the only
+        # bot of its persona) and not a window: Beta's b-1002, which is after the V2 window, would be relabelled V1
+        assert result["changed"] == 1 and len(result["session_types"]) == 2
+        assert sum(e["bot_sessions"]["changed"] for e in result["session_types"].values()) == 1
     _run(body)
 
 
@@ -460,12 +463,15 @@ def test_migrate_legacy_brings_the_old_database_over_and_a_second_run_changes_no
             header = ",".join(mitra["column_map"][r] for r in roles)
             row = ",".join({"session_type": "Alpha_Voice", "session_status": "COMPLETED", "session": "x" * 32,
                             "submission_id": "1", "language": "en", "sequence": "1", "message": "hi",
-                            "created_at": "2026-10-05T10:00:00+00:00", "stage": "S", "sender_id": "5"}.get(r, "")
+                            "created_at": "2026-10-05T10:00:00+00:00", "stage": "S", "sender_id": "5",
+                            "bot_id": "90"}.get(r, "")
                            for r in roles)
             df = feedback_uploads.parse_feedback_csv(f"{header}\n{row}\n".encode())
             assert feedback_uploads.check_feedback_file(df, mitra, "Alpha_Voice") == []
             restamp = await fo.restamp_questionnaire_versions(tenant_code=TENANT)      # the documented follow-up works
-            assert restamp["changed"] == 0                                              # the labels are already right
+            # CHANGED (was: 0, "the labels are already right"): the migration stamps the windows, and the sessions
+            # carry bot id 90, so the follow-up `restamp` puts the bot-rank label on Beta's b-1002 (V2 -> V1)
+            assert restamp["changed"] == 1
             async with db.pool.acquire() as c:
                 assert await fo.get_feedback_process_steps(c, "a-1001", TENANT) == []
                 assert await fo.get_feedback_process_steps(c, "b-1002", TENANT) == []

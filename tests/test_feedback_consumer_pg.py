@@ -129,7 +129,8 @@ def test_create_session_resolves_parents():
         assert str(sub["program_id"]) == PROGRAM_ID and str(sub["leader_id"]) == LEADER_ID
         assert sub["session_id"] == sess and sub["status"] == "pending"
         assert fs["source"] == "mitra" and fs["completion_status"] == "COMPLETED" and fs["source_ref"] is None
-        assert fs["session_type"] == "Youth_Voice" and fs["questionnaire_version"] == "V2"
+        # CHANGED: the event says V2, the stored label of a bot session is the rank of its bot id (the only bot: V1)
+        assert fs["session_type"] == "Youth_Voice" and fs["questionnaire_version"] == "V1"
         assert json.loads(fs["meta_data"]) == {"bot_id": "101", "bot_name": "Mitra Youth Test Bot"}
         by_seq = {r["sequence"]: r for r in fbs}
         assert sorted(by_seq) == [1, 2, 3, 4, 5, 6]
@@ -564,36 +565,39 @@ def test_create_writes_session_type_version_and_bot_meta():
     _run(body)
 
 
-def test_create_with_blank_bot_fields_omits_them_from_meta():
+def test_create_with_a_blank_bot_name_omits_it_and_a_missing_bot_id_is_rejected():
+    # CHANGED: botId is required for conversation_rows (it was optional); only botName can be blank now
     async def body(conn, created):
         sid, sess = _ids()
         sid2, sess2 = _ids()
         sid3, sess3 = _ids()
         created.extend([sid, sid2, sid3])
         await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"botId": "205", "botName": "  "}))
-        await insert_or_update_submission(conn, _event(sid2, sess2, SIX, data={"botId": None, "botName": ""}))
+        for bad in ({"botId": None, "botName": ""}, {"botId": ""}):
+            with pytest.raises(ValueError, match="data.botId is invalid"):
+                await insert_or_update_submission(conn, _event(sid2, sess2, SIX, data=bad))
         event3 = _event(sid3, sess3, SIX)
         del event3["data"]["botId"], event3["data"]["botName"]
-        await insert_or_update_submission(conn, event3)
+        with pytest.raises(ValueError, match="data.botId is invalid"):
+            await insert_or_update_submission(conn, event3)
         assert json.loads((await _fs(conn, sid))["meta"]) == {"bot_id": "205"}
-        assert (await _fs(conn, sid2))["meta"] is None
-        assert (await _fs(conn, sid3))["meta"] is None
+        assert await _fs(conn, sid2) is None and await _fs(conn, sid3) is None      # nothing written
     _run(body)
 
 
-def test_redelivery_with_changed_version_refreshes_it_and_resends_to_processing():
+def test_redelivery_with_another_event_version_keeps_the_rank_label_and_changes_nothing():
+    # CHANGED (was: "..._changed_version_refreshes_it_and_resends_to_processing"): the version of the event no longer
+    # decides what is stored for a bot session, so a redelivery that only changes it is an identical event
     async def body(conn, created):
         sid, sess = _ids()
         created.append(sid)
         await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"questionnaireVersion": "V1"}))
         await conn.execute("UPDATE submissions SET status = 'success' WHERE submission_id = $1", sid)
-        before = await _fs(conn, sid)
+        before = await _snapshot(conn, sid)
         res = await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"questionnaireVersion": "V2"}))
-        after = await _fs(conn, sid)
-        assert res["changed"] is True and res["messages_inserted"] == 0
-        assert before["questionnaire_version"] == "V1" and after["questionnaire_version"] == "V2"
-        assert after["session_type"] == before["session_type"] and after["meta"] == before["meta"]
-        assert after["updated_at"] >= before["updated_at"]
+        assert res["changed"] is False and res["messages_inserted"] == 0
+        assert (await _fs(conn, sid))["questionnaire_version"] == "V1"
+        assert await _snapshot(conn, sid) == before
     _run(body)
 
 
@@ -620,10 +624,10 @@ def test_redelivery_with_new_bot_merges_meta_data():
             conn, _event(sid, sess, SIX, data={"botId": "110", "botName": "Educator Test Bot"}))
         assert res["changed"] is True
         assert json.loads((await _fs(conn, sid))["meta"]) == {"bot_id": "110", "bot_name": "Educator Test Bot"}
-        # a later delivery without bot info leaves the stored meta_data alone and changes nothing
+        # a later delivery with a blank name (and the same bot) leaves the stored meta_data alone and changes nothing
         await conn.execute("UPDATE submissions SET status = 'success' WHERE submission_id = $1", sid)
         before = await _snapshot(conn, sid)
-        later = _event(sid, sess, SIX, data={"botId": None, "botName": ""})
+        later = _event(sid, sess, SIX, data={"botId": "110", "botName": ""})
         res = await insert_or_update_submission(conn, later)
         assert res["changed"] is False
         assert await _snapshot(conn, sid) == before

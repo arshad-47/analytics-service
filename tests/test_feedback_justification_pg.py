@@ -7,8 +7,8 @@ network). SYNTHETIC data only.
   * feedback_extracted_data.justification is written (and rewritten by a re-run); older databases get the column from
     schema.sql at startup;
   * meta_data.extraction.masking.findings holds type / severity, confidence and justification, never the matched text;
-  * meta_data.extraction.responses holds both complete answers for a session that is NOT flagged, is replaced by every
-    re-run and is absent for a flagged session (which keeps no respondent words), while the justifications stay;
+  * meta_data.extraction.responses holds both complete answers of every session, flagged ones included (the data stays in
+    our system), and is replaced by every re-run;
   * a call whose answer cannot be used keeps a truncated copy of it in its failed llm_logs row (a good call does not);
   * the outcome carries the stage list (masking, then extraction) and tells a listener after every change.
 """
@@ -71,7 +71,7 @@ def test_the_justification_of_a_field_is_stored_and_a_rerun_rewrites_it():
         await extract_submission(pool, sid, "mitra", llm_function=Fake(
             masking=_clean_masking, extraction=_extraction(None, "The answer is a region, not a district.")))
         assert await _justifications(conn, sid) == {
-            "district": (None, "unmapped", "The answer is a region, not a district.")}
+            "district": ("Invalid response", "unmapped", "The answer is a region, not a district.")}
     _run(body)
 
 
@@ -116,23 +116,27 @@ def test_both_complete_responses_are_stored_for_a_session_that_is_not_flagged_an
     _run(body)
 
 
-def test_a_flagged_session_keeps_no_responses_but_keeps_its_justifications():
+def test_a_flagged_session_keeps_its_responses_and_its_justifications():
     async def body(conn, pool):
         sid = await _session(conn)
-        await extract_submission(pool, sid, "mitra", llm_function=Fake(extraction=_extraction(pii=True)))
+        text = _extraction(pii=True)
+        await extract_submission(pool, sid, "mitra", llm_function=Fake(extraction=text))
         pii, meta = await _meta(conn, sid)
-        assert pii is True and "responses" not in meta["extraction"]
+        assert pii is True and meta["extraction"]["responses"]["extraction"] == text      # the data stays in our system
         assert (await _justifications(conn, sid))["district"][2] == "They named the district."
     _run(body)
 
 
-def test_a_rerun_that_flags_the_session_removes_the_responses_an_earlier_clean_run_stored():
+def test_a_rerun_replaces_the_responses_of_an_earlier_run_flagged_or_not():
     async def body(conn, pool):
         sid = await _session(conn)
-        await extract_submission(pool, sid, "mitra", llm_function=Fake(masking=_clean_masking, extraction=_extraction()))
-        assert "responses" in (await _meta(conn, sid))[1]["extraction"]
-        await extract_submission(pool, sid, "mitra", llm_function=Fake(extraction=_extraction(pii=True)))   # names the person
-        assert "responses" not in (await _meta(conn, sid))[1]["extraction"]
+        clean = _extraction(justification="clean run")
+        await extract_submission(pool, sid, "mitra", llm_function=Fake(masking=_clean_masking, extraction=clean))
+        assert (await _meta(conn, sid))[1]["extraction"]["responses"]["extraction"] == clean
+        flagged = _extraction(justification="flagged run", pii=True)
+        await extract_submission(pool, sid, "mitra", llm_function=Fake(extraction=flagged))        # names the person
+        pii, meta = await _meta(conn, sid)
+        assert pii is True and meta["extraction"]["responses"]["extraction"] == flagged
     _run(body)
 
 

@@ -88,10 +88,11 @@ def test_types_outside_the_configured_list_are_recorded_as_other():
     assert run.result.pii_types == ("other",)
 
 
-def test_a_flagged_session_still_keeps_no_respondent_words():
+def test_a_flagged_session_keeps_what_the_model_extracted():
     run, _ = _run([_row(1, "Q", answer=False), _row(2, PHONE_TEXT)])
     district = {f.field_name: f for f in run.result.fields}["district"]
-    assert district.value is None and district.raw_value is None
+    assert run.result.pii_detected is True
+    assert district.value == "Mysuru" and district.raw_value is not None       # nothing is wiped any more
 
 
 def test_the_translated_column_is_masked_too():

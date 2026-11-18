@@ -30,7 +30,7 @@ from app.services.feedback_adapter_config import (
     validate_adapter_config,
 )
 from app.services.feedback_config_validation import validate_feedback_config_keys
-from app.services.feedback_versions import parse_versions, stamp_version
+from app.services.feedback_versions import BOT_ID_RULE, is_valid_bot_id, parse_versions, stamp_version
 from app.services.feedback_constants import (
     ADAPTER_CONVERSATION_ROWS,
     CONFIG_KEY_EXPECT_STAGES,
@@ -83,16 +83,27 @@ def _column_lookup(df: pd.DataFrame) -> Dict[str, str]:
     return lookup
 
 
+def _bot_id_header(config: Dict[str, Any]) -> str:
+    """
+    The CSV header of the bot id (config["column_map"]["bot_id"], default 'bot_id'; the Mitra export names it per
+    config, for example company_bot_id). A Mitra file MUST carry it: a session's questionnaire version is the rank
+    of its bot id inside the persona, so a file without it can not be stamped.
+    """
+    return resolve_column_map(config)["bot_id"]
+
+
 def check_feedback_file(df: pd.DataFrame, config: Dict[str, Any], expected_session_type: str) -> List[str]:
     """
     File-level checks. Returns error strings; an empty list means the file may be processed.
 
     - every required role (config["column_map"] over the default role names; session_type, session_status, session,
       submission_id, language, sequence, message, created_at, stage, sender_id) has its CSV column, matched
-      case-insensitively;
+      case-insensitively; so has the bot_id role (the questionnaire version of a bot session is the rank of its bot
+      id, see _bot_id_header);
     - every row's session_type is present and equals `expected_session_type` (a file holding another
-      persona is rejected whole; only counts are reported, never the cell values). The bot id is NOT checked: one
-      persona runs several bots over time and the same file may hold V1 and V2 sessions.
+      persona is rejected whole; only counts are reported, never the cell values). The values of the bot id are
+      checked per session by build_feedback_events: one persona runs several bots over time and the same file may
+      hold V1 and V2 sessions, each session carrying exactly one bot id.
     Blank submission_id / session cells are session-level problems (see build_feedback_events), not
     file-level ones. Extra columns are fine.
     """
@@ -100,9 +111,13 @@ def check_feedback_file(df: pd.DataFrame, config: Dict[str, Any], expected_sessi
     lookup = _column_lookup(df)
     headers = required_column_headers(config)
 
-    missing = [header for header in headers.values() if header.lower() not in lookup]
+    missing = [header for header in (*headers.values(), _bot_id_header(config)) if header.lower() not in lookup]
     if missing:
         errors.append("Missing required column(s): " + ", ".join(missing))
+
+    bot_col = lookup.get(_bot_id_header(config).lower())
+    if bot_col is not None and int((df[bot_col].astype(str).str.strip() != "").sum()) == 0:
+        errors.append("bot_id is blank in every row; every session needs the bot id that asked its questions")
 
     type_col = lookup.get(headers["session_type"].lower())
     if type_col is None:
@@ -285,7 +300,9 @@ def build_feedback_events(
       CSV starts at sequence 1 (tail-only sessions are skipped);
     - submissionDate = the first real message (not the opening row); questionnaireVersion = the version
       of config["questionnaire_versions"] in force at that instant; sessionType must equal
-      config["session_type"]; botId / botName are recorded, never matched;
+      config["session_type"]; botId is required (one per session, a positive integer in digits) and decides the
+      STORED questionnaire version through its rank in the persona (the version stamped here from the windows stays
+      in the event as input and is not what is stored for these sessions); botName is only recorded;
     - a sender_id outside config["bot_sender_ids"] is a respondent; parentSequence is null for bot
       rows and, for a respondent row, the stored sequence of the nearest preceding bot row
       (including the synthesised question). Nothing relies on sequence parity;
@@ -295,7 +312,8 @@ def build_feedback_events(
     _check_config(config)
     lookup = _column_lookup(df)
     roles = resolve_column_map(config)
-    missing = [header for header in required_column_headers(config).values() if header.lower() not in lookup]
+    missing = [header for header in (*required_column_headers(config).values(), _bot_id_header(config))
+               if header.lower() not in lookup]
     if missing:
         raise ValueError("Feedback CSV is missing required column(s): " + ", ".join(missing))
 
@@ -470,11 +488,16 @@ def build_feedback_events(
         non_blank_languages = [v for v in language_values if v != ""]
         if len(non_blank_languages) > 1:
             problems.append(f"language differs within the session ({len(non_blank_languages)} distinct values)")
-        # The bot is informational: blank cells (a row without a bot id) are ignored, only two different
-        # non-blank bot ids inside one session are a problem.
+        # The questionnaire version of a session is the rank of its bot id inside the persona, so a session needs
+        # exactly ONE bot id, written as a positive integer in digits. A blank cell on some row is tolerated (an
+        # opening row may carry none) as long as the other rows agree; the values are never echoed.
         bot_values = _distinct([bot_ids[i] for i in idx if bot_ids[i] != ""])
-        if len(bot_values) > 1:
+        if len(bot_values) == 0:
+            problems.append("bot_id is blank in every row (a Mitra session needs its bot id)")
+        elif len(bot_values) > 1:
             problems.append(f"bot_id differs within the session ({len(bot_values)} distinct values)")
+        elif not is_valid_bot_id(bot_values[0]):
+            problems.append(f"bot_id must be {BOT_ID_RULE}")
         type_values = _distinct([session_types[i] for i in idx])
         if "" in type_values:
             problems.append(f"session_type is blank in {sum(1 for i in idx if session_types[i] == '')} row(s)")
@@ -634,7 +657,7 @@ def build_feedback_events(
                 "adapter": ADAPTER_CONVERSATION_ROWS,
                 "sessionType": expected_session_type,
                 "questionnaireVersion": stamp_version(versions, session_start),
-                "botId": bot_values[0] if bot_values else None,
+                "botId": bot_values[0],
                 "botName": next((bot_names[i] for i in idx if bot_names[i] != ""), None),
                 "language": language,
                 "completionStatus": completion_status,

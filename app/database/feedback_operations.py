@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from app.config import settings
 from app.database.db import db
+from app.database.feedback_bot_versions import BOT_SESSION_SQL, apply_bot_version_ranks, lock_personas
 from app.database.operations import update_submission_status
 from app.services.feedback_adapter_config import (
     CONFIG_KEY_COLUMN_MAP,
@@ -536,7 +537,8 @@ async def _restamp_sessions(conn, cfg: Mapping[str, Any], versions) -> Dict[str,
     """
     Relabel the stored sessions of ONE config (`cfg`: a row of _find_upload_configs) from the given version windows
     (the list parsed by parse_versions) using each session's start (submissions.submission_date, its first real
-    message). Only the sessions the config governs (see _sessions_of_config_sql) are read or written: those of
+    message). A Mitra bot session (one with a bot id) is NEVER relabelled from a date: its label is the rank of its bot
+    id (_restamp_bot_sessions). Only the sessions the config governs (see _sessions_of_config_sql) are read or written: those of
     exactly the config's (tenant, program, session_type, source); a config without a program (the tenant's default)
     also governs the sessions of the programs that have no config of their own for that (session_type, source), and
     never those of a program that has one. Writes through `conn` (the caller owns the transaction). Returns
@@ -551,6 +553,7 @@ async def _restamp_sessions(conn, cfg: Mapping[str, Any], versions) -> Dict[str,
         JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
         WHERE fs.source = $1 AND fs.session_type = $2 AND fs.tenant_code = $3
           AND {_sessions_of_config_sql("$4::uuid", "$5")} AND s.submission_date IS NOT NULL
+          AND NOT {BOT_SESSION_SQL}
         """,
         cfg["config_source"], cfg["session_type"], cfg["tenant_code"], cfg["program_id"], CONFIG_TYPE_FEEDBACK_UPLOAD,
     )
@@ -577,6 +580,71 @@ async def _restamp_sessions(conn, cfg: Mapping[str, Any], versions) -> Dict[str,
     return {"sessions": len(rows), "changed": len(changed_ids), "versions": counts}
 
 
+async def _governed_bot_rows(conn, cfg: Mapping[str, Any]):
+    """program_id, bot_id, questionnaire_version and the session count of the bot sessions ONE config governs."""
+    return await conn.fetch(
+        f"""
+        SELECT s.program_id::text AS program_id, fs.meta_data ->> 'bot_id' AS bot_id, fs.questionnaire_version,
+               count(*) AS n
+        FROM feedback_submissions fs
+        JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
+        WHERE fs.source = $1 AND fs.session_type = $2 AND fs.tenant_code = $3
+          AND {_sessions_of_config_sql("$4::uuid", "$5")} AND {BOT_SESSION_SQL}
+        GROUP BY 1, 2, 3
+        ORDER BY 1 NULLS FIRST, 2, 3
+        """,
+        cfg["config_source"], cfg["session_type"], cfg["tenant_code"], cfg["program_id"], CONFIG_TYPE_FEEDBACK_UPLOAD,
+    )
+
+
+async def _bot_rank_overview(conn, cfg: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Read-only. For each program among the bot sessions ONE config governs (a persona = tenant, program, session_type,
+    source): the bot-id-based label next to the stamped one:
+    {"program_id", "bots": {bot_id: {"label": rank label, "sessions": n, "stamped": {stored label: n}}},
+     "sessions_to_relabel": n}. Bots are listed in numeric order. [] when the config governs no bot session.
+    """
+    from app.services.feedback_versions import rank_bot_versions
+
+    per_program: Dict[Optional[str], List[Mapping[str, Any]]] = {}
+    for row in await _governed_bot_rows(conn, cfg):
+        per_program.setdefault(row["program_id"], []).append(row)
+    overview: List[Dict[str, Any]] = []
+    for program, rows in per_program.items():
+        ranks = rank_bot_versions(row["bot_id"] for row in rows)
+        bots: Dict[str, Dict[str, Any]] = {}
+        stale = 0
+        for bot_id in sorted(ranks, key=int):
+            mine = [row for row in rows if row["bot_id"] == bot_id]
+            bots[bot_id] = {
+                "label": ranks[bot_id],
+                "sessions": sum(int(row["n"]) for row in mine),
+                "stamped": {row["questionnaire_version"]: int(row["n"]) for row in mine},
+            }
+            stale += sum(int(row["n"]) for row in mine if row["questionnaire_version"] != ranks[bot_id])
+        overview.append({"program_id": program, "bots": bots, "sessions_to_relabel": stale})
+    return overview
+
+
+async def _restamp_bot_sessions(conn, cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Recompute the bot-rank labels of every persona (program) among the bot sessions ONE config governs and relabel
+    what differs, sending each relabelled session back through processing (apply_bot_version_ranks). This is the
+    manual repair of the ingest rule. Writes through `conn` (the caller owns the transaction); the personas are locked
+    first, in one fixed order. Returns {"personas": n, "sessions": n, "changed": n, "reprocess": [submission_id]}.
+    """
+    programs = sorted({row["program_id"] for row in await _governed_bot_rows(conn, cfg)}, key=lambda p: (p is not None, p))
+    personas = [(cfg["tenant_code"], program, cfg["session_type"], cfg["config_source"]) for program in programs]
+    await lock_personas(conn, personas)
+    sessions = 0
+    reprocess: List[str] = []
+    for persona in personas:
+        applied = await apply_bot_version_ranks(conn, *persona)
+        sessions += applied["sessions"]
+        reprocess.extend(applied["restamped"])
+    return {"personas": len(personas), "sessions": sessions, "changed": len(reprocess), "reprocess": reprocess}
+
+
 async def restamp_questionnaire_versions(
     session_type: Optional[str] = None,
     dry_run: bool = False,
@@ -589,7 +657,7 @@ async def restamp_questionnaire_versions(
     """
     Relabel the questionnaire_version of the stored sessions from the ACTIVE upload config of their persona
     (config.questionnaire_versions), for every source whose config has questionnaire versions (a config without
-    them is not touched). Needed after anything that changes the windows outside set_questionnaire_version (that one
+    them is not touched; window labels only for sessions WITHOUT a bot id). Needed after anything that changes the windows outside set_questionnaire_version (that one
     relabels by itself), because re-uploading an unchanged session is a no-op and never refreshes the label. Each
     config relabels only the sessions it governs: those of exactly its (tenant, program, session_type, source); a
     program-less default config also those of the programs that have no config of their own for that (session_type,
@@ -599,8 +667,14 @@ async def restamp_questionnaire_versions(
     is the explicit sweep over every matching config; WITH a session_type it must identify exactly one config
     (AmbiguousFeedbackConfigError, listing the candidates, when several programs / tenants / sources share it).
 
-    Returns {"session_types": {key: {"sessions", "changed", "versions": {label: n}, tenant_code, program_id,
-    program_name, session_type, source}}, "changed": total, "dry_run": bool}; `key` is the session_type, or
+    Mitra bot sessions (a bot id stored) are NOT relabelled from the windows: their label is the rank of their bot id
+    inside the persona (lowest bot id = V1, see app/database/feedback_bot_versions.py). This function recomputes those
+    labels too (it is the manual repair of the ingest rule): a session whose label changes is sent back through
+    processing (extraction deleted, PII flag reset, status 'pending').
+
+    Returns {"session_types": {key: {"sessions", "changed", "versions": {label: n}, "bot_sessions": {"personas",
+    "sessions", "changed", "reprocess": [submission_id]}, tenant_code, program_id, program_name, session_type,
+    source}}, "changed": total (window and bot relabels), "dry_run": bool}; `key` is the session_type, or
     tenant/program/session_type/source when the session_type alone would collide. With dry_run nothing is written.
     One transaction. Raises ValueError when an active config has an invalid questionnaire_versions list.
     """
@@ -629,8 +703,11 @@ async def restamp_questionnaire_versions(
                         continue  # its active version went away since the listing: nothing to restamp from
                     versions = parse_versions(active["config"])
                     summary = await _restamp_sessions(conn, cfg, versions)
-                    result["session_types"][keys[cfg["config_id"]]] = {**summary, **_identity(cfg)}
-                    result["changed"] += summary["changed"]
+                    # bot sessions follow their bot ids, not the windows: recompute those labels too (the repair)
+                    bot_summary = await _restamp_bot_sessions(conn, cfg)
+                    result["session_types"][keys[cfg["config_id"]]] = {
+                        **summary, "bot_sessions": bot_summary, **_identity(cfg)}
+                    result["changed"] += summary["changed"] + bot_summary["changed"]
                 if dry_run:
                     raise _DryRunRollback()
     except _DryRunRollback:
@@ -651,7 +728,9 @@ async def list_questionnaire_versions(
     has questionnaire versions), with the number of stored sessions per label, counted over the sessions the config
     governs (its tenant, program, session_type, source; for a program-less default also the sessions of the programs
     that have no config of their own for it): {key: {"config_version": n, "versions": [{"key", "effective_from"}],
-    "sessions": {label: n}, tenant_code, program_id, program_name, session_type, source}}. `key` is the session_type,
+    "sessions": {label: n}, "bot_versions": [...], tenant_code, program_id, program_name, session_type, source}}.
+    `bot_versions` is the bot-id-based label of each bot per program next to the stamped labels (the version of a
+    bot session follows the order of the bot ids, not the windows). `key` is the session_type,
     or tenant/program/session_type/source when the session_type alone would collide.
     """
     if not db.pool:
@@ -680,6 +759,8 @@ async def list_questionnaire_versions(
                 "config_version": cfg["version"],
                 "versions": _as_dict(cfg["config"]).get(_VERSIONS_KEY),
                 "sessions": {row["questionnaire_version"]: int(row["n"]) for row in counts},
+                # the bot-id-based label of each bot next to what is stamped (see _bot_rank_overview)
+                "bot_versions": await _bot_rank_overview(conn, cfg),
                 **_identity(cfg),
             }
     return result
@@ -770,6 +851,8 @@ async def detect_questionnaire_versions(
             found["next_step"] = None if proposal is None else (
                 f"python tools/questionnaire_versions.py set {_selector_flags(cfg)} "
                 f"--key {shlex.quote(proposal['key'])} --effective-from {proposal['effective_from']} --dry-run")
+            # Read-only cross-check: the bot-id-based label of each bot next to the stamped one above
+            found["bot_versions"] = await _bot_rank_overview(conn, cfg)
             found.update(_identity(cfg))
             result[keys[cfg["config_id"]]] = found
     return result
@@ -806,7 +889,8 @@ async def set_questionnaire_version(
     Returns {"session_type", "tenant_code", "program_id", "program_name", "source", "changed", "config_version",
     "versions", "restamp", "dry_run"}; changed is False (and nothing is written) when the list would not change.
     Raises ValueError for an unknown persona, a missing UTC offset, a date that is not after the previous version /
-    before the next one, or the first version.
+    before the next one, the first version, or a persona whose stored sessions carry bot ids (the version of a bot
+    session follows the order of the bot ids, so a window would change nothing for it).
     """
     from app.services.feedback_versions import parse_versions
 
@@ -845,6 +929,15 @@ async def set_questionnaire_version(
                     f"no active upload config with questionnaire versions for session_type {session_type!r}",
                     "upload configs with questionnaire versions", _PICK_HINT)
                 result.update({k: v for k, v in _identity(target).items() if k != "session_type"})
+                bot_sessions = sum(int(row["n"]) for row in await _governed_bot_rows(conn, target))
+                if bot_sessions > 0:
+                    raise ValueError(
+                        f"the {bot_sessions} stored session(s) of this persona carry a bot id: the questionnaire "
+                        f"version of a Mitra bot session follows the ORDER OF THE BOT IDS of its persona (lowest bot "
+                        f"id = V1, next = V2 ...), not a date window, so recording a window here would change "
+                        f"nothing for them. A new questionnaire is a new bot id: upload its sessions. To recompute "
+                        f"the labels run: python tools/questionnaire_versions.py restamp {_selector_flags(target)}"
+                    )
                 # Lock the config row FIRST and read its active version afterwards in a separate statement: a
                 # statement that waits for the lock keeps its snapshot for the join, so a single locking SELECT
                 # over config + config_version could hand back a version a concurrent writer just deactivated.

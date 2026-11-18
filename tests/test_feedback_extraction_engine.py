@@ -94,8 +94,8 @@ def test_integer_field_is_parsed_with_its_bounds_and_flags():
     ({"max": False}, "integer min and max"),
     ({"min": 101}, "min must not be greater than max"),
     ({"max": 10 ** 16}, "within"),
-    ({"categories": ["a"]}, "no categories or guidance"),
-    ({"guidance": {"a": "b"}}, "no categories or guidance"),
+    ({"categories": ["a"]}, "categories only together with bands"),
+    ({"guidance": {"a": "b"}}, "has no guidance"),
     ({"sensitive": "yes"}, "sensitive must be a boolean"),
     ({"sensitive": 1}, "sensitive must be a boolean"),
     ({"provisional": "yes"}, "provisional must be a boolean"),
@@ -185,7 +185,7 @@ def test_integer_inside_the_bounds_is_extracted_as_the_canonical_decimal_string(
 @pytest.mark.parametrize("value", [4, 101, "4", "101", -1, "-1", 0, 10 ** 30, "9" * 30, 1e30])
 def test_integer_outside_the_bounds_is_unmapped_with_the_raw_kept(value):
     field = _field(fx.parse_model_response(_answer(age=value), _config()), "age")
-    assert field.value is None and field.status == "unmapped" and field.raw_value is not None and field.raw_value != ""
+    assert field.value == "Invalid response" and field.status == "unmapped" and field.raw_value is not None and field.raw_value != ""
 
 
 @pytest.mark.parametrize("value", [17.5, "17.5", "17.0", "1e1", "seventeen", "17 years", "0x11", "१७", "+17", "--17", "1,7",
@@ -193,14 +193,14 @@ def test_integer_outside_the_bounds_is_unmapped_with_the_raw_kept(value):
 def test_a_non_integer_is_unmapped_never_coerced(value):
     raw_json = _answer(age=0).replace('"value": 0', f'"value": {json.dumps(value) if value != float("1e400") else "1e400"}', 1)
     field = _field(fx.parse_model_response(raw_json, _config()), "age")
-    assert field.value is None and field.status == "unmapped"
+    assert field.value == "Invalid response" and field.status == "unmapped"
     assert field.raw_value is not None
 
 
 def test_integer_null_blank_and_placeholders_are_not_provided():
     for value in (None, "", "   ", "N/A", "null", "not provided", "-"):
         field = _field(fx.parse_model_response(_answer(age=value), _config()), "age")
-        assert (field.value, field.raw_value, field.status) == (None, None, "not_provided"), value
+        assert (field.value, field.raw_value, field.status) == ("Not answered", None, "not_provided"), value
 
 
 def test_integer_null_with_the_respondents_words_in_raw_is_unmapped_and_keeps_them():
@@ -208,7 +208,7 @@ def test_integer_null_with_the_respondents_words_in_raw_is_unmapped_and_keeps_th
                                     "district": {"value": None, "raw": None}, "disability": {"value": None, "raw": None}},
                          "pii": {"detected": False, "types": []}})
     field = _field(fx.parse_model_response(answer, _config()), "age")
-    assert (field.value, field.raw_value, field.status) == (None, "about sixteen or so", "unmapped")
+    assert (field.value, field.raw_value, field.status) == ("Invalid response", "about sixteen or so", "unmapped")
 
 
 def test_integer_raw_is_the_models_own_words_when_given_else_its_rendering():
@@ -461,10 +461,10 @@ def test_summarise_config_lists_prompt_name_and_field_flags_without_bands():
     summary = cli.summarise_config(raw)
     assert summary["prompt_name"] == "Youth Prompt"
     assert summary["fields"] == [
-        {"name": "age", "kind": "integer", "sensitive": False, "provisional": False},
-        {"name": "gender", "kind": "category", "sensitive": False, "provisional": False},
-        {"name": "district", "kind": "free_text", "sensitive": False, "provisional": False},
-        {"name": "disability", "kind": "category", "sensitive": True, "provisional": True},
+        {"name": "age", "kind": "integer", "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None},
+        {"name": "gender", "kind": "category", "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None},
+        {"name": "district", "kind": "free_text", "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None},
+        {"name": "disability", "kind": "category", "sensitive": True, "provisional": True, "multi": False, "versions": None, "applies_when": None},
     ]
     assert "categories" not in json.dumps(summary)
     raw_without = _raw_config()
@@ -472,7 +472,7 @@ def test_summarise_config_lists_prompt_name_and_field_flags_without_bands():
     assert cli.summarise_config(raw_without)["prompt_name"] == "(none)"
     assert cli.summarise_config("not a dict") == {"prompt_name": "(none)", "fields": []}
     assert cli.summarise_config({"fields": [1, {"name": "x"}]})["fields"] == [
-        {"name": "x", "kind": None, "sensitive": False, "provisional": False}]
+        {"name": "x", "kind": None, "sensitive": False, "provisional": False, "multi": False, "versions": None, "applies_when": None}]
 
 
 def _outcome(config, answer):

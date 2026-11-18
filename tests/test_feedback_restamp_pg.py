@@ -107,6 +107,9 @@ async def _add(conn, persona, session_type, stored_version, started_at, source="
     else:
         event["data"]["botId"] = PERSONAS[persona]["bot_id"]
     await insert_or_update_submission(conn, event)
+    if source != "google_forms":
+        # these tests are about the date-window labels, which only apply to sessions without a bot id
+        await factories.as_window_stamped_session(conn, sid, stored_version)
     return event["submissionId"]
 
 

@@ -3,6 +3,7 @@ from typing import Optional
 
 from app.config import settings
 from app.services.feedback_adapter_config import is_safe_code, is_safe_id, shown, source_label_problem
+from app.services.feedback_versions import BOT_ID_RULE, is_valid_bot_id
 from app.services.feedback_constants import (
     ADAPTERS,
     COMPLETION_COMPLETED,
@@ -211,6 +212,16 @@ def _validate_feedback_adapter_rules(event: dict, adapter: str, completion) -> l
     else:
         if ref_found and source_ref is not None:
             problems.append(f"'data.sourceRef' must be absent or null for adapter {adapter}")
+        # A Mitra bot session gets its questionnaire version from the rank of its bot id inside the persona (see
+        # app/services/feedback_versions.py), so the bot id is required here whatever the persona's configured
+        # schema lists, and it must be a positive integer written in digits (the value is never echoed).
+        bot_id, bot_found = _get_nested(event, "data.botId")
+        if not bot_found:
+            problems.append(f"'data.botId' is missing (required for adapter {adapter})")
+        elif _is_empty(bot_id):
+            problems.append(f"'data.botId' is {_emptiness_label(bot_id)} (required for adapter {adapter})")
+        elif isinstance(bot_id, str) and not is_valid_bot_id(bot_id):
+            problems.append(f"'data.botId' must be {BOT_ID_RULE}")
 
     return problems
 
@@ -248,11 +259,14 @@ def _validate_feedback_create(event: dict) -> list:
         value, found = _get_nested(event, path)
         if found and not _is_empty(value) and not isinstance(value, str):
             problems.append(f"'{path}' must be a string, got {type(value).__name__}")
-    # the bot is informational (Mitra only): a string or null
-    for path in ("data.botId", "data.botName"):
-        value, found = _get_nested(event, path)
-        if found and value is not None and not isinstance(value, str):
-            problems.append(f"'{path}' must be a string or null, got {type(value).__name__}")
+    # botName is informational (a string or null). botId is a string; for adapter conversation_rows it is also
+    # required and a positive integer in digits (_validate_feedback_adapter_rules); wide_form carries none.
+    value, found = _get_nested(event, "data.botName")
+    if found and value is not None and not isinstance(value, str):
+        problems.append(f"'data.botName' must be a string or null, got {type(value).__name__}")
+    value, found = _get_nested(event, "data.botId")
+    if found and value is not None and not isinstance(value, str):
+        problems.append(f"'data.botId' must be a string, got {type(value).__name__}")
 
     messages, found = _get_nested(event, "data.messages")
     if found:

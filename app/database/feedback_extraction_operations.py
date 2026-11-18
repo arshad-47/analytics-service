@@ -8,7 +8,7 @@ writes the field rows, the PII flag and the llm log in ONE transaction. Re-runni
 Nothing in here logs conversation text; error messages carry no respondent text and no provider text. The text stored
 besides the extracted values: the MASKED question and answer JSON of the optional masking call and the model's
 justifications (meta_data.extraction.masking, feedback_extracted_data.justification); the complete answers of the two
-calls of a session that is NOT flagged (meta_data.extraction.responses, replaced by every re-run); and a truncated copy
+calls of a session (meta_data.extraction.responses, replaced by every re-run); and a truncated copy
 of the answer of a call that failed to give a usable one (llm_logs.meta_data.response).
 
 A session can grow (a delta event) while the LLM call is running. The write transaction therefore locks the
@@ -45,6 +45,7 @@ from app.services.feedback_extraction_constants import (
     ANALYSIS_TYPE,
     CONFIG_TYPE_FEEDBACK_EXTRACTION,
     FAILED_RESPONSE_MAX_CHARS,
+    KIND_CATEGORY,
     MIN_LLM_CALL_SECONDS,
     PII_MASKING_ANALYSIS_TYPE,
     STAGE_METADATA_EXTRACTION,
@@ -247,13 +248,15 @@ async def load_closing_keys(conn, tenant_code: str, session_type: str, program_i
     return keys
 
 
-def persona_identity(session_type: Any, source: Any, program_id: Any) -> Tuple[Any, Any, Optional[str]]:
+def persona_identity(session_type: Any, source: Any, program_id: Any,
+                     questionnaire_version: Any = None) -> Tuple[Any, Any, Optional[str], Any]:
     """
-    What selects the extraction config, the prompt and the closing keys of a session: session_type, source and
-    program. Compared (with the message fingerprint) under the write locks: a redelivery that moves a session to
-    another persona without touching its messages must not let the old persona's fields overwrite it.
+    What selects the extraction config, the prompt, the closing keys and the questions asked of a session: session_type,
+    source, program and questionnaire version (the version decides which fields are N/A). Compared (with the message
+    fingerprint) under the write locks: a redelivery that moves a session to another persona, or a relabel of its
+    questionnaire version, without touching its messages must not let the old values overwrite it.
     """
-    return (session_type, source, None if program_id is None else str(program_id))
+    return (session_type, source, None if program_id is None else str(program_id), questionnaire_version)
 
 
 async def load_submission_inputs(conn, submission_id: str, tenant_code: str) -> Dict[str, Any]:
@@ -280,7 +283,8 @@ async def load_submission_inputs(conn, submission_id: str, tenant_code: str) -> 
     return {
         "session_type": head["session_type"],
         "questionnaire_version": head["questionnaire_version"],
-        "identity": persona_identity(head["session_type"], head["source"], head["program_id"]),
+        "identity": persona_identity(head["session_type"], head["source"], head["program_id"],
+                                     head["questionnaire_version"]),
         "rows": [dict(r) for r in rows],
         "fingerprint": rows_fingerprint(rows),
         "loaded_at": loaded_at,
@@ -317,13 +321,14 @@ async def save_extraction(
     write the llm log (when the LLM was called). `run_at` is the time the input was loaded. The meta_data object
     holds ids, PII types and the time; when the masking call ran (`masking`) it also holds that call's MASKED answers and
     findings (never the original text). `responses` ({'masking': text, 'extraction': text}, the complete answers of the
-    calls) is stored under `extraction.responses` ONLY when the session is not flagged pii_detected: the extraction
-    answer repeats what the respondent said, and a flagged session keeps no respondent words. The whole `extraction`
+    calls) is stored under `extraction.responses` for every session, flagged ones included (the data stays in our
+    system; what an export may contain is decided by its query). The whole `extraction`
     object is replaced by a re-run, so older responses never linger. session_type / questionnaire_version are not copied
     into the rows.
     """
     names = [f.field_name for f in result.fields]
     justifications = [f.justification for f in result.fields]
+    value_lists = [json.dumps(list(f.value_list)) for f in result.fields]
     confidences = [None if f.confidence is None else Decimal(str(f.confidence)) for f in result.fields]
     extraction_meta = {
         "config_version_id": str(config_version_id),
@@ -334,7 +339,7 @@ async def save_extraction(
     if masking is not None:
         extraction_meta["masking"] = dict(masking)   # the MASKED answers, pii types and abuse flag of the masking call
     kept_responses = {k: v for k, v in (responses or {}).items() if isinstance(v, str)}
-    if len(kept_responses) > 0 and not result.pii_detected:
+    if len(kept_responses) > 0:
         extraction_meta["responses"] = kept_responses
     async with conn.transaction():
         # The ingest path takes these same row locks, in this same order (submissions, then feedback_submissions),
@@ -345,7 +350,8 @@ async def save_extraction(
             submission_id, tenant_code,
         )
         feedback = None if master is None else await conn.fetchrow(
-            "SELECT session_type, source FROM feedback_submissions WHERE submission_id = $1 AND tenant_code = $2 "
+            "SELECT session_type, source, questionnaire_version FROM feedback_submissions "
+            "WHERE submission_id = $1 AND tenant_code = $2 "
             "FOR UPDATE",
             submission_id, tenant_code,
         )
@@ -357,22 +363,26 @@ async def save_extraction(
                 f"feedback session {submission_id} changed while its extraction was running; nothing was written, "
                 f"it must run again on the new content")
         if input_identity is not None and persona_identity(
-                feedback["session_type"], feedback["source"], master["program_id"]) != input_identity:
+                feedback["session_type"], feedback["source"], master["program_id"],
+                feedback["questionnaire_version"]) != input_identity:
             raise StaleExtractionError(
-                f"feedback session {submission_id} was moved to another persona (session_type, source or program) "
+                f"feedback session {submission_id} was moved to another persona (session_type, source, program or "
+                f"questionnaire version) "
                 f"while its extraction was running; nothing was written, it must run again for the new persona")
         await conn.execute(
             """
             INSERT INTO feedback_extracted_data (
                 submission_id, tenant_code, field_name,
-                value, raw_value, status, confidence, justification, config_version_id, prompt_version_id, extracted_at
+                value, value_list, raw_value, status, confidence, justification, config_version_id, prompt_version_id,
+                extracted_at
             )
-            SELECT $1, $2, t.field_name, t.value, t.raw_value, t.status, t.confidence, t.justification,
-                   $3::uuid, $4::uuid, $5::timestamptz
-            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::numeric[], $11::text[])
-                 AS t(field_name, value, raw_value, status, confidence, justification)
+            SELECT $1, $2, t.field_name, t.value, ARRAY(SELECT jsonb_array_elements_text(t.value_list::jsonb)),
+                   t.raw_value, t.status, t.confidence, t.justification, $3::uuid, $4::uuid, $5::timestamptz
+            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::numeric[], $11::text[], $12::text[])
+                 AS t(field_name, value, raw_value, status, confidence, justification, value_list)
             ON CONFLICT (submission_id, tenant_code, field_name) DO UPDATE SET
                 value = EXCLUDED.value,
+                value_list = EXCLUDED.value_list,
                 raw_value = EXCLUDED.raw_value,
                 status = EXCLUDED.status,
                 confidence = EXCLUDED.confidence,
@@ -385,7 +395,7 @@ async def save_extraction(
             submission_id, tenant_code,
             str(config_version_id), str(prompt_version_id), run_at,
             names, [f.value for f in result.fields], [f.raw_value for f in result.fields],
-            [f.status for f in result.fields], confidences, justifications,
+            [f.status for f in result.fields], confidences, justifications, value_lists,
         )
         await conn.execute(
             """
@@ -712,7 +722,7 @@ async def extract_submission(
     try:
         run = await asyncio.to_thread(
             extract, inputs["rows"], config, prompt["system_prompt"], prompt["user_prompt"], make_call("extraction"),
-            inputs["closing_keys"], masking_step, tracker.update,
+            inputs["closing_keys"], masking_step, tracker.update, inputs["questionnaire_version"],
         )
     except Exception as exc:
         exc.stages = tracker.stages
@@ -777,6 +787,6 @@ async def extract_submission(
             raise stale
     return SubmissionOutcome(
         submission_id, tenant_code, inputs["session_type"], inputs["questionnaire_version"], run, llm["model"],
-        config_version_id, prompt_version_id, write, {f.name: f.kind for f in config.fields}, prompt["name"],
+        config_version_id, prompt_version_id, write, {f.name: (KIND_CATEGORY if len(f.bands) > 0 else f.kind) for f in config.fields}, prompt["name"],
         tracker.stages,
     )

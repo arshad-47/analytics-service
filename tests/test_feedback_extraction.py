@@ -25,7 +25,9 @@ def _seeded_bands(field_name, persona="Youth"):
     return tuple(field["categories"])
 
 
-INDIAN_STATES_AND_UTS = _seeded_bands("state")
+STATE_BAND = _seeded_bands("state")
+INDIAN_STATES_AND_UTS = STATE_BAND[:36]                  # the 28 states and 8 union territories; the rest are special answers
+STATE_SPECIAL_ANSWERS = STATE_BAND[36:]
 GENDER_CATEGORIES = _seeded_bands("gender")
 
 
@@ -92,8 +94,10 @@ def _fake_llm(answer, calls=None):
 def test_seeded_state_band_is_28_states_and_8_union_territories_without_duplicates():
     assert len(INDIAN_STATES_AND_UTS) == 36
     assert len(set(INDIAN_STATES_AND_UTS)) == 36
-    for name in ("Dadra and Nagar Haveli and Daman and Diu", "Jammu and Kashmir", "Ladakh", "Delhi (NCT)", "Telangana"):
+    for name in ("Dadra and Nagar Haveli and Daman and Diu", "Jammu and Kashmir", "Ladakh", "Delhi", "Telangana"):
         assert name in INDIAN_STATES_AND_UTS
+    assert "Delhi (NCT)" not in INDIAN_STATES_AND_UTS
+    assert STATE_SPECIAL_ANSWERS == ("Prefer not to say", "Unmapped", "Invalid response", "Outside India")
 
 
 @pytest.mark.parametrize("persona", list(PERSONAS))
@@ -102,15 +106,16 @@ def test_seed_config_of_every_persona_parses_and_is_keyed_by_session_type(person
     assert config.session_type == PERSONAS[persona]["session_type"]
     assert config.persona == persona
     by_name = {f.name: f for f in config.fields}
-    assert by_name["state"].categories == INDIAN_STATES_AND_UTS
+    assert by_name["state"].categories == STATE_BAND
     assert by_name["district"].kind == "free_text"
+    assert by_name["district"].categories == STATE_SPECIAL_ANSWERS
 
 
 def test_every_persona_has_its_own_dots_columns_see_the_persona_tests_for_the_exact_lists():
     # the exact field lists, bands and flags are asserted in tests/test_feedback_extraction_personas.py
     names = {p: fx.parse_extraction_config(extraction_config_v1(p)).field_names() for p in PERSONAS}
     assert len({tuple(v) for v in names.values()}) == 4
-    assert names["General Public"] == ("age", "gender", "state", "district", "occupation")
+    assert names["General Public"] == ("gender", "age", "state", "district", "occupation")
 
 
 def test_extraction_config_ids_are_stable_and_distinct_per_session_type():
@@ -143,7 +148,7 @@ def test_seed_prompt_only_uses_variables_the_renderer_knows():
     (lambda c: c["fields"][0].update(categories=["A", "a"]), "duplicate value"),
     (lambda c: c["fields"][0].update(categories=[" A"]), "surrounding spaces"),
     (lambda c: c["fields"][0].update(guidance={"Nowhere": "x"}), "not categories"),
-    (lambda c: c["fields"][1].update(categories=["x"]), "free_text"),
+    (lambda c: c["fields"][1].update(min=1), "free_text field has no min or max"),
     (lambda c: c["fields"][0].update(provisional="yes"), "provisional"),
     (lambda c: c["fields"][0].update(extra=1), "unknown key"),
     (lambda c: c.update(pii={"types": ["name"]}), "include 'other'"),
@@ -284,8 +289,8 @@ def test_prompt_contains_every_field_band_guidance_pii_type_and_the_conversation
     for gender in GENDER_CATEGORIES:
         assert gender in prompt
     assert "Government-aided" in prompt                      # Youth school type
-    assert "Delhi (NCT) = also Delhi, New Delhi" in prompt   # guidance rendered
-    assert "district (free text)" in prompt
+    assert "Delhi = Delhi, New Delhi, NCT of Delhi" in prompt   # guidance rendered
+    assert "district (free text" in prompt
     for pii_type in PII_TYPES:
         assert f"- {pii_type}:" in prompt
     assert "Youth" in prompt and "state, district, gender, school_type" in prompt
@@ -309,7 +314,7 @@ def test_unknown_template_variable_is_rejected():
 def test_parent_prompt_shows_its_own_bands_without_government_aided():
     config = fx.parse_extraction_config(_four_field_raw("Parent"))
     prompt = fx.render_prompt(SYSTEM, USER, config, fx.build_conversation(_conversation_rows()))
-    assert "Allowed values: Government; Private; Others; Invalid" in prompt
+    assert "Allowed values: Government; Private; Others; Not sure; Prefer not to say; Invalid response" in prompt
     assert "Government-aided" not in prompt
     assert "CHILD" in prompt
 
@@ -342,8 +347,8 @@ def test_null_value_and_null_raw_is_not_provided_and_confidence_is_kept_only_whe
         "pii": {"detected": False},
     })
     fields = _by_name(_parse(answer))
-    assert fields["state"].status == "not_provided" and fields["state"].value is None and fields["state"].raw_value is None
-    assert fields["district"].status == "not_provided"
+    assert fields["state"].status == "not_provided" and fields["state"].value == "Not answered" and fields["state"].raw_value is None
+    assert fields["district"].status == "not_provided" and fields["district"].value == "Not answered"
     assert fields["school_type"].status == "not_provided"   # a blank string is not an answer
     assert fields["gender"].confidence == 0.75 and fields["state"].confidence is None
 
@@ -352,8 +357,10 @@ def test_value_outside_the_bands_is_unmapped_with_the_raw_value_never_coerced():
     result = _parse(_answer(state=("Karnataka State", "KA"), gender=("Non-binary person", "nb"),
                             school_type=("Madrasa", None)))
     fields = _by_name(result)
-    assert fields["state"].status == "unmapped" and fields["state"].value is None and fields["state"].raw_value == "KA"
-    assert fields["gender"].status == "unmapped" and fields["gender"].value is None
+    # a value outside the list is never taken as given: the field's fallback label stands in, the words stay in raw
+    assert fields["state"].status == "unmapped" and fields["state"].value == "Unmapped" and fields["state"].raw_value == "KA"
+    assert fields["gender"].status == "unmapped" and fields["gender"].value == "Others"
+    assert fields["school_type"].value == "Others"
     # no raw given: what the model returned is kept, so the rejected value is not lost
     assert fields["school_type"].status == "unmapped" and fields["school_type"].raw_value == "Madrasa"
 
@@ -367,15 +374,16 @@ def test_band_match_ignores_case_and_spacing_only_and_returns_the_canonical_spel
     fields = _by_name(_parse(_answer(state=("  tamil   NADU ", "TN"), gender=("female", "f"))))
     assert fields["state"].value == "Tamil Nadu" and fields["state"].status == "extracted"
     assert fields["gender"].value == "Female"
-    # a different spelling is NOT repaired
-    assert _by_name(_parse(_answer(state=("Tamilnadu", "tn"))))["state"].status == "unmapped"
+    # a spelling that is neither the band nor one of its configured aliases is NOT repaired
+    assert _by_name(_parse(_answer(state=("Tamilnaadu", "tn"))))["state"].status == "unmapped"
+    assert _by_name(_parse(_answer(state=("Tamilnadu", "tn"))))["state"].value == "Tamil Nadu"       # an alias of the config
 
 
 def test_free_text_value_is_taken_as_given_but_an_overlong_one_is_unmapped():
     assert _by_name(_parse(_answer(district=("  Bengaluru   Urban ", "bangalore"))))["district"].value == "Bengaluru Urban"
     long_value = "x" * 200
     fields = _by_name(_parse(_answer(district=(long_value, None))))
-    assert fields["district"].status == "unmapped" and fields["district"].value is None
+    assert fields["district"].status == "unmapped" and fields["district"].value == "Unmapped"
 
 
 @pytest.mark.parametrize("text", [
@@ -459,7 +467,7 @@ def test_free_text_placeholders_are_not_provided_never_extracted(placeholder):
     for district in ((placeholder, None), (placeholder, placeholder), (None, placeholder)):
         fields = _by_name(_parse(_answer(district=district)))
         assert fields["district"].status == "not_provided", (district,)
-        assert fields["district"].value is None and fields["district"].raw_value is None
+        assert fields["district"].value == "Not answered" and fields["district"].raw_value is None
 
 
 def test_a_placeholder_value_with_real_words_in_raw_is_unmapped_and_real_districts_stay_extracted():
@@ -467,8 +475,9 @@ def test_a_placeholder_value_with_real_words_in_raw_is_unmapped_and_real_distric
     assert fields["district"].status == "unmapped" and fields["district"].raw_value == "somewhere near the river"
     for real in ("Nalgonda", "Nagpur", "Bengaluru Urban", "None Pura"):          # contains a placeholder word only
         assert _by_name(_parse(_answer(district=(real, real))))["district"].status == "extracted"
-    # category fields are unchanged: a placeholder is not an allowed band
-    assert _by_name(_parse(_answer(state=("N/A", None))))["state"].status == "unmapped"
+    # a category field: "N/A" / "Not answered" from the model means no answer; any other word that is not a band is unmapped
+    assert _by_name(_parse(_answer(state=("N/A", None))))["state"].status == "not_provided"
+    assert _by_name(_parse(_answer(state=("Narnia", None))))["state"].status == "unmapped"
 
 
 def test_duplicate_keys_in_the_answer_are_rejected():
@@ -650,7 +659,8 @@ def test_seed_descriptions_read_correctly_and_never_tell_the_model_to_infer_a_st
         config = fx.parse_extraction_config(extraction_config_v1(persona))
         fields = {f.name: f for f in config.fields}
         assert "districts-as-states" not in fields["state"].description
-        assert "never infer a state from a district" in fields["state"].description
+        assert "derived from the district" in fields["state"].description
+        assert "never infer a state from a district" not in fields["state"].description
         assert re.search(r"The district the respondent[^.]* (lives|teaches|attends school) in", fields["district"].description)
         assert "lives in lives in" not in fields["district"].description
         assert "teaches in lives in" not in fields["district"].description

@@ -185,11 +185,28 @@ def test_check_session_type_column_name_is_case_insensitive(config):
     assert "1 row(s) carry a session_type other than Parent_Voice" in error
 
 
-def test_check_does_not_look_at_the_bot_id(config):
-    # one persona runs several bots over time: any bot id, blank ones and a missing column are all fine
+def test_check_wants_the_bot_id_column_but_not_its_values(config):
+    # CHANGED (the questionnaire version of a session is the rank of its bot id): the bot_id column is now required.
+    # One persona still runs several bots over time, so any bot ids and blank cells on some rows are fine here (each
+    # session is checked by build_feedback_events); a missing column, or a column blank in every row, is not.
     df = make_df([{"bot_id": "88"}, {"bot_id": "999", "sequence": "2"}, {"bot_id": "", "sequence": "3"}])
     assert check_feedback_file(df, config, PARENT_TYPE) == []
-    assert check_feedback_file(df.drop(columns=["bot_id", "bot_name"]), config, PARENT_TYPE) == []
+    assert check_feedback_file(df.drop(columns=["bot_id", "bot_name"]), config, PARENT_TYPE) == [
+        "Missing required column(s): bot_id"]
+    blank = make_df([{"bot_id": ""}, {"bot_id": "  ", "sequence": "2"}])
+    assert check_feedback_file(blank, config, PARENT_TYPE) == [
+        "bot_id is blank in every row; every session needs the bot id that asked its questions"]
+
+
+def test_the_bot_id_header_follows_the_column_map(config):
+    # the Mitra export names the column per config (for example company_bot_id): that header is the one required
+    config["column_map"] = {**config.get("column_map", {}), "bot_id": "company_bot_id"}
+    df = make_df([{}])
+    assert check_feedback_file(df, config, PARENT_TYPE) == ["Missing required column(s): company_bot_id"]
+    renamed = df.rename(columns={"bot_id": "Company_Bot_Id"})
+    assert check_feedback_file(renamed, config, PARENT_TYPE) == []
+    events, skipped = build(renamed, config)
+    assert skipped == [] and events[0]["data"]["botId"] == "88"
 
 
 def test_bot_id_is_an_optional_role_of_the_column_map():
@@ -540,12 +557,29 @@ def test_blank_bot_id_on_some_rows_is_ignored(config):
     assert events[0]["data"]["botId"] == "88"
 
 
-def test_blank_bot_id_on_every_row_gives_no_bot(config):
+def test_blank_bot_id_on_every_row_skips_the_session(config):
+    # CHANGED: a session without any bot id can not be given a questionnaire version, so it is skipped (it used to
+    # produce an event with botId None)
     rows = session_rows([("R", "STATE_IDENTIFICATION", "a", "a"), ("B", "Q2", "q", "q")])
     for row in rows:
         row["bot_id"] = ""
     events, skipped = build(make_df(rows), config)
-    assert skipped == [] and events[0]["data"]["botId"] is None
+    assert events == [] and "bot_id is blank in every row" in skipped[0]["problems"][0]
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-5", "089", "8.5", "1e3", "12345678901234567890", "８９"])
+def test_a_bot_id_that_is_not_a_positive_integer_in_digits_skips_the_session(config, value):
+    rows = session_rows([("R", "STATE_IDENTIFICATION", "a", "a"), ("B", "Q2", "q", "q")])
+    for row in rows:
+        row["bot_id"] = value
+    events, skipped = build(make_df(rows), config)
+    assert events == [] and "positive integer written in digits" in skipped[0]["problems"][0]
+    assert value not in " ".join(skipped[0]["problems"])      # the cell value is never echoed
+
+
+def test_the_bot_id_column_absent_raises(config):
+    with pytest.raises(ValueError, match="missing required column.*bot_id"):
+        build(make_df([{}]).drop(columns=["bot_id"]), config)
 
 
 def test_missing_role_column_raises(config):
@@ -1173,15 +1207,17 @@ def test_event_session_type_is_the_config_value(config):
     assert events[0]["data"]["sessionType"] == "Parent_Voice"
 
 
-# ---------------------------------------------------------------------------------- bot id / bot name are informational
+# ---------------------------------------------------------------------------------- bot id (required) / bot name (informational)
 
-def test_bot_id_column_absent_is_fine_and_gives_none(config):
+def test_bot_name_column_absent_is_fine_and_gives_none(config):
+    # CHANGED: the bot_id column is required now (see test_check_wants_the_bot_id_column_but_not_its_values); only the
+    # bot_name column stays optional
     df = make_df(session_rows([("R", "STATE_IDENTIFICATION", "a", "a"), ("B", "Q2", "q", "q")])).drop(
-        columns=["bot_id", "bot_name"])
+        columns=["bot_name"])
     assert check_feedback_file(df, config, PARENT_TYPE) == []
     events, skipped = build(df, config)
     assert skipped == []
-    assert events[0]["data"]["botId"] is None and events[0]["data"]["botName"] is None
+    assert events[0]["data"]["botId"] == "88" and events[0]["data"]["botName"] is None
 
 
 def test_bot_id_and_name_are_filled_from_the_session(config):

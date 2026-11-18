@@ -69,7 +69,7 @@ PUBLISHED = "2026-10-20T00:00:00.000Z"
 PTM_HEADERS = {
     "session_type": "persona", "session_status": "state", "session": "meeting_session", "submission_id": "meeting_id",
     "language": "lang", "sequence": "turn_no", "message": "utterance", "created_at": "spoken_at", "stage": "topic",
-    "sender_id": "speaker_role",
+    "sender_id": "speaker_role", "bot_id": "bot_no",    # the bot id is required: a session's version is its rank
 }
 PTM_COLUMN_MAP = dict(PTM_HEADERS)
 PTM_COLUMN_MAP["translated_message"] = "utterance_en"
@@ -96,7 +96,7 @@ def ptm_config(**overrides) -> dict:
 
 
 PTM_COLUMNS = ["meeting_id", "meeting_session", "persona", "state", "lang", "turn_no", "utterance", "utterance_en",
-               "spoken_at", "topic", "speaker_role", "venue"]
+               "spoken_at", "topic", "speaker_role", "venue", "bot_no"]
 
 
 def ptm_rows(meeting="m1", session="s1", status="DONE", persona=PTM_TYPE, count=3):
@@ -107,7 +107,7 @@ def ptm_rows(meeting="m1", session="s1", status="DONE", persona=PTM_TYPE, count=
             "meeting_id": meeting, "meeting_session": session, "persona": persona, "state": status, "lang": "en",
             "turn_no": str(n), "utterance": "question text" if bot else "answer text", "utterance_en": "",
             "spoken_at": f"2026-10-15T08:00:{n:02d}+05:30", "topic": "ATTENDEE" if n == 1 else "NEXT_Q",
-            "speaker_role": "assistant" if bot else "teacher", "venue": "hall",
+            "speaker_role": "assistant" if bot else "teacher", "venue": "hall", "bot_no": "7",
         })
     return rows
 
@@ -184,9 +184,12 @@ def test_stage_report_uses_the_mapped_columns():
 
 def test_bot_id_column_can_be_mapped():
     config = ptm_config(column_map={**PTM_COLUMN_MAP, "bot_id": "venue"})
-    events, _ = build(ptm_df(ptm_rows()), config)
-    assert events[0]["data"]["botId"] == "hall"
-    assert uploads_service_module._distinct_bot_ids(ptm_df(ptm_rows()), config) == ["hall"]
+    rows = ptm_rows()
+    for row in rows:
+        row["venue"] = "12"   # a bot id is a positive integer written in digits
+    events, _ = build(ptm_df(rows), config)
+    assert events[0]["data"]["botId"] == "12"
+    assert uploads_service_module._distinct_bot_ids(ptm_df(rows), config) == ["12"]
 
 
 def test_default_column_map_is_the_role_names():

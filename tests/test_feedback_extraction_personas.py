@@ -24,15 +24,15 @@ BANDS_DOC = ROOT / "docs" / "feedback-extraction-bands.md"
 
 # The DOTS export columns (the headers of the user's DOTS samples), in export order.
 DOTS_FIELDS = {
-    "Youth": ["age", "gender", "state", "district", "current_activity_status", "education_level", "course_details",
-              "institution_type", "monthly_household_income", "disability", "disability_type"],
-    "General Public": ["age", "gender", "state", "district", "occupation"],
+    "Youth": ["gender", "age", "state", "district", "current_activity_status", "education_level", "course_details",
+              "institution_type", "monthly_household_income", "annual_household_income", "disability", "disability_type"],
+    "General Public": ["gender", "age", "state", "district", "occupation"],
     "Parent": ["state", "district", "child_gender", "disability", "disability_type", "respondent_relationship",
                "school_type", "child_grade", "parent_education", "parent_education_level"],
     "Educator": ["state", "district", "gender", "institution_type", "teaching_level"],
 }
 SENSITIVE = {
-    "Youth": {"monthly_household_income", "disability", "disability_type"},
+    "Youth": {"monthly_household_income", "annual_household_income", "disability", "disability_type"},
     "General Public": set(),
     "Parent": {"disability", "disability_type"},
     "Educator": set(),
@@ -99,85 +99,152 @@ def test_sensitive_flags_are_set_on_exactly_the_sensitive_fields(persona):
 
 
 @pytest.mark.parametrize("persona", PERSONA_NAMES)
-def test_every_field_is_provisional_except_state_and_district(persona):
-    for f in _config(persona).fields:
-        assert f.provisional is (f.name not in ("state", "district")), f.name
+def test_no_field_is_provisional_because_the_category_lists_are_the_data_teams_finalised_ones(persona):
+    assert not any(f.provisional for f in _config(persona).fields)
 
 
-def test_state_is_the_36_states_and_uts_district_is_free_text_in_every_persona():
-    youth_states = {f.name: f for f in _config("Youth").fields}["state"].categories
-    assert len(youth_states) == 36 and len(set(youth_states)) == 36
-    for name in ("Dadra and Nagar Haveli and Daman and Diu", "Jammu and Kashmir", "Ladakh", "Delhi (NCT)", "Telangana"):
-        assert name in youth_states
+SPECIAL_PLACE_ANSWERS = ("Prefer not to say", "Unmapped", "Invalid response", "Outside India")
+YOUTH_AGE_BANDS = ["< 12", "≥ 12 and < 16", "≥ 16 and < 22", "≥ 22 and < 26", "≥ 26 and < 30", "≥ 30 and < 35",
+                   "≥ 35 and < 40", "≥ 40 and < 45", "≥ 45 and < 50", "≥ 50 and < 55", "≥ 55 and < 60", "≥ 60"]
+GENERAL_PUBLIC_AGE_BANDS = ["< 12", "≥ 12 and < 26", "≥ 26 and < 36", "≥ 36 and < 46", "≥ 46 and < 60", "≥ 60"]
+GENDERS = ("Male", "Female", "Others", "Prefer not to say", "Invalid response", "Unsure / don't know")
+
+
+def test_state_is_the_36_states_and_uts_plus_the_special_answers_and_district_is_free_text_in_every_persona():
+    youth_state = {f.name: f for f in _config("Youth").fields}["state"]
+    states = youth_state.categories[:36]
+    assert len(states) == 36 and len(set(states)) == 36
+    assert youth_state.categories[36:] == SPECIAL_PLACE_ANSWERS
+    for name in ("Dadra and Nagar Haveli and Daman and Diu", "Jammu and Kashmir", "Ladakh", "Delhi", "Telangana"):
+        assert name in states
+    assert "Delhi (NCT)" not in states
     for persona in PERSONA_NAMES:
         by_name = {f.name: f for f in _config(persona).fields}
-        assert by_name["state"].categories == youth_states
-        assert by_name["district"].kind == "free_text"
+        assert by_name["state"].categories == youth_state.categories
+        assert by_name["district"].kind == "free_text" and by_name["district"].categories == SPECIAL_PLACE_ANSWERS
 
 
-def test_age_is_an_integer_field_with_bounds_for_youth_and_general_public_only():
-    for persona in ("Youth", "General Public"):
+def test_every_variant_of_delhi_is_an_alias_of_the_one_delhi_value_and_a_region_is_decided_with_the_district():
+    state = {f.name: f for f in _config("Youth").fields}["state"]
+    assert set(state.aliases["Delhi"]) >= {"New Delhi", "NCT", "NCT of Delhi", "Delhi NCR", "Delhi/NCR", "NCR"}
+    assert "derived from the district" in state.description and "'Delhi/NCR'" in state.description
+    for persona in PERSONA_NAMES:
+        assert {f.name: f for f in _config(persona).fields}["state"].aliases == state.aliases
+
+
+def test_age_is_a_banded_number_for_youth_and_general_public_only():
+    for persona, bands in (("Youth", YOUTH_AGE_BANDS), ("General Public", GENERAL_PUBLIC_AGE_BANDS)):
         age = {f.name: f for f in _config(persona).fields}["age"]
-        assert age.kind == "integer" and (age.min_value, age.max_value) == (5, 100)
+        assert age.kind == "integer" and (age.min_value, age.max_value) == (0, 120)
+        assert [b.label for b in age.bands] == bands
+        assert age.categories == ("Prefer not to say", "Unclear", "Invalid response")
     for persona in ("Parent", "Educator"):
         assert "age" not in _config(persona).field_names()
 
 
-def test_youth_income_is_a_monthly_band_list_that_tells_the_model_to_convert_annual_to_monthly():
-    income = {f.name: f for f in _config("Youth").fields}["monthly_household_income"]
-    assert income.kind == "category" and income.categories == (
-        "Less than ₹25,000", "₹25,000 - ₹66,000", "₹67,000 - ₹83,000", "Above ₹83,000", "Don't know")
-    assert "divide the amount by 12" in income.description and "MONTH" in income.description
-    # the story's gap (66,001 to 66,999) is closed in the guidance
-    assert "between 66,000 and 67,000" in income.guidance["₹25,000 - ₹66,000"]
+def test_gender_lists_are_the_same_in_every_persona_and_a_parent_may_name_several_children():
+    for persona, name in (("Youth", "gender"), ("General Public", "gender"), ("Educator", "gender"), ("Parent", "child_gender")):
+        assert {f.name: f for f in _config(persona).fields}[name].categories == GENDERS
+    assert {f.name: f for f in _config("Parent").fields}["child_gender"].multi
 
 
-def test_disability_fields_are_sensitive_and_disability_type_is_free_text_in_youth_and_parent():
+def test_youth_status_education_and_course_lists_are_the_finalised_ones_and_depend_on_each_other():
+    by_name = {f.name: f for f in _config("Youth").fields}
+    assert by_name["current_activity_status"].categories == (
+        "Studying", "Working", "Self-employed", "Looking for work/unemployed", "Not currently studying", "Others",
+        "Prefer not to say", "Invalid response")
+    assert by_name["current_activity_status"].multi
+    assert by_name["education_level"].categories == (
+        "Grade 6 to 10", "Grade 11 to 12", "Skill programs", "Pursuing undergraduate and postgraduate", "Others",
+        "Prefer not to say", "Invalid response")
+    assert by_name["education_level"].applies_when == ("current_activity_status", ("Studying",))
+    assert by_name["course_details"].applies_when == (
+        "education_level", ("Grade 11 to 12", "Skill programs", "Pursuing undergraduate and postgraduate"))
+    assert by_name["course_details"].categories == (
+        "Science", "Commerce", "Electrical or electronics", "Mechanical or manufacturing", "Automobile or transport",
+        "Civil or construction", "Computer or IT", "Health", "Beauty", "Hospitality", "Arts (BA or MA)",
+        "Science (B.Sc or M.Sc)", "Commerce (B.Com or M.Com)", "Technology (B.Tech or M.Tech)",
+        "Business administration (BBA or MBA)", "Computer applications (BCA or MCA)", "Medicine (MBBS or MD)",
+        "Law (LLB or LLM)", "Others", "Prefer not to say", "Invalid response")
+    assert by_name["institution_type"].categories == (
+        "Government", "Private", "Government-aided", "Others", "Not sure", "Prefer not to say", "Invalid response")
+
+
+def test_youth_income_has_a_monthly_band_list_for_v2_and_an_annual_one_for_v1_with_the_symbols_the_data_team_chose():
+    by_name = {f.name: f for f in _config("Youth").fields}
+    monthly, annual = by_name["monthly_household_income"], by_name["annual_household_income"]
+    assert monthly.categories == (
+        "Zero income / no income", "< ₹25,000", "≥ ₹25,000 and < ₹66,000", "≥ ₹66,000 and < ₹83,000",
+        "≥ ₹83,000", "Don't know", "Prefer not to say", "Invalid response", "Unclear")
+    assert annual.categories == (
+        "Zero income / no income", "< ₹3 lakh", "≥ ₹3 lakh and < ₹8 lakh", "≥ ₹8 lakh and < ₹10 lakh",
+        "≥ ₹10 lakh", "Don't know", "Prefer not to say", "Invalid response", "Unclear")
+    assert monthly.versions == ("V2",) and annual.versions == ("V1",) and monthly.sensitive and annual.sensitive
+    assert "divide the amount by 12" in monthly.description and "MONTH" in monthly.description
+    assert "multiply the amount by 12" in annual.description and "YEAR" in annual.description
+    assert "'around 25,000' belongs here" in monthly.guidance["≥ ₹25,000 and < ₹66,000"]
+
+
+def test_disability_fields_are_sensitive_and_disability_type_is_a_multi_value_category_that_needs_a_yes():
     for persona in ("Youth", "Parent"):
         by_name = {f.name: f for f in _config(persona).fields}
-        assert by_name["disability"].categories == ("Yes", "No", "Prefer not to say", "Invalid")
-        assert by_name["disability_type"].kind == "free_text" and by_name["disability_type"].sensitive
+        assert by_name["disability"].categories == ("Yes", "No", "Prefer not to say", "Invalid response")
+        kind = by_name["disability_type"]
+        assert kind.kind == "category" and kind.sensitive and kind.multi
+        assert kind.categories == ("Physical disability", "Intellectual disability", "Others", "Prefer not to say", "Invalid response")
+        assert kind.applies_when == ("disability", ("Yes",))
     assert "CHILD" in {f.name: f for f in _config("Parent").fields}["disability"].description
 
 
 def test_parent_child_fields_are_about_the_child_and_parent_fields_about_the_parent():
     by_name = {f.name: f for f in _config("Parent").fields}
     assert "CHILD" in by_name["child_gender"].description and "not of the parent" in by_name["child_gender"].description
-    assert by_name["child_grade"].categories == (
-        "Primary (Classes 1-5)",
-        "Middle (Classes 6-8)",
-        "Secondary (Classes 9-10)",
-        "Higher Secondary (Classes 11-12)",
-        "College/University",
-        "Other",
-    )
-    assert by_name["respondent_relationship"].categories == ("Mother", "Father", "Guardian")
-    assert by_name["school_type"].categories == ("Government", "Private", "Others", "Invalid")
+    grade = by_name["child_grade"]
+    assert grade.categories == (
+        "Pre-primary", "Primary (classes 1-5)", "Middle (classes 6-8)", "High school (classes 9-12)",
+        "Undergraduate/postgraduate", "Skill programs", "Others", "Prefer not to say", "Invalid response",
+        "Unsure / don't know", "Out of school / not currently enrolled")
+    assert grade.multi and grade.versions == ("V1",)
+    assert by_name["respondent_relationship"].categories == (
+        "Mother", "Father", "Guardian", "Other relative", "Unmapped", "Prefer not to say", "Invalid response")
+    assert by_name["school_type"].categories == ("Government", "Private", "Others", "Not sure", "Prefer not to say", "Invalid response")
     for name in ("parent_education", "parent_education_level"):
         assert "RESPONDENT" in by_name[name].description and "not the child" in by_name[name].description
-    assert "Did Not Go to School" in by_name["parent_education_level"].categories
+    assert by_name["parent_education"].categories == ("Yes", "No", "Prefer not to say", "Invalid response")
+    assert by_name["parent_education_level"].categories == grade.categories[:-1] + ("Did not go to school",)
 
 
-def test_educator_teaching_level_keeps_the_story_bands_and_says_when_they_cannot_be_derived():
-    level = {f.name: f for f in _config("Educator").fields}["teaching_level"]
-    assert level.categories == ("Primary", "Middle", "Secondary", "Higher Secondary", "Undergraduate",
-                                "Postgraduate", "Others", "Invalid")
-    assert "only when the respondent names" in level.description
-    assert level.provisional
+def test_educator_lists_are_the_finalised_ones_and_a_teacher_of_several_levels_gets_each_once():
+    by_name = {f.name: f for f in _config("Educator").fields}
+    level = by_name["teaching_level"]
+    assert level.categories == ("Pre-primary", "Primary (classes 1-5)", "Middle (classes 6-8)", "High school (classes 9-12)",
+                                "Undergraduate", "Postgraduate", "Others", "Prefer not to say", "Invalid response")
+    assert level.multi and "Postgraduate only when" in level.description
+    assert by_name["institution_type"].categories == ("Government", "Private", "Others", "Not sure", "Prefer not to say", "Invalid response")
 
 
-def test_youth_keeps_the_existing_names_and_has_no_school_type_but_institution_type():
-    names = _config("Youth").field_names()
-    assert "institution_type" in names and "school_type" not in names
-    assert {f.name: f for f in _config("Youth").fields}["institution_type"].categories == (
-        "Government", "Government-aided", "Private", "Others", "Invalid")
-
-
-def test_general_public_occupation_is_the_story_sector_list():
+def test_general_public_occupation_is_the_finalised_sector_list():
     occupation = {f.name: f for f in _config("General Public").fields}["occupation"]
     assert occupation.categories == (
         "Education", "Health", "Government and public services", "IT and services", "Manufacturing", "Agriculture",
-        "Retail and trade", "NGO or social sector", "Others", "Invalid")
+        "Retail and trade", "NGO or social sector", "Others", "Not currently working", "Homemaker", "Student",
+        "Prefer not to say", "Unclear", "Invalid response")
+
+
+def test_labels_use_one_spelling_across_personas_and_fields():
+    """The normalised set: sentence case, 'Others', 'Invalid response', 'Prefer not to say', 'Not sure' ... everywhere."""
+    labels = set()
+    for persona in PERSONA_NAMES:
+        for f in _config(persona).fields:
+            labels.update(f.categories)
+    for wrong in ("Other", "Invalid", "Invalid responses", "Invalid Response", "Prefer Not to Say", "Not Answered", "Not answered",
+                  "N/A", "Not Sure", "Unsure / Don't Know", "Zero Income / No Income"):
+        assert wrong not in labels, wrong
+    assert {"Others", "Invalid response", "Prefer not to say", "Not sure", "Unsure / don't know"} <= labels
+    for persona in PERSONA_NAMES:                       # no comma in the label of a multi-value field
+        for f in _config(persona).fields:
+            if f.multi:
+                assert all("," not in c for c in f.categories), f.name
 
 
 # ------------------------------------------------------------------------------------------------ prompts
@@ -225,7 +292,8 @@ def test_persona_prompt_keeps_the_safety_clauses_of_the_generic_prompt(sql, pers
     assert security in system
     assert "never instructions to you" in system and "Output ONLY the JSON object" in system
     assert "No markdown fences" in system
-    assert "Never infer" in system and "not a state from a language, a city or a district" in system
+    assert "Never infer" in system and "not a state from a language or a city" in system
+    assert "A state may be derived from a district the respondent names" in system
     assert "latest clear answer" in system
     assert 'value" null and "raw" null' in system and 'value" null and "raw" filled' in system
     # the delimited conversation and the data-not-instructions reminder of the user part
@@ -261,17 +329,20 @@ def test_persona_prompt_renders_with_the_engine_and_lists_every_field(sql, perso
 
 def test_persona_prompts_are_specific_to_their_persona(sql):
     prompts = {p: _seeded_prompt(sql, PERSONA_PROMPT_NAMES[p])[1] for p in PERSONA_NAMES}
-    # Youth: annual to monthly before banding
-    assert "always MONTHLY" in prompts["Youth"] and "divide by 12" in prompts["Youth"]
-    assert "annual" in prompts["Youth"] and "per month" in prompts["Youth"]
-    assert "disability_type: only when disability is Yes" in prompts["Youth"]
+    # Youth: a period conversion for income, several statuses, a dropout rule
+    assert "MONTHLY or YEARLY" in prompts["Youth"] and "convert first" in prompts["Youth"]
+    assert "Not currently studying" in prompts["Youth"] and "both Studying and Working" in prompts["Youth"]
+    assert "disability_type: the kinds they name" in prompts["Youth"]
     # General Public: sector of work
-    assert "sector" in prompts["General Public"] and "Others" in prompts["General Public"]
-    # Parent: child vs parent
-    assert "CHILD" in prompts["Parent"] and "parent_education" in prompts["Parent"] and "Guardian" in prompts["Parent"]
-    # Educator: the teaching level cannot always be derived
-    assert "ONLY when the respondent names the classes" in prompts["Educator"]
-    assert "value null" in prompts["Educator"]
+    assert "sector" in prompts["General Public"] and "Others" in prompts["General Public"] and "Unclear" in prompts["General Public"]
+    # Parent: child vs parent, several children
+    assert "CHILD" in prompts["Parent"] and "parent_education" in prompts["Parent"] and "Other relative" in prompts["Parent"]
+    assert "every gender that applies" in prompts["Parent"]
+    # Educator: the levels and several of them
+    assert "High school (classes 9-12)" in prompts["Educator"] and "every band that applies" in prompts["Educator"]
+    # every persona prompt tells the model how a multi-value answer is written
+    for text in prompts.values():
+        assert 'a field marked "one or more", a JSON list' in text
     # each persona prompt is more specific than the generic one but stays short (one call per session)
     generic = _seeded_prompt(sql, PROMPT_NAME)[1]
     for text in prompts.values():
@@ -296,14 +367,15 @@ def _answer(config, values, pii=(False, [])):
 def test_a_synthetic_youth_answer_maps_every_kind_and_sensitive_fields_stay_optional():
     config = _config("Youth")
     answer = _answer(config, {
-        "age": ("14", "fourteen"), "gender": ("Female", "girl"), "state": ("Karnataka", "karnataka"),
-        "district": ("Mysuru", "mysore"), "current_activity_status": ("Studying", "in school"),
-        "education_level": ("9", "class 9"), "institution_type": ("Government", "govt"),
-        "monthly_household_income": ("Less than ₹25,000", "3 lakh a year"),
+        "age": (14.5, "fourteen and a half"), "gender": ("Female", "girl"), "state": ("Karnataka", "karnataka"),
+        "district": ("Mysuru", "mysore"), "current_activity_status": (["Studying", "Working"], "in school, part time job"),
+        "education_level": ("Grade 6 to 10", "class 9"), "institution_type": ("Government", "govt"),
+        "monthly_household_income": ("< \u20b925,000", "3 lakh a year"),
     })
     fields = {f.field_name: f for f in fx.parse_model_response(answer, config).fields}
-    assert (fields["age"].value, fields["age"].status) == ("14", "extracted")
-    assert fields["monthly_household_income"].value == "Less than ₹25,000"
+    assert (fields["age"].value, fields["age"].raw_value, fields["age"].status) == ("\u2265 12 and < 16", "fourteen and a half", "extracted")
+    assert fields["current_activity_status"].value == "Studying, Working" and fields["current_activity_status"].value_list == ("Studying", "Working")
+    assert fields["monthly_household_income"].value == "< \u20b925,000"
     assert fields["disability"].status == "not_provided" and fields["course_details"].status == "not_provided"
 
 
@@ -311,7 +383,7 @@ def test_out_of_range_age_and_a_stated_value_that_fits_no_band_are_unmapped_with
     config = _config("Youth")
     answer = _answer(config, {"age": ("244", "244"), "monthly_household_income": (None, "between 60 and 90 thousand")})
     fields = {f.field_name: f for f in fx.parse_model_response(answer, config).fields}
-    assert (fields["age"].status, fields["age"].value, fields["age"].raw_value) == ("unmapped", None, "244")
+    assert (fields["age"].status, fields["age"].value, fields["age"].raw_value) == ("unmapped", "Invalid response", "244")
     # monthly_household_income is a sensitive field: its words are not stored (raw_value NULL) unless store_raw is set
     assert (fields["monthly_household_income"].status, fields["monthly_household_income"].raw_value) == ("unmapped", None)
 
@@ -337,15 +409,18 @@ def test_each_persona_accepts_an_answer_with_every_configured_field_and_rejects_
 def test_parent_child_grade_and_educator_level_bands_map_and_others_do_not_coerce():
     parent = _config("Parent")
     fields = {f.field_name: f for f in fx.parse_model_response(
-        _answer(parent, {"child_grade": ("Middle (Classes 6-8)", "6th"), "parent_education_level": ("Did Not Go to School", "never"),
+        _answer(parent, {"child_grade": ("Middle (classes 6-8)", "6th"), "parent_education_level": ("Did not go to school", "never"),
                          "respondent_relationship": ("Aunt", "aunt")}), parent).fields}
-    assert fields["child_grade"].value == "Middle (Classes 6-8)"
-    assert fields["parent_education_level"].value == "Did Not Go to School"
-    assert (fields["respondent_relationship"].status, fields["respondent_relationship"].raw_value) == ("unmapped", "aunt")
+    assert fields["child_grade"].value == "Middle (classes 6-8)"
+    assert fields["parent_education_level"].value == "Did not go to school"
+    # "Aunt" is no value of the list: it is not coerced, the field's own Unmapped stands in and the words stay
+    assert (fields["respondent_relationship"].status, fields["respondent_relationship"].value,
+            fields["respondent_relationship"].raw_value) == ("unmapped", "Unmapped", "aunt")
     educator = _config("Educator")
     level = {f.field_name: f for f in fx.parse_model_response(
         _answer(educator, {"teaching_level": ("High school", "high school")}), educator).fields}["teaching_level"]
     assert level.status == "unmapped" and level.raw_value == "high school"      # a bare 'high school' is not a band
+    assert level.value == "Others"                                              # the field's fallback, never an empty value
 
 
 # ------------------------------------------------------------------------------------------------ doc

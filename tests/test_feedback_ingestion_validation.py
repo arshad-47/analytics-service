@@ -341,30 +341,62 @@ def test_any_non_empty_strings_are_accepted(event, session_type, version):
     assert _problems(event) == []
 
 
-@pytest.mark.parametrize("field", ["botId", "botName"])
-def test_bot_fields_are_optional(event, field):
-    del event["data"][field]
-    assert _problems(event) == []
-
-
-def test_bot_fields_absent_together(event):
-    del event["data"]["botId"]
+def test_bot_name_is_optional(event):
     del event["data"]["botName"]
     assert _problems(event) == []
 
 
-@pytest.mark.parametrize("field", ["botId", "botName"])
-@pytest.mark.parametrize("ok", [None, "101", "Mitra Youth Test Bot", ""])
-def test_bot_fields_accept_string_or_null(event, field, ok):
-    event["data"][field] = ok
+# CHANGED: botId was optional; for adapter conversation_rows it is now required (the questionnaire version of a bot
+# session is the rank of its bot id inside the persona) and must be a positive integer written in digits
+def test_bot_id_is_required_for_conversation_rows(event):
+    del event["data"]["botId"]
+    assert _problems(event) == ["'data.botId' is missing (required for adapter conversation_rows)"]
+
+
+@pytest.mark.parametrize("empty, label", [(None, "null"), ("", "empty"), ("   ", "empty")])
+def test_empty_bot_id_is_rejected_for_conversation_rows(event, empty, label):
+    event["data"]["botId"] = empty
+    assert _problems(event) == [f"'data.botId' is {label} (required for adapter conversation_rows)"]
+
+
+@pytest.mark.parametrize("ok", ["1", "101", "89", "103", "123456789012345678"])
+def test_bot_id_accepts_a_positive_integer_in_digits(event, ok):
+    event["data"]["botId"] = ok
     assert _problems(event) == []
 
 
-@pytest.mark.parametrize("field", ["botId", "botName"])
+@pytest.mark.parametrize("bad", ["abc", "0", "00", "089", "-1", "+5", "1.5", "1e3", " 101", "101 ", "1 0",
+                                 "1234567890123456789", "８９", "bot-101"])
+def test_bot_id_that_is_not_a_positive_integer_in_digits_is_rejected_without_being_echoed(event, bad):
+    event["data"]["botId"] = bad
+    (problem,) = _problems(event)
+    assert problem == ("'data.botId' must be a positive integer written in digits (no sign, no leading zero, "
+                       "at most 18 digits)")
+    assert bad.strip() == "" or bad not in problem
+
+
+def test_bot_id_is_not_required_for_wide_form(event):
+    gforms = _load("create", "create_feedback_gforms.json")
+    assert "botId" not in gforms["data"]
+    assert _problems(gforms) == []
+
+
+@pytest.mark.parametrize("ok", [None, "Mitra Youth Test Bot", ""])
+def test_bot_name_accepts_string_or_null(event, ok):
+    event["data"]["botName"] = ok
+    assert _problems(event) == []
+
+
 @pytest.mark.parametrize("bad, type_name", [(101, "int"), (True, "bool"), (["a"], "list"), ({}, "dict")])
-def test_bot_fields_wrong_type(event, field, bad, type_name):
-    event["data"][field] = bad
-    assert _problems(event) == [f"'data.{field}' must be a string or null, got {type_name}"]
+def test_bot_name_wrong_type(event, bad, type_name):
+    event["data"]["botName"] = bad
+    assert _problems(event) == [f"'data.botName' must be a string or null, got {type_name}"]
+
+
+@pytest.mark.parametrize("bad, type_name", [(101, "int"), (True, "bool"), (["a"], "list")])
+def test_bot_id_wrong_type(event, bad, type_name):
+    event["data"]["botId"] = bad
+    assert _problems(event) == [f"'data.botId' must be a string, got {type_name}"]
 
 
 def test_in_progress_fixture_has_null_bot_name_and_passes():
@@ -515,10 +547,10 @@ def test_feedback_delete_without_a_schema_checks_the_envelope_only():
 def test_the_validator_uses_the_schema_it_is_given(event):
     """A persona may require more (or other) paths: the passed schema decides, not a global one."""
     stricter = copy.deepcopy(SCHEMA)
-    stricter["create"]["required"].append("data.botId")
+    stricter["create"]["required"].append("data.botName")   # (botId is required by code now, whatever the schema says)
     assert validate_ingestion_schema(event, "feedback", "create", feedback_schema=stricter) == []
-    event["data"]["botId"] = None
-    assert validate_ingestion_schema(event, "feedback", "create", feedback_schema=stricter) == ["'data.botId' is null"]
+    event["data"]["botName"] = None
+    assert validate_ingestion_schema(event, "feedback", "create", feedback_schema=stricter) == ["'data.botName' is null"]
     assert _problems(event) == []
 
 
@@ -626,7 +658,7 @@ def test_gforms_bot_fields_are_optional_but_typed(gforms):
     gforms["data"]["botName"] = "x"
     assert _problems(gforms) == []
     gforms["data"]["botId"] = 5
-    assert _problems(gforms) == ["'data.botId' must be a string or null, got int"]
+    assert _problems(gforms) == ["'data.botId' must be a string, got int"]
 
 
 def test_mitra_source_ref_absent_or_null_is_valid(event):

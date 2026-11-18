@@ -300,16 +300,16 @@ def test_extraction_writes_rows_pii_flag_meta_and_llm_log_in_one_go():
         prompt = fake.calls[0]["prompt"]
         assert "[2] Respondent: karnatka" in prompt and "[4] Respondent: girl" in prompt
         assert "Thank you, goodbye!" not in prompt                      # closing message left out by the upload config's closing_keys
-        assert "Allowed values: Government; Government-aided; Private; Others; Invalid" in prompt
+        assert "Allowed values: Government; Private; Government-aided; Others; Not sure; Prefer not to say; Invalid response" in prompt
 
         rows = await _rows(conn, sid)
         assert set(rows) == {"state", "district", "gender", "school_type"}
-        # the model flagged the session (pii True): a flagged session keeps no respondent words (raw_value NULL for
-        # every field) and no free-text value; category values (bands from the config) stay
-        assert (rows["state"]["value"], rows["state"]["status"], rows["state"]["raw_value"]) == ("Karnataka", "extracted", None)
+        # the model flagged the session (pii True): the flag marks it, everything extracted is kept (values and the
+        # respondent's words in raw_value); the export query decides what leaves the system
+        assert (rows["state"]["value"], rows["state"]["status"], rows["state"]["raw_value"]) == ("Karnataka", "extracted", "karnatka")
         assert (rows["gender"]["value"], rows["school_type"]["value"]) == ("Female", "Government")
-        assert (rows["district"]["value"], rows["district"]["status"], rows["district"]["raw_value"]) == (None, "extracted", None)
-        assert all(r["raw_value"] is None for r in rows.values())
+        assert (rows["district"]["value"], rows["district"]["status"], rows["district"]["raw_value"]) == ("Mysuru", "extracted", "mysore")
+        assert rows["school_type"]["raw_value"] == "govt" and rows["school_type"]["status"] == "extracted"
         for r in rows.values():
             assert "session_type" not in r.keys() and "questionnaire_version" not in r.keys()      # no stale copies of the labels
             assert r["config_version_id"] is not None and r["prompt_version_id"] is not None and r["confidence"] is None
@@ -341,7 +341,7 @@ def test_rerun_overwrites_one_row_per_field_and_drops_fields_no_longer_configure
         assert set(second) == {"state", "district", "gender", "school_type"}          # 'age' removed, nothing duplicated
         assert second["state"]["value"] == "Tamil Nadu" and second["state"]["id"] == first["state"]["id"]   # updated in place
         assert second["state"]["extracted_at"] > first["state"]["extracted_at"]
-        assert (second["gender"]["status"], second["gender"]["value"], second["gender"]["raw_value"]) == ("unmapped", None, "xyz")
+        assert (second["gender"]["status"], second["gender"]["value"], second["gender"]["raw_value"]) == ("unmapped", "Others", "xyz")
         assert (await _fs(conn, sid))["pii_detected"] is False                         # the flag is overwritten too
         assert json.loads((await _fs(conn, sid))["meta_data"])["extraction"]["pii_types"] == []
         assert await conn.fetchval("SELECT count(*) FROM llm_logs WHERE submission_id = $1", sid) == 2
@@ -383,7 +383,7 @@ def test_google_forms_session_is_extracted_with_the_same_config():
         assert outcome.session_type == "Parent_Voice"
         assert (rows["state"]["value"], rows["gender"]["value"], rows["school_type"]["value"]) == ("Kerala", "Male", "Private")
         assert (await _fs(conn, sid))["questionnaire_version"] == "V1"
-        assert "Allowed values: Government; Private; Others; Invalid" in fake.calls[0]["prompt"]   # the Parent bands
+        assert "Allowed values: Government; Private; Others; Not sure; Prefer not to say; Invalid response" in fake.calls[0]["prompt"]   # the Parent bands
     _run(body)
 
 
@@ -745,10 +745,17 @@ def _doc_queries():
     return re.findall(r"```sql\n(.*?)```", section, flags=re.S)
 
 
+# What _add stamps in these tests: every persona has ONE bot, so its sessions are the lowest bot id of the persona: V1
+# (the label is the rank of the bot id, whatever `version` the event carries).
+SESSION_VERSION = {"Youth": "V1", "Parent": "V1", "General Public": "V1", "Educator": "V1"}
+
+
 def _seed_values(persona, **overrides):
-    """A valid value for every field of the persona's SEEDED config (by kind), overridable by field name."""
+    """A valid value for every field the persona's SEEDED config asks in the version of the test's sessions, by kind."""
     values = {}
     for f in extraction_config_v1(persona)["fields"]:
+        if "versions" in f and SESSION_VERSION[persona] not in f["versions"]:
+            continue                      # not asked in this questionnaire version: the code answers N/A, the model is not asked
         if f["name"] == "state":
             values["state"] = "Karnataka"
         elif f["kind"] == "integer":
@@ -767,7 +774,8 @@ def _seed_answer(persona, pii=(False, []), **overrides):
                        "pii": {"detected": pii[0], "types": pii[1]}})
 
 
-SENSITIVE = {"Youth": {"monthly_household_income", "disability", "disability_type"}, "Parent": {"disability", "disability_type"}}
+SENSITIVE = {"Youth": {"monthly_household_income", "annual_household_income", "disability", "disability_type"},
+             "Parent": {"disability", "disability_type"}}
 
 
 def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_sessions():
@@ -788,8 +796,8 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         row = dict(youth[0])
         want = _seed_values("Youth")
         assert (row["state"], row["district"], row["gender"], row["institution_type"], row["questionnaire_version"]) == (
-            "Karnataka", "Mysuru", want["gender"], want["institution_type"], "V2")
-        assert row["age"] == 17 and row["age_status"] == "extracted"                  # cast to a number
+            "Karnataka", "Mysuru", want["gender"], want["institution_type"], "V1")   # the rank of its bot id (the only bot)
+        assert row["age"] == "≥ 16 and < 22" and row["age_status"] == "extracted"      # the label of the band, 17 is the raw word
         assert row["source"] == "mitra" and row["session_type"] == "Youth_Voice"
         assert all(row[f"{n}_status"] == "extracted" for n in ("state", "district", "gender", "institution_type"))
         # the sensitive columns are NOT in the documented export, and the commented-out block turns them on when asked
@@ -803,7 +811,9 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         # session_type / questionnaire_version come from feedback_submissions: a relabel shows up at once
         await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V9' WHERE submission_id = $1", clean)
         assert (await conn.fetch(queries[0]))[0]["questionnaire_version"] == "V9"
-        await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V2' WHERE submission_id = $1", clean)
+        # put the rank label back (V1: its only bot): any later ingest of the persona re-ranks it and would otherwise
+        # repair the label by sending the session back through extraction
+        await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V1' WHERE submission_id = $1", clean)
         unchecked_rows = await conn.fetch(queries[4])
         assert [(r["session_type"], r["unchecked_sessions"]) for r in unchecked_rows] == [("Youth_Voice", 1)]
         assert unchecked not in [r["submission_id"] for r in youth]
@@ -820,7 +830,7 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         assert [r["submission_id"] for r in await conn.fetch(queries[0])] == [clean]
         general = await _add(conn, persona="General Public")
         await extract_submission(pool, general, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("General Public", state="Kerala"))))
-        assert [(r["submission_id"], r["state"], r["age"]) for r in await conn.fetch(queries[2])] == [(general, "Kerala", 17)]
+        assert [(r["submission_id"], r["state"], r["age"]) for r in await conn.fetch(queries[2])] == [(general, "Kerala", "≥ 12 and < 26")]
         educator = await _add(conn, persona="Educator", version="V1")
         await extract_submission(pool, educator, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Educator"))))
         erow = [dict(r) for r in await conn.fetch(queries[3])]
@@ -834,7 +844,7 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         answer["fields"]["state"] = {"value": None, "raw": "somewhere"}
         await extract_submission(pool, unmapped, "mitra", llm_function=_with_masking(FakeLlm(json.dumps(answer))))
         review = await conn.fetch(queries[8])
-        assert [(r["submission_id"], r["raw_value"], r["questionnaire_version"]) for r in review] == [(unmapped, "somewhere", "V2")]
+        assert [(r["submission_id"], r["raw_value"], r["questionnaire_version"]) for r in review] == [(unmapped, "somewhere", "V1")]
         # the status columns tell not_provided from unmapped (both have a NULL value); an integer out of range is unmapped
         placeholder = await _add(conn)
         answer = json.loads(_seed_answer("Youth"))
@@ -844,10 +854,10 @@ def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_se
         answer["fields"]["age"] = {"value": 250, "raw": "250"}
         await extract_submission(pool, placeholder, "mitra", llm_function=_with_masking(FakeLlm(json.dumps(answer))))
         by_id = {r["submission_id"]: r for r in await conn.fetch(queries[0])}
-        assert (by_id[placeholder]["state"], by_id[placeholder]["state_status"]) == (None, "unmapped")
-        assert (by_id[placeholder]["district"], by_id[placeholder]["district_status"]) == (None, "not_provided")
-        assert (by_id[placeholder]["gender"], by_id[placeholder]["gender_status"]) == (None, "not_provided")
-        assert (by_id[placeholder]["age"], by_id[placeholder]["age_status"]) == (None, "unmapped")
+        assert (by_id[placeholder]["state"], by_id[placeholder]["state_status"]) == ("Unmapped", "unmapped")
+        assert (by_id[placeholder]["district"], by_id[placeholder]["district_status"]) == ("Not answered", "not_provided")
+        assert (by_id[placeholder]["gender"], by_id[placeholder]["gender_status"]) == ("Not answered", "not_provided")
+        assert (by_id[placeholder]["age"], by_id[placeholder]["age_status"]) == ("Invalid response", "unmapped")
         statuses = {(r["session_type"], r["field_name"], r["status"]): r["sessions"] for r in await conn.fetch(queries[7])}
         assert statuses[("Youth_Voice", "state", "unmapped")] == 2 and statuses[("Youth_Voice", "state", "extracted")] == 2
     _run(body, legacy=False)

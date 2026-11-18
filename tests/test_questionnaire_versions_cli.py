@@ -20,6 +20,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import factories
 import pg_support
 
 from app.config import settings
@@ -294,6 +295,8 @@ def _store(persona, stored_version, started_at):
 
     async def go(conn):
         await insert_or_update_submission(conn, event)
+        # the CLI tests are about the date windows, which only apply to sessions without a bot id
+        await factories.as_window_stamped_session(conn, sid, stored_version)
     _with_conn(go)
     return sid
 

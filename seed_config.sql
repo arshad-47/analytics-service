@@ -1326,17 +1326,9 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
   "schema_version": 1,
   "persona": "Youth",
   "session_type": "Youth_Voice",
-  "source_note": "Fields are the DOTS metadata columns of the persona. Category sets come from the Katha stories (still Draft); fields marked provisional wait for product confirmation, sensitive fields are filled only when the respondent states them explicitly. Districts are free text without a reference list.",
+  "source_note": "Fields are the DOTS metadata columns of the persona. The category lists are the data team's finalised lists (1MV dashboard requirements sheet) in the engine's normalised spellings; Not answered and N/A are written by the engine and are not listed. Fields with `versions` exist in those questionnaire versions only (N/A otherwise); a field with `applies_when` is N/A unless the earlier field holds one of the listed values; `multi` fields may hold several categories. Sensitive fields are filled only when the respondent states them explicitly.",
   "prompt_name": "Feedback Metadata Extraction - Youth",
   "fields": [
-    {
-      "name": "age",
-      "kind": "integer",
-      "description": "The age in whole years of the respondent (the Youth bot is for 12 to 25, but older respondents answer it), as a number. Use the number the respondent states; do not compute an age from a class, a birth year or a date of birth, and do not round a stated age. An age given as a range, or a number that cannot be an age, is not a value (put the words in raw).",
-      "min": 5,
-      "max": 100,
-      "provisional": true
-    },
     {
       "name": "gender",
       "kind": "category",
@@ -1346,21 +1338,101 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "Female",
         "Others",
         "Prefer not to say",
-        "Invalid"
+        "Invalid response",
+        "Unsure / don't know"
       ],
       "guidance": {
         "Male": "boy, man, male",
         "Female": "girl, woman, female",
         "Others": "a valid gender that is not male or female, for example non-binary, transgender, 'something else'",
-        "Prefer not to say": "the respondent declines or skips the question ('skip', 'do not want to say', 'not sure')",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unsure / don't know": "the respondent says they are unsure of their gender identity or do not know which option to choose"
+      }
+    },
+    {
+      "name": "age",
+      "kind": "integer",
+      "description": "The age of the respondent in years, as a number (the Youth bot is for 12 to 25, but older respondents answer it). Use the number the respondent states (decimals such as 15.5 are valid; 'around 16' is 16); do not compute an age from a class, a birth year or a date of birth. A stated range that lies inside one band is a number inside it; a range that spans two or more bands is Unclear.",
+      "categories": [
+        "Prefer not to say",
+        "Unclear",
+        "Invalid response"
+      ],
+      "guidance": {
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unclear": "a range that spans two or more bands, or a vague answer such as 'thirty something'",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "provisional": true
+      "min": 0,
+      "max": 120,
+      "bands": [
+        {
+          "label": "< 12",
+          "min": null,
+          "max": 12
+        },
+        {
+          "label": "≥ 12 and < 16",
+          "min": 12,
+          "max": 16
+        },
+        {
+          "label": "≥ 16 and < 22",
+          "min": 16,
+          "max": 22
+        },
+        {
+          "label": "≥ 22 and < 26",
+          "min": 22,
+          "max": 26
+        },
+        {
+          "label": "≥ 26 and < 30",
+          "min": 26,
+          "max": 30
+        },
+        {
+          "label": "≥ 30 and < 35",
+          "min": 30,
+          "max": 35
+        },
+        {
+          "label": "≥ 35 and < 40",
+          "min": 35,
+          "max": 40
+        },
+        {
+          "label": "≥ 40 and < 45",
+          "min": 40,
+          "max": 45
+        },
+        {
+          "label": "≥ 45 and < 50",
+          "min": 45,
+          "max": 50
+        },
+        {
+          "label": "≥ 50 and < 55",
+          "min": 50,
+          "max": 55
+        },
+        {
+          "label": "≥ 55 and < 60",
+          "min": 55,
+          "max": 60
+        },
+        {
+          "label": "≥ 60",
+          "min": 60,
+          "max": null
+        }
+      ]
     },
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants and abbreviations to the official name; never infer a state from a district, a language or a city. A place that is not an Indian state or union territory does not fit any allowed value.",
+      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -1393,128 +1465,335 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "Andaman and Nicobar Islands",
         "Chandigarh",
         "Dadra and Nagar Haveli and Daman and Diu",
-        "Delhi (NCT)",
+        "Delhi",
         "Jammu and Kashmir",
         "Ladakh",
         "Lakshadweep",
-        "Puducherry"
+        "Puducherry",
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
       ],
       "guidance": {
-        "Andaman and Nicobar Islands": "also Andaman, Nicobar, A&N Islands",
-        "Dadra and Nagar Haveli and Daman and Diu": "also Dadra and Nagar Haveli, Daman, Diu, Silvassa",
-        "Delhi (NCT)": "also Delhi, New Delhi, NCT of Delhi",
-        "Odisha": "also Orissa",
-        "Puducherry": "also Pondicherry",
-        "Uttarakhand": "also Uttaranchal",
-        "Telangana": "also Telengana",
-        "Jammu and Kashmir": "also J&K, Kashmir"
+        "Delhi": "Delhi, New Delhi, NCT of Delhi; 'Delhi/NCR' or 'NCR' when the district is a Delhi district or none is given",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      },
+      "aliases": {
+        "Delhi": [
+          "New Delhi",
+          "NCT",
+          "NCT of Delhi",
+          "National Capital Territory of Delhi",
+          "Delhi NCT",
+          "Delhi NCR",
+          "Delhi/NCR",
+          "NCR",
+          "Dilli"
+        ],
+        "Odisha": [
+          "Orissa"
+        ],
+        "Puducherry": [
+          "Pondicherry",
+          "Pondy"
+        ],
+        "Uttarakhand": [
+          "Uttaranchal"
+        ],
+        "Telangana": [
+          "Telengana"
+        ],
+        "Tamil Nadu": [
+          "Tamilnadu",
+          "TN"
+        ],
+        "Uttar Pradesh": [
+          "UP",
+          "U.P."
+        ],
+        "Madhya Pradesh": [
+          "MP",
+          "M.P."
+        ],
+        "West Bengal": [
+          "WB",
+          "Bengal"
+        ],
+        "Jammu and Kashmir": [
+          "J&K",
+          "J and K",
+          "Jammu & Kashmir",
+          "Kashmir"
+        ],
+        "Andaman and Nicobar Islands": [
+          "Andaman",
+          "Nicobar",
+          "A&N Islands",
+          "Andaman & Nicobar Islands"
+        ],
+        "Dadra and Nagar Haveli and Daman and Diu": [
+          "Dadra and Nagar Haveli",
+          "Daman and Diu",
+          "Daman",
+          "Diu",
+          "Silvassa",
+          "Dadra & Nagar Haveli",
+          "Daman & Diu"
+        ]
       }
     },
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name."
+      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "categories": [
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
+      ],
+      "guidance": {
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      }
     },
     {
       "name": "current_activity_status",
       "kind": "category",
-      "description": "What the respondent is doing right now (studying, working, self-employed, looking for work, something else), as answered to the bot's current-activity question.",
+      "description": "What the respondent is doing right now (studying, working, self-employed, looking for work, something else), as answered to the bot's current-activity question. A respondent in two statuses (a student who works part time) gets both.",
       "categories": [
         "Studying",
         "Working",
         "Self-employed",
-        "Looking for work/Unemployed",
-        "Other",
-        "Invalid"
+        "Looking for work/unemployed",
+        "Not currently studying",
+        "Others",
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
-        "Studying": "in school, college or any course; also preparing for an exam as a student",
-        "Working": "has a job or works for someone, including a family business or farm",
-        "Self-employed": "runs their own business or work",
-        "Looking for work/Unemployed": "not working and looking for work, or unemployed",
-        "Other": "anything else the respondent names (for example caring for family, 'doing something else' with no detail)",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Studying": "in school, college or any course, or saying they go to a named school or college",
+        "Working": "employed by someone: public or private sector work, a job",
+        "Self-employed": "runs their own business or works for themselves (runs a cafe, a shop)",
+        "Looking for work/unemployed": "has no work and is looking for work",
+        "Not currently studying": "has dropped out, discontinued education, or is not enrolled in an educational institution",
+        "Others": "a valid status that is none of these, for example preparing for an exam, or caring for family and not looking for a job",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "provisional": true
+      "multi": true
     },
     {
       "name": "education_level",
-      "kind": "free_text",
-      "description": "The class the respondent studies in now, as asked after 'studying' (free text: for a school class just the number, for example '9'; for college the year or level in a few words). Empty when the respondent does not study or never named a class. No bands are defined yet (H7).",
-      "provisional": true
+      "kind": "category",
+      "description": "The level of education the respondent is in, asked only of those who study. If the respondent says they dropped out, use the last COMPLETED level (someone who dropped out of a BA completed grade 12: Grade 11 to 12). A level below grade 6 is Others.",
+      "categories": [
+        "Grade 6 to 10",
+        "Grade 11 to 12",
+        "Skill programs",
+        "Pursuing undergraduate and postgraduate",
+        "Others",
+        "Prefer not to say",
+        "Invalid response"
+      ],
+      "guidance": {
+        "Grade 6 to 10": "school classes 6 to 10",
+        "Grade 11 to 12": "school classes 11 and 12",
+        "Skill programs": "ITI, polytechnic, vocational programmes",
+        "Pursuing undergraduate and postgraduate": "a bachelor's or master's course",
+        "Others": "a valid course that is not listed, such as a doctoral programme or a certificate course; also a level below grade 6",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+      },
+      "applies_when": {
+        "field": "current_activity_status",
+        "in": [
+          "Studying"
+        ]
+      }
     },
     {
       "name": "course_details",
-      "kind": "free_text",
-      "description": "The course or stream the respondent studies (free text, in a few words, for example the stream of a school student or the degree and subject of a college student). Empty when not asked or not named. No bands are defined yet (H7).",
-      "provisional": true
+      "kind": "category",
+      "description": "The stream or programme the respondent studies, matching education_level: a stream for Grade 11 to 12 (Science or Commerce; any other stream such as Arts or Humanities is Others), a trade for Skill programs, a degree for Pursuing undergraduate and postgraduate. Use only the values that belong to the respondent's education level; a valid course that is not listed is Others.",
+      "categories": [
+        "Science",
+        "Commerce",
+        "Electrical or electronics",
+        "Mechanical or manufacturing",
+        "Automobile or transport",
+        "Civil or construction",
+        "Computer or IT",
+        "Health",
+        "Beauty",
+        "Hospitality",
+        "Arts (BA or MA)",
+        "Science (B.Sc or M.Sc)",
+        "Commerce (B.Com or M.Com)",
+        "Technology (B.Tech or M.Tech)",
+        "Business administration (BBA or MBA)",
+        "Computer applications (BCA or MCA)",
+        "Medicine (MBBS or MD)",
+        "Law (LLB or LLM)",
+        "Others",
+        "Prefer not to say",
+        "Invalid response"
+      ],
+      "guidance": {
+        "Science": "the science stream of grades 11 and 12",
+        "Commerce": "the commerce stream of grades 11 and 12",
+        "Health": "health-related skill programmes (nursing assistant, lab technician, ...)",
+        "Arts (BA or MA)": "BA, MA or another arts / humanities degree",
+        "Technology (B.Tech or M.Tech)": "B.Tech, M.Tech, BE, ME",
+        "Medicine (MBBS or MD)": "MBBS, MD and similar medical degrees",
+        "Others": "a valid stream, trade or degree that is not listed (for example Arts or Humanities in grades 11-12, nursing, pharmacy, BDS, B.Ed)",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+      },
+      "applies_when": {
+        "field": "education_level",
+        "in": [
+          "Grade 11 to 12",
+          "Skill programs",
+          "Pursuing undergraduate and postgraduate"
+        ]
+      }
     },
     {
       "name": "institution_type",
       "kind": "category",
-      "description": "The type of educational institution the respondent studies in or studied in (government, government-aided or private), as answered to the bot's institution question. Answered by every respondent in the current bot, including those who work (about their past school).",
+      "description": "The type of school or institution the respondent studies in or studied in, as answered to the bot's institution question. An international school or a board, home schooling and open schooling are Others. If the answer is about a college (the question is about schools), it is Invalid response.",
       "categories": [
         "Government",
-        "Government-aided",
         "Private",
+        "Government-aided",
         "Others",
-        "Invalid"
+        "Not sure",
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
-        "Government": "government or state-run school, college or institution",
-        "Government-aided": "aided school or institution (privately run, funded by the government)",
-        "Private": "private school, college or institution",
-        "Others": "any other kind of institution the respondent names (for example madrasa, open school, home schooling)",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "provisional": true
+        "Government": "government, govt or public (state-run school or institution)",
+        "Private": "private school or institution",
+        "Others": "any institution beyond the listed ones: home schooling, international, open schooling",
+        "Not sure": "the respondent says they are not sure of the institution type or do not know",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question, or an answer about a college (the question is about schools)",
+        "Government-aided": "an aided school or institution (privately run, funded by the government)"
+      }
     },
     {
       "name": "monthly_household_income",
       "kind": "category",
-      "description": "The household income per MONTH, as a band. The bot's question was per YEAR in the older questionnaire and per MONTH in the newer: when the question or the respondent speaks of a year (annual, yearly, per year, a lakh a year), divide the amount by 12 first, then pick the band; when it is per month, use it as is. A range that spans two bands, or an amount whose period is unclear, fits no band (value null, put the words in raw).",
+      "description": "The household income per MONTH, as a band. Asked only in the newer questionnaire. When the respondent speaks of a year (annual, yearly, per year, a lakh a year), divide the amount by 12 first, then pick the band; when it is per month, use it as is.",
       "categories": [
-        "Less than ₹25,000",
-        "₹25,000 - ₹66,000",
-        "₹67,000 - ₹83,000",
-        "Above ₹83,000",
-        "Don't know"
+        "Zero income / no income",
+        "< ₹25,000",
+        "≥ ₹25,000 and < ₹66,000",
+        "≥ ₹66,000 and < ₹83,000",
+        "≥ ₹83,000",
+        "Don't know",
+        "Prefer not to say",
+        "Invalid response",
+        "Unclear"
       ],
       "guidance": {
-        "Less than ₹25,000": "a monthly amount below 25,000 (including 0)",
-        "₹25,000 - ₹66,000": "a monthly amount from 25,000 up to but not including 67,000 (an amount between 66,000 and 67,000 belongs here)",
-        "₹67,000 - ₹83,000": "a monthly amount from 67,000 up to and including 83,000",
-        "Above ₹83,000": "a monthly amount above 83,000",
-        "Don't know": "the respondent says they do not know the household income"
+        "Zero income / no income": "the household has no income",
+        "Don't know": "the respondent says they are unsure or do not know the household income",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unclear": "a range that spans two or more bands, or an amount whose period (month or year) cannot be told",
+        "< ₹25,000": "a monthly amount above zero and below 25,000",
+        "≥ ₹25,000 and < ₹66,000": "a monthly amount from 25,000 up to but not including 66,000; 'around 25,000' belongs here",
+        "≥ ₹66,000 and < ₹83,000": "a monthly amount from 66,000 up to but not including 83,000",
+        "≥ ₹83,000": "a monthly amount of 83,000 or more"
       },
-      "provisional": true,
-      "sensitive": true
+      "sensitive": true,
+      "versions": [
+        "V2"
+      ]
+    },
+    {
+      "name": "annual_household_income",
+      "kind": "category",
+      "description": "The household income per YEAR, as a band. Asked only in the older questionnaire. When the respondent speaks of a month, multiply the amount by 12 first, then pick the band; when it is per year, use it as is.",
+      "categories": [
+        "Zero income / no income",
+        "< ₹3 lakh",
+        "≥ ₹3 lakh and < ₹8 lakh",
+        "≥ ₹8 lakh and < ₹10 lakh",
+        "≥ ₹10 lakh",
+        "Don't know",
+        "Prefer not to say",
+        "Invalid response",
+        "Unclear"
+      ],
+      "guidance": {
+        "Zero income / no income": "the household has no income",
+        "Don't know": "the respondent says they are unsure or do not know the household income",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unclear": "a range that spans two or more bands, or an amount whose period (month or year) cannot be told",
+        "< ₹3 lakh": "a yearly amount above zero and below 3 lakh",
+        "≥ ₹3 lakh and < ₹8 lakh": "a yearly amount from 3 lakh up to but not including 8 lakh; 'around 4 lakh' belongs here",
+        "≥ ₹8 lakh and < ₹10 lakh": "a yearly amount from 8 lakh up to but not including 10 lakh",
+        "≥ ₹10 lakh": "a yearly amount of 10 lakh or more"
+      },
+      "sensitive": true,
+      "versions": [
+        "V1"
+      ]
     },
     {
       "name": "disability",
       "kind": "category",
-      "description": "Whether the respondent has a disability, as answered to the bot's disability question (or stated explicitly anywhere else in the conversation).",
+      "description": "Whether the respondent has a disability, as answered to the bot's disability question (or stated explicitly anywhere else in the conversation). If the respondent names a disability instead of answering yes or no, it is Yes.",
       "categories": [
         "Yes",
         "No",
         "Prefer not to say",
-        "Invalid"
+        "Invalid response"
       ],
       "guidance": {
         "Yes": "the respondent says that they have a disability (or, for a parent, that the child has one), including when they state it while answering another question",
         "No": "the respondent says there is none",
-        "Prefer not to say": "the respondent declines to answer ('skip', 'do not want to say')",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "provisional": true,
       "sensitive": true
     },
     {
       "name": "disability_type",
-      "kind": "free_text",
-      "description": "The kind of disability the respondent has (free text, for example 'visual impairment', 'hearing impairment', 'locomotor disability'), only when disability is Yes and the respondent names the kind. No list of types is defined yet.",
-      "provisional": true,
-      "sensitive": true
+      "kind": "category",
+      "description": "The kind of disability the respondent has, only when disability is Yes. When there are several kinds, list each one.",
+      "categories": [
+        "Physical disability",
+        "Intellectual disability",
+        "Others",
+        "Prefer not to say",
+        "Invalid response"
+      ],
+      "guidance": {
+        "Physical disability": "any locomotor, visual or hearing disability, and speech impairments",
+        "Intellectual disability": "any cognitive impairment, specific learning disability, autism spectrum disorder or psychological disability",
+        "Others": "a valid disability that fits neither",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+      },
+      "sensitive": true,
+      "multi": true,
+      "applies_when": {
+        "field": "disability",
+        "in": [
+          "Yes"
+        ]
+      }
     }
   ],
   "pii": {
@@ -1608,7 +1887,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
   ],
   "llm": {}
 }
-$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
+$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid)
   AND NOT EXISTS (SELECT 1 FROM config_version WHERE config_id = '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid)
 ON CONFLICT (config_id, version) DO NOTHING;
@@ -1626,13 +1905,13 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
   "schema_version": 1,
   "persona": "Parent",
   "session_type": "Parent_Voice",
-  "source_note": "Fields are the DOTS metadata columns of the persona. Category sets come from the Katha stories (still Draft); fields marked provisional wait for product confirmation, sensitive fields are filled only when the respondent states them explicitly. Districts are free text without a reference list.",
+  "source_note": "Fields are the DOTS metadata columns of the persona. The category lists are the data team's finalised lists (1MV dashboard requirements sheet) in the engine's normalised spellings; Not answered and N/A are written by the engine and are not listed. Fields with `versions` exist in those questionnaire versions only (N/A otherwise); a field with `applies_when` is N/A unless the earlier field holds one of the listed values; `multi` fields may hold several categories. Sensitive fields are filled only when the respondent states them explicitly.",
   "prompt_name": "Feedback Metadata Extraction - Parent",
   "fields": [
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent's child (or, where the bot asked the parent's own state, the respondent) lives in, as answered to the bot's state question. Map spelling variants and abbreviations to the official name; never infer a state from a district, a language or a city. A place that is not an Indian state or union territory does not fit any allowed value.",
+      "description": "The Indian state or union territory the respondent's child (or, where the bot asked the parent's own state, the respondent) lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -1665,73 +1944,170 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
         "Andaman and Nicobar Islands",
         "Chandigarh",
         "Dadra and Nagar Haveli and Daman and Diu",
-        "Delhi (NCT)",
+        "Delhi",
         "Jammu and Kashmir",
         "Ladakh",
         "Lakshadweep",
-        "Puducherry"
+        "Puducherry",
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
       ],
       "guidance": {
-        "Andaman and Nicobar Islands": "also Andaman, Nicobar, A&N Islands",
-        "Dadra and Nagar Haveli and Daman and Diu": "also Dadra and Nagar Haveli, Daman, Diu, Silvassa",
-        "Delhi (NCT)": "also Delhi, New Delhi, NCT of Delhi",
-        "Odisha": "also Orissa",
-        "Puducherry": "also Pondicherry",
-        "Uttarakhand": "also Uttaranchal",
-        "Telangana": "also Telengana",
-        "Jammu and Kashmir": "also J&K, Kashmir"
+        "Delhi": "Delhi, New Delhi, NCT of Delhi; 'Delhi/NCR' or 'NCR' when the district is a Delhi district or none is given",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      },
+      "aliases": {
+        "Delhi": [
+          "New Delhi",
+          "NCT",
+          "NCT of Delhi",
+          "National Capital Territory of Delhi",
+          "Delhi NCT",
+          "Delhi NCR",
+          "Delhi/NCR",
+          "NCR",
+          "Dilli"
+        ],
+        "Odisha": [
+          "Orissa"
+        ],
+        "Puducherry": [
+          "Pondicherry",
+          "Pondy"
+        ],
+        "Uttarakhand": [
+          "Uttaranchal"
+        ],
+        "Telangana": [
+          "Telengana"
+        ],
+        "Tamil Nadu": [
+          "Tamilnadu",
+          "TN"
+        ],
+        "Uttar Pradesh": [
+          "UP",
+          "U.P."
+        ],
+        "Madhya Pradesh": [
+          "MP",
+          "M.P."
+        ],
+        "West Bengal": [
+          "WB",
+          "Bengal"
+        ],
+        "Jammu and Kashmir": [
+          "J&K",
+          "J and K",
+          "Jammu & Kashmir",
+          "Kashmir"
+        ],
+        "Andaman and Nicobar Islands": [
+          "Andaman",
+          "Nicobar",
+          "A&N Islands",
+          "Andaman & Nicobar Islands"
+        ],
+        "Dadra and Nagar Haveli and Daman and Diu": [
+          "Dadra and Nagar Haveli",
+          "Daman and Diu",
+          "Daman",
+          "Diu",
+          "Silvassa",
+          "Dadra & Nagar Haveli",
+          "Daman & Diu"
+        ]
       }
     },
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent's child attends school in (or, where the bot asked the parent's own district, the district the respondent lives in) (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name."
+      "description": "The district the respondent's child attends school in (or, where the bot asked the parent's own district, the district the respondent lives in) (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "categories": [
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
+      ],
+      "guidance": {
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      }
     },
     {
       "name": "child_gender",
       "kind": "category",
-      "description": "The gender of the respondent's CHILD, not of the parent (boy maps to Male, girl to Female), as answered to the bot's question about the child.",
+      "description": "The gender of the respondent's CHILD, not of the parent (boy maps to Male, girl to Female), as answered to the bot's question about the child. A parent of several children gets every gender that applies, once each.",
       "categories": [
         "Male",
         "Female",
         "Others",
         "Prefer not to say",
-        "Invalid"
+        "Invalid response",
+        "Unsure / don't know"
       ],
       "guidance": {
         "Male": "boy, man, male",
         "Female": "girl, woman, female",
         "Others": "a valid gender that is not male or female, for example non-binary, transgender, 'something else'",
-        "Prefer not to say": "the respondent declines or skips the question ('skip', 'do not want to say', 'not sure')",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unsure / don't know": "the respondent says they are unsure of their gender identity or do not know which option to choose"
       },
-      "provisional": true
+      "multi": true
     },
     {
       "name": "disability",
       "kind": "category",
-      "description": "Whether the respondent's CHILD has a disability, as answered to the bot's disability question (or stated explicitly anywhere else in the conversation).",
+      "description": "Whether the respondent's CHILD has a disability, as answered to the bot's disability question (or stated explicitly anywhere else in the conversation). If the respondent names a disability instead of answering yes or no, it is Yes.",
       "categories": [
         "Yes",
         "No",
         "Prefer not to say",
-        "Invalid"
+        "Invalid response"
       ],
       "guidance": {
         "Yes": "the respondent says that they have a disability (or, for a parent, that the child has one), including when they state it while answering another question",
         "No": "the respondent says there is none",
-        "Prefer not to say": "the respondent declines to answer ('skip', 'do not want to say')",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "provisional": true,
       "sensitive": true
     },
     {
       "name": "disability_type",
-      "kind": "free_text",
-      "description": "The kind of disability the respondent's CHILD has (free text, for example 'visual impairment', 'hearing impairment', 'locomotor disability'), only when disability is Yes and the respondent names the kind. No list of types is defined yet.",
-      "provisional": true,
-      "sensitive": true
+      "kind": "category",
+      "description": "The kind of disability the respondent's CHILD has, only when disability is Yes. When there are several kinds, list each one.",
+      "categories": [
+        "Physical disability",
+        "Intellectual disability",
+        "Others",
+        "Prefer not to say",
+        "Invalid response"
+      ],
+      "guidance": {
+        "Physical disability": "any locomotor, visual or hearing disability, and speech impairments",
+        "Intellectual disability": "any cognitive impairment, specific learning disability, autism spectrum disorder or psychological disability",
+        "Others": "a valid disability that fits neither",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+      },
+      "sensitive": true,
+      "multi": true,
+      "applies_when": {
+        "field": "disability",
+        "in": [
+          "Yes"
+        ]
+      }
     },
     {
       "name": "respondent_relationship",
@@ -1740,54 +2116,77 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
       "categories": [
         "Mother",
         "Father",
-        "Guardian"
+        "Guardian",
+        "Other relative",
+        "Unmapped",
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
         "Mother": "the child's mother",
         "Father": "the child's father",
-        "Guardian": "any other caregiver (grandparent, aunt, uncle, older sibling, legal guardian)"
-      },
-      "provisional": true
+        "Guardian": "the respondent explicitly says they are the child's guardian",
+        "Other relative": "any other family relationship, such as an aunt, uncle or grandparent",
+        "Unmapped": "the respondent says 'parent' or 'parents' without saying which one",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+      }
     },
     {
       "name": "school_type",
       "kind": "category",
-      "description": "The type of school the respondent's child studies in (government or private), as answered to the bot's school question.",
+      "description": "The type of school the respondent's child studies in, as answered to the bot's school question. An international school or a board, home schooling and open schooling are Others. If the answer is about a college (the question is about schools), it is Invalid response. An aided school is Others.",
       "categories": [
         "Government",
         "Private",
         "Others",
-        "Invalid"
+        "Not sure",
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
-        "Government": "government or state-run school, college or institution",
-        "Private": "private school, college or institution",
-        "Others": "any other kind of institution the respondent names (for example madrasa, open school, home schooling)",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "provisional": true
+        "Government": "government, govt or public (state-run school or institution)",
+        "Private": "private school or institution",
+        "Others": "any institution beyond the listed ones: home schooling, international, open schooling; also a government-aided school",
+        "Not sure": "the respondent says they are not sure of the institution type or do not know",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question, or an answer about a college (the question is about schools)"
+      }
     },
     {
       "name": "child_grade",
       "kind": "category",
-      "description": "The class the respondent's CHILD studies in, as a band. Only the older questionnaire asks it: empty when never asked. A class given as a word ('fifth', '5th') is the number. Several children in different bands, or a class that fits no band (for example nursery), fit no band (value null, put the words in raw).",
+      "description": "The class the respondent's CHILD studies in, as a band. Only the older questionnaire asks it. A class given as a word ('fifth', '5th') is the number. A parent of several children gets every band that applies, once each. A child who dropped out gets the last COMPLETED level; a child who is not in school and has no further detail is Out of school.",
       "categories": [
-        "Primary (Classes 1-5)",
-        "Middle (Classes 6-8)",
-        "Secondary (Classes 9-10)",
-        "Higher Secondary (Classes 11-12)",
-        "College/University",
-        "Other"
+        "Pre-primary",
+        "Primary (classes 1-5)",
+        "Middle (classes 6-8)",
+        "High school (classes 9-12)",
+        "Undergraduate/postgraduate",
+        "Skill programs",
+        "Others",
+        "Prefer not to say",
+        "Invalid response",
+        "Unsure / don't know",
+        "Out of school / not currently enrolled"
       ],
       "guidance": {
-        "Primary (Classes 1-5)": "classes 1 to 5",
-        "Middle (Classes 6-8)": "classes 6 to 8",
-        "Secondary (Classes 9-10)": "classes 9 and 10",
-        "Higher Secondary (Classes 11-12)": "classes 11 and 12",
-        "College/University": "any degree or college course",
-        "Other": "out of school, not studying, home schooling"
+        "Pre-primary": "nursery, LKG, UKG, kindergarten and other pre-primary education",
+        "Primary (classes 1-5)": "classes 1 to 5",
+        "Middle (classes 6-8)": "classes 6 to 8",
+        "High school (classes 9-12)": "classes 9 to 12",
+        "Undergraduate/postgraduate": "bachelor's and master's degrees",
+        "Skill programs": "ITI, polytechnic, vocational programmes",
+        "Others": "a valid education category that is none of these, such as home schooling, alternative education, doctoral programmes",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unsure / don't know": "the respondent says they are unsure of the grade or do not know",
+        "Out of school / not currently enrolled": "the respondent says the child dropped out or does not go to school, with no further detail"
       },
-      "provisional": true
+      "multi": true,
+      "versions": [
+        "V1"
+      ]
     },
     {
       "name": "parent_education",
@@ -1795,41 +2194,47 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
       "description": "Whether the RESPONDENT (the parent or guardian, not the child) went to school or college, as answered to the bot's question about their own education.",
       "categories": [
         "Yes",
-        "No"
+        "No",
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
         "Yes": "the respondent went to school or college",
-        "No": "the respondent never went to school"
-      },
-      "provisional": true
+        "No": "the respondent says they never went to school",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+      }
     },
     {
       "name": "parent_education_level",
       "kind": "category",
-      "description": "How far the RESPONDENT (the parent or guardian, not the child) studied, as a band: the highest level reached. When parent_education is No, this is 'Did Not Go to School'. A parent who says yes without a level has no level (value null, put the words in raw).",
+      "description": "How far the RESPONDENT (the parent or guardian, not the child) studied, as a band: the highest level COMPLETED (a parent who dropped out of a BA completed class 12: High school). When parent_education is No, this is 'Did not go to school'.",
       "categories": [
-        "Did Not Go to School",
-        "Primary",
-        "Middle",
-        "Secondary",
-        "Higher Secondary",
-        "Undergraduate",
-        "Postgraduate",
+        "Pre-primary",
+        "Primary (classes 1-5)",
+        "Middle (classes 6-8)",
+        "High school (classes 9-12)",
+        "Undergraduate/postgraduate",
+        "Skill programs",
         "Others",
-        "Invalid"
+        "Prefer not to say",
+        "Invalid response",
+        "Unsure / don't know",
+        "Did not go to school"
       ],
       "guidance": {
-        "Did Not Go to School": "never went to school",
-        "Primary": "studied up to class 5",
-        "Middle": "studied up to class 8",
-        "Secondary": "studied up to class 10",
-        "Higher Secondary": "studied up to class 12",
-        "Undergraduate": "any bachelor's degree (for example BA, BCom, BSc, BCA, BE)",
-        "Postgraduate": "any master's degree (for example MA, MSc, MBA, MCA)",
-        "Others": "PhD, diploma, vocational training, skill certification",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "provisional": true
+        "Pre-primary": "nursery, LKG, UKG, kindergarten and other pre-primary education",
+        "Primary (classes 1-5)": "classes 1 to 5",
+        "Middle (classes 6-8)": "classes 6 to 8",
+        "High school (classes 9-12)": "classes 9 to 12",
+        "Undergraduate/postgraduate": "bachelor's and master's degrees",
+        "Skill programs": "ITI, polytechnic, vocational programmes",
+        "Others": "a valid education category that is none of these, such as home schooling, alternative education, doctoral programmes",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unsure / don't know": "the respondent says they are unsure of the grade or do not know",
+        "Did not go to school": "never went to school"
+      }
     }
   ],
   "pii": {
@@ -1923,7 +2328,7 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
   ],
   "llm": {}
 }
-$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
+$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid)
   AND NOT EXISTS (SELECT 1 FROM config_version WHERE config_id = '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid)
 ON CONFLICT (config_id, version) DO NOTHING;
@@ -1941,17 +2346,9 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
   "schema_version": 1,
   "persona": "General Public",
   "session_type": "General_Public_Voice",
-  "source_note": "Fields are the DOTS metadata columns of the persona. Category sets come from the Katha stories (still Draft); fields marked provisional wait for product confirmation, sensitive fields are filled only when the respondent states them explicitly. Districts are free text without a reference list.",
+  "source_note": "Fields are the DOTS metadata columns of the persona. The category lists are the data team's finalised lists (1MV dashboard requirements sheet) in the engine's normalised spellings; Not answered and N/A are written by the engine and are not listed. Fields with `versions` exist in those questionnaire versions only (N/A otherwise); a field with `applies_when` is N/A unless the earlier field holds one of the listed values; `multi` fields may hold several categories. Sensitive fields are filled only when the respondent states them explicitly.",
   "prompt_name": "Feedback Metadata Extraction - General Public",
   "fields": [
-    {
-      "name": "age",
-      "kind": "integer",
-      "description": "The age in whole years of the respondent, as a number. Use the number the respondent states; do not compute an age from a class, a birth year or a date of birth, and do not round a stated age. An age given as a range, or a number that cannot be an age, is not a value (put the words in raw).",
-      "min": 5,
-      "max": 100,
-      "provisional": true
-    },
     {
       "name": "gender",
       "kind": "category",
@@ -1961,21 +2358,71 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
         "Female",
         "Others",
         "Prefer not to say",
-        "Invalid"
+        "Invalid response",
+        "Unsure / don't know"
       ],
       "guidance": {
         "Male": "boy, man, male",
         "Female": "girl, woman, female",
         "Others": "a valid gender that is not male or female, for example non-binary, transgender, 'something else'",
-        "Prefer not to say": "the respondent declines or skips the question ('skip', 'do not want to say', 'not sure')",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unsure / don't know": "the respondent says they are unsure of their gender identity or do not know which option to choose"
+      }
+    },
+    {
+      "name": "age",
+      "kind": "integer",
+      "description": "The age of the respondent in years, as a number. Use the number the respondent states (decimals such as 15.5 are valid; 'around 16' is 16); do not compute an age from a class, a birth year or a date of birth. A stated range that lies inside one band is a number inside it; a range that spans two or more bands is Unclear.",
+      "categories": [
+        "Prefer not to say",
+        "Unclear",
+        "Invalid response"
+      ],
+      "guidance": {
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unclear": "a range that spans two or more bands, or a vague answer such as 'thirty something'",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "provisional": true
+      "min": 0,
+      "max": 120,
+      "bands": [
+        {
+          "label": "< 12",
+          "min": null,
+          "max": 12
+        },
+        {
+          "label": "≥ 12 and < 26",
+          "min": 12,
+          "max": 26
+        },
+        {
+          "label": "≥ 26 and < 36",
+          "min": 26,
+          "max": 36
+        },
+        {
+          "label": "≥ 36 and < 46",
+          "min": 36,
+          "max": 46
+        },
+        {
+          "label": "≥ 46 and < 60",
+          "min": 46,
+          "max": 60
+        },
+        {
+          "label": "≥ 60",
+          "min": 60,
+          "max": null
+        }
+      ]
     },
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants and abbreviations to the official name; never infer a state from a district, a language or a city. A place that is not an Indian state or union territory does not fit any allowed value.",
+      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -2008,27 +2455,103 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
         "Andaman and Nicobar Islands",
         "Chandigarh",
         "Dadra and Nagar Haveli and Daman and Diu",
-        "Delhi (NCT)",
+        "Delhi",
         "Jammu and Kashmir",
         "Ladakh",
         "Lakshadweep",
-        "Puducherry"
+        "Puducherry",
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
       ],
       "guidance": {
-        "Andaman and Nicobar Islands": "also Andaman, Nicobar, A&N Islands",
-        "Dadra and Nagar Haveli and Daman and Diu": "also Dadra and Nagar Haveli, Daman, Diu, Silvassa",
-        "Delhi (NCT)": "also Delhi, New Delhi, NCT of Delhi",
-        "Odisha": "also Orissa",
-        "Puducherry": "also Pondicherry",
-        "Uttarakhand": "also Uttaranchal",
-        "Telangana": "also Telengana",
-        "Jammu and Kashmir": "also J&K, Kashmir"
+        "Delhi": "Delhi, New Delhi, NCT of Delhi; 'Delhi/NCR' or 'NCR' when the district is a Delhi district or none is given",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      },
+      "aliases": {
+        "Delhi": [
+          "New Delhi",
+          "NCT",
+          "NCT of Delhi",
+          "National Capital Territory of Delhi",
+          "Delhi NCT",
+          "Delhi NCR",
+          "Delhi/NCR",
+          "NCR",
+          "Dilli"
+        ],
+        "Odisha": [
+          "Orissa"
+        ],
+        "Puducherry": [
+          "Pondicherry",
+          "Pondy"
+        ],
+        "Uttarakhand": [
+          "Uttaranchal"
+        ],
+        "Telangana": [
+          "Telengana"
+        ],
+        "Tamil Nadu": [
+          "Tamilnadu",
+          "TN"
+        ],
+        "Uttar Pradesh": [
+          "UP",
+          "U.P."
+        ],
+        "Madhya Pradesh": [
+          "MP",
+          "M.P."
+        ],
+        "West Bengal": [
+          "WB",
+          "Bengal"
+        ],
+        "Jammu and Kashmir": [
+          "J&K",
+          "J and K",
+          "Jammu & Kashmir",
+          "Kashmir"
+        ],
+        "Andaman and Nicobar Islands": [
+          "Andaman",
+          "Nicobar",
+          "A&N Islands",
+          "Andaman & Nicobar Islands"
+        ],
+        "Dadra and Nagar Haveli and Daman and Diu": [
+          "Dadra and Nagar Haveli",
+          "Daman and Diu",
+          "Daman",
+          "Diu",
+          "Silvassa",
+          "Dadra & Nagar Haveli",
+          "Daman & Diu"
+        ]
       }
     },
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name."
+      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "categories": [
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
+      ],
+      "guidance": {
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      }
     },
     {
       "name": "occupation",
@@ -2044,21 +2567,30 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
         "Retail and trade",
         "NGO or social sector",
         "Others",
-        "Invalid"
+        "Not currently working",
+        "Homemaker",
+        "Student",
+        "Prefer not to say",
+        "Unclear",
+        "Invalid response"
       ],
       "guidance": {
-        "Education": "teacher, lecturer, tutor, school or college staff",
-        "Health": "doctor, nurse, ASHA or anganwadi worker, pharmacist, hospital staff",
-        "Government and public services": "administration, police, defence, railways, utilities, other government office jobs (a teacher or nurse goes to Education or Health, the sector wins)",
-        "IT and services": "software, IT, BPO, banking, consulting, other office services",
-        "Manufacturing": "factory, mill, construction or workshop work",
-        "Agriculture": "farmer, farm worker, dairy, fishing",
-        "Retail and trade": "shop, trader, vendor, delivery, sales",
-        "NGO or social sector": "NGO, social worker, community organisation",
-        "Others": "any other occupation or status (homemaker, student, retired, unemployed, driver, artist, daily wage)",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "provisional": true
+        "Education": "teacher, tutor, anganwadi teacher, lecturer, school or college staff",
+        "Health": "doctor, nurse, dentist, healthcare assistant, ASHA worker, pharmacist, hospital staff",
+        "Government and public services": "government employee, civil servant, IAS, IPS, government officer, police, traffic police, army, navy, air force",
+        "IT and services": "developer, designer, IT support, software, BPO",
+        "Manufacturing": "factory worker, assembly line worker, textile or garment factory worker, automobile worker",
+        "Agriculture": "farmer, anything to do with farming, dairy, fishing",
+        "Retail and trade": "shopkeeper, retail salesperson, shop assistant, store manager, vendor, business owner",
+        "NGO or social sector": "NGO employee, social worker, community mobiliser, field coordinator, programme manager at an NGO, CSR professional",
+        "Others": "a valid occupation that fits none of the sectors, for example actor, musician, content creator, driver, electrician, tailor, construction or daily-wage worker, domestic worker, retired",
+        "Not currently working": "between jobs, looking for work, unemployed",
+        "Homemaker": "managing the household or caregiving as the main activity",
+        "Student": "in school, studying, in college",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unclear": "some information but not enough to tell the occupation or sector ('I work somewhere', 'I work in a private company')",
+        "Invalid response": "gibberish, nonsensical or irrelevant"
+      }
     }
   ],
   "pii": {
@@ -2152,7 +2684,7 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
   ],
   "llm": {}
 }
-$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
+$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid)
   AND NOT EXISTS (SELECT 1 FROM config_version WHERE config_id = '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid)
 ON CONFLICT (config_id, version) DO NOTHING;
@@ -2170,13 +2702,13 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
   "schema_version": 1,
   "persona": "Educator",
   "session_type": "Educator_Voice",
-  "source_note": "Fields are the DOTS metadata columns of the persona. Category sets come from the Katha stories (still Draft); fields marked provisional wait for product confirmation, sensitive fields are filled only when the respondent states them explicitly. Districts are free text without a reference list.",
+  "source_note": "Fields are the DOTS metadata columns of the persona. The category lists are the data team's finalised lists (1MV dashboard requirements sheet) in the engine's normalised spellings; Not answered and N/A are written by the engine and are not listed. Fields with `versions` exist in those questionnaire versions only (N/A otherwise); a field with `applies_when` is N/A unless the earlier field holds one of the listed values; `multi` fields may hold several categories. Sensitive fields are filled only when the respondent states them explicitly.",
   "prompt_name": "Feedback Metadata Extraction - Educator",
   "fields": [
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants and abbreviations to the official name; never infer a state from a district, a language or a city. A place that is not an Indian state or union territory does not fit any allowed value.",
+      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -2209,27 +2741,103 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
         "Andaman and Nicobar Islands",
         "Chandigarh",
         "Dadra and Nagar Haveli and Daman and Diu",
-        "Delhi (NCT)",
+        "Delhi",
         "Jammu and Kashmir",
         "Ladakh",
         "Lakshadweep",
-        "Puducherry"
+        "Puducherry",
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
       ],
       "guidance": {
-        "Andaman and Nicobar Islands": "also Andaman, Nicobar, A&N Islands",
-        "Dadra and Nagar Haveli and Daman and Diu": "also Dadra and Nagar Haveli, Daman, Diu, Silvassa",
-        "Delhi (NCT)": "also Delhi, New Delhi, NCT of Delhi",
-        "Odisha": "also Orissa",
-        "Puducherry": "also Pondicherry",
-        "Uttarakhand": "also Uttaranchal",
-        "Telangana": "also Telengana",
-        "Jammu and Kashmir": "also J&K, Kashmir"
+        "Delhi": "Delhi, New Delhi, NCT of Delhi; 'Delhi/NCR' or 'NCR' when the district is a Delhi district or none is given",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      },
+      "aliases": {
+        "Delhi": [
+          "New Delhi",
+          "NCT",
+          "NCT of Delhi",
+          "National Capital Territory of Delhi",
+          "Delhi NCT",
+          "Delhi NCR",
+          "Delhi/NCR",
+          "NCR",
+          "Dilli"
+        ],
+        "Odisha": [
+          "Orissa"
+        ],
+        "Puducherry": [
+          "Pondicherry",
+          "Pondy"
+        ],
+        "Uttarakhand": [
+          "Uttaranchal"
+        ],
+        "Telangana": [
+          "Telengana"
+        ],
+        "Tamil Nadu": [
+          "Tamilnadu",
+          "TN"
+        ],
+        "Uttar Pradesh": [
+          "UP",
+          "U.P."
+        ],
+        "Madhya Pradesh": [
+          "MP",
+          "M.P."
+        ],
+        "West Bengal": [
+          "WB",
+          "Bengal"
+        ],
+        "Jammu and Kashmir": [
+          "J&K",
+          "J and K",
+          "Jammu & Kashmir",
+          "Kashmir"
+        ],
+        "Andaman and Nicobar Islands": [
+          "Andaman",
+          "Nicobar",
+          "A&N Islands",
+          "Andaman & Nicobar Islands"
+        ],
+        "Dadra and Nagar Haveli and Daman and Diu": [
+          "Dadra and Nagar Haveli",
+          "Daman and Diu",
+          "Daman",
+          "Diu",
+          "Silvassa",
+          "Dadra & Nagar Haveli",
+          "Daman & Diu"
+        ]
       }
     },
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent teaches in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name."
+      "description": "The district the respondent teaches in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "categories": [
+        "Prefer not to say",
+        "Unmapped",
+        "Invalid response",
+        "Outside India"
+      ],
+      "guidance": {
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Unmapped": "a place that does not identify one state / district: a direction, a region, a city, or a district name used in several states when no state is known",
+        "Invalid response": "names that sound like gibberish, or an answer that has nothing to do with the question",
+        "Outside India": "a place that is not in India"
+      }
     },
     {
       "name": "gender",
@@ -2240,60 +2848,66 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
         "Female",
         "Others",
         "Prefer not to say",
-        "Invalid"
+        "Invalid response",
+        "Unsure / don't know"
       ],
       "guidance": {
         "Male": "boy, man, male",
         "Female": "girl, woman, female",
         "Others": "a valid gender that is not male or female, for example non-binary, transgender, 'something else'",
-        "Prefer not to say": "the respondent declines or skips the question ('skip', 'do not want to say', 'not sure')",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "provisional": true
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
+        "Unsure / don't know": "the respondent says they are unsure of their gender identity or do not know which option to choose"
+      }
     },
     {
       "name": "institution_type",
       "kind": "category",
-      "description": "The type of institution the respondent teaches at (government, private or other), as answered to the bot's institution question.",
+      "description": "The type of institution the respondent teaches at, as answered to the bot's institution question. An international school or a board, home schooling and open schooling are Others. If the answer is about a college (the question is about schools), it is Invalid response. An aided school is Others.",
       "categories": [
         "Government",
         "Private",
         "Others",
-        "Invalid"
+        "Not sure",
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
-        "Government": "government or state-run school, college or institution",
-        "Private": "private school, college or institution",
-        "Others": "any other kind of institution the respondent names (for example madrasa, open school, home schooling)",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "provisional": true
+        "Government": "government, govt or public (state-run school or institution)",
+        "Private": "private school or institution",
+        "Others": "any institution beyond the listed ones: home schooling, international, open schooling; also a government-aided school",
+        "Not sure": "the respondent says they are not sure of the institution type or do not know",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question, or an answer about a college (the question is about schools)"
+      }
     },
     {
       "name": "teaching_level",
       "kind": "category",
-      "description": "The level the respondent teaches, as a band. The bot asks 'primary, middle, high school or college': 'primary' is Primary and 'middle' is Middle; 'high school' is Secondary or Higher Secondary only when the respondent names classes (9-10 or 11-12), and 'college' is Undergraduate or Postgraduate only when the respondent names the degree level. Otherwise, and when the respondent teaches several levels, the answer fits no band (value null, put the words in raw).",
+      "description": "The level the respondent teaches, as a band. The bot asks 'primary, middle, high school or college': 'primary' is Primary, 'middle' is Middle, 'high school' is High school; 'college' alone is Undergraduate, and Postgraduate only when the respondent names a master's level. A respondent who teaches several levels gets every band that applies, once each.",
       "categories": [
-        "Primary",
-        "Middle",
-        "Secondary",
-        "Higher Secondary",
+        "Pre-primary",
+        "Primary (classes 1-5)",
+        "Middle (classes 6-8)",
+        "High school (classes 9-12)",
         "Undergraduate",
         "Postgraduate",
         "Others",
-        "Invalid"
+        "Prefer not to say",
+        "Invalid response"
       ],
       "guidance": {
-        "Primary": "classes 1 to 5",
-        "Middle": "classes 6 to 8",
-        "Secondary": "classes 9 and 10",
-        "Higher Secondary": "classes 11 and 12",
-        "Undergraduate": "teaches bachelor's degree students",
-        "Postgraduate": "teaches master's degree students",
-        "Others": "any other level or setting (for example vocational training, skill certification, PhD)",
-        "Invalid": "a given answer that is gibberish or has nothing to do with the question"
+        "Pre-primary": "nursery, LKG, UKG, kindergarten and other pre-primary education",
+        "Primary (classes 1-5)": "classes 1 to 5",
+        "Middle (classes 6-8)": "classes 6 to 8",
+        "High school (classes 9-12)": "classes 9 to 12",
+        "Undergraduate": "teaches bachelor's degree students (for example BCom, BCA, BE)",
+        "Postgraduate": "teaches master's degree students (for example MBA, MCom)",
+        "Others": "a valid level that is none of these: vocational or skill training (ITI, polytechnic), tuitions, home schooling, alternative education, doctoral programmes",
+        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
+        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "provisional": true
+      "multi": true
     }
   ],
   "pii": {
@@ -2387,7 +3001,7 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
   ],
   "llm": {}
 }
-$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with bands from the Katha stories (fields marked provisional await product) and the persona''s own prompt'
+$cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid)
   AND NOT EXISTS (SELECT 1 FROM config_version WHERE config_id = '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid)
 ON CONFLICT (config_id, version) DO NOTHING;

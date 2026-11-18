@@ -11,6 +11,7 @@ import pytest
 from app.database.feedback_operations import detect_questionnaire_versions, set_questionnaire_version
 from app.database.operations import insert_or_update_submission
 from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS
+import factories
 import pg_support
 from test_feedback_versions_pg import _run
 
@@ -46,7 +47,7 @@ def _messages(questions, probe=True):
 async def _add(conn, questions, minutes, stamped="V1"):
     sid = f"d{uuid.uuid4().hex[:14]}"
     started = T0 + timedelta(minutes=minutes)
-    await insert_or_update_submission(conn, {
+    event = ({
         "submissionId": sid, "sessionId": f"sess-{uuid.uuid4().hex}", "submissionType": "feedback",
         "tenantCode": "mitra", "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
         "tags": {"programId": YOUTH["program_id"], "programName": FEEDBACK_PROGRAM_NAME,
@@ -56,6 +57,10 @@ async def _add(conn, questions, minutes, stamped="V1"):
                  "language": "en", "completionStatus": "COMPLETED", "submissionDate": started.isoformat(),
                  "messages": _messages(questions), "botId": YOUTH["bot_id"]},
     })
+    await insert_or_update_submission(conn, event)
+    # the sessions are stamped from windows here (detect reads the labels and the bot ids as evidence): a legacy
+    # session without a bot id, since a bot session's label is the rank of its bot id
+    await factories.as_window_stamped_session(conn, sid, stamped)
     return started
 
 
@@ -73,7 +78,8 @@ def test_detect_proposes_the_new_version_and_the_proposed_set_command_records_it
         assert set(found) == {"Youth_Voice"}
         proposal = youth["proposal"]
         assert proposal["key"] == "V2" and proposal["effective_from"] == change.isoformat()
-        assert proposal["bot_ids_before"] == [str(YOUTH["bot_id"])]        # evidence only: same bot id on both sides here
+        # the sessions are legacy ones without a bot id here (see _add): no bot-id evidence on either side
+        assert proposal["bot_ids_before"] == []
         assert proposal["bot_id_changed_at_start"] is False
         texts = {q["text"] for q in youth["new_questions"]}
         assert texts == {"How do you feel about school these days?", "Which job do you want?"}

@@ -225,9 +225,9 @@ def test_run_writes_rows_prints_aggregates_only_and_never_respondent_text(scratc
     assert result["submissions"] == {"selected": 4, "processed": 4, "failed": 0, "llm_calls": 3, "no_respondent_answer": 1,
                                      "oversized_respondent_message": 0, "conversation_too_long": 0}
     assert result["fields"]["state"]["status"] == {"extracted": 2, "not_provided": 1, "unmapped": 1}
-    assert result["fields"]["state"]["top_values"] == {"Karnataka": 2}
+    assert result["fields"]["state"]["top_values"] == {"Karnataka": 2, "Not answered": 1, "Unmapped": 1}     # a value is never empty
     assert result["fields"]["school_type"]["status"] == {"not_provided": 4}
-    assert result["fields"]["gender"]["top_values"] == {"Female": 3}
+    assert result["fields"]["gender"]["top_values"] == {"Female": 3, "Not answered": 1}
     # a free-text field: only the status counts and the NUMBER of distinct values, never the values the model copied
     assert result["fields"]["district"]["status"] == {"extracted": 3, "not_provided": 1}
     assert result["fields"]["district"]["distinct_values"] == 1 and "top_values" not in result["fields"]["district"]
@@ -304,7 +304,8 @@ def test_show_config_prints_the_active_versions_for_every_persona_or_one(seeded,
         assert entry["summary"]["prompt_name"] == seed["prompt_name"]
         assert entry["summary"]["fields"] == [
             {"name": f["name"], "kind": f["kind"], "sensitive": f.get("sensitive", False) is True,
-             "provisional": f.get("provisional", False) is True} for f in seed["fields"]]
+             "provisional": f.get("provisional", False) is True, "multi": f.get("multi", False) is True,
+             "versions": f.get("versions"), "applies_when": f.get("applies_when")} for f in seed["fields"]]
         assert [f["name"] for f in entry["config"]["fields"]] == [f["name"] for f in seed["fields"]]
         assert "categories" not in json.dumps(entry["summary"])           # the summary carries no band lists
     code, out, _ = _call(capsys, ["show-config", "--session-type", "Parent_Voice"])

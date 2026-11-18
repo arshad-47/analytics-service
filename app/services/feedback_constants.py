@@ -30,8 +30,12 @@ Kafka event for one session (eventType "create"; "update"/"delete" reuse the env
         "source": "mitra",                  # a free label, [a-z0-9_]{1,40}, that has an ACTIVE upload config
         "adapter": "conversation_rows",     # the adapter of that config: 'conversation_rows' | 'wide_form'; required
         "sessionType": "Youth_Voice",       # persona key of the export (config.session_type); required
-        "questionnaireVersion": "V2",       # stamped at ingest from the config's version windows; required
-        "botId": "101", "botName": "...",   # conversation_rows only, informational (recorded in meta_data, never matched)
+        "questionnaireVersion": "V2",       # stamped at upload from the config's version windows; required and validated; STORED as is
+                                            # for wide_form, but for conversation_rows the stored version is the rank of botId (below)
+        "botId": "101", "botName": "...",   # conversation_rows: botId REQUIRED, a positive integer written in digits (never matched against a
+                                            # config); the stored version is its rank among the bot ids of the persona (tenant, program,
+                                            # session_type, source), lowest = V1 (app/database/feedback_bot_versions.py). botName is only
+                                            # recorded. wide_form carries neither
         "sourceRef": "<natural key>",       # wide_form only (required there, absent or null for conversation_rows)
         "language": "hi",
         "completionStatus": "COMPLETED",    # 'COMPLETED' | 'IN_PROGRESS'

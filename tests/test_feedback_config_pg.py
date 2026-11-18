@@ -75,7 +75,7 @@ def _run(body):
 def _event(source="mitra", session_type=None):
     session_type = session_type or YOUTH["session_type"]
     sid = f"c{uuid.uuid4().hex[:14]}"
-    ref = {"sourceRef": f"2026-10-02T10:09:20|{uuid.uuid4().hex}"} if source == "google_forms" else {}
+    ref = {"sourceRef": f"2026-10-02T10:09:20|{uuid.uuid4().hex}"} if source == "google_forms" else {"botId": "101"}
     if source == "google_forms":
         sid = str(uuid.uuid4())
     return {

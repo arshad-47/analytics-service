@@ -22,7 +22,7 @@ fields (for a free-text field such as district only the number of distinct value
 the number of distinct values and the smallest and largest), PII counts and types, token usage, error types. Never
 conversation text, respondent answers, raw values or free-text values. Reads DATABASE_URL like the application does.
 `show-config` prints the active extraction config versions (configuration, no respondent data): per persona the
-prompt name ("(none)" for a config that names none: it cannot run) and every field with its kind and the sensitive / provisional
+prompt name ("(none)" for a config that names none: it cannot run) and every field with its kind and the sensitive / provisional / multi / versions / applies_when
 flags, plus the full config JSON. The seed of these configs is seed_config.sql (it never overwrites an existing
 database); an existing database gets new content through a NEW config_version (docs/feedback-extraction-bands.md,
 "Changing a band or a field").
@@ -30,6 +30,7 @@ database); an existing database gets new content through a NEW config_version (d
 import argparse
 import asyncio
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -43,6 +44,8 @@ from app.services.feedback_extraction import KIND_INTEGER, ExtractionOutputError
 from app.services.feedback_extraction_constants import (  # noqa: E402
     CONFIG_TYPE_FEEDBACK_EXTRACTION,
     KIND_CATEGORY,
+    KIND_FREE_TEXT,
+    STATUS_EXTRACTED,
 )
 
 NO_PROMPT_LABEL = "(none)"
@@ -113,7 +116,11 @@ def _add_outcome(agg: Dict[str, Any], outcome, top: int, values: Dict[str, Count
         entry = agg["fields"].setdefault(field.field_name, {"status": Counter(), "kinds": set()})
         entry["kinds"].add(outcome.field_kinds.get(field.field_name))
         entry["status"][field.status] += 1
-        if field.value is not None:   # counted here; whether any value is printed is decided in _finish
+        # Counted here; whether any value is printed is decided in _finish. A value is never empty now ('Not answered',
+        # 'N/A' ...), so a free-text or whole-number field counts only what was really extracted (words / numbers of the
+        # respondent), and every other kind holds config labels only.
+        if field.value is not None and (outcome.field_kinds.get(field.field_name) not in (KIND_FREE_TEXT, KIND_INTEGER)
+                                        or field.status == STATUS_EXTRACTED):
             values.setdefault(field.field_name, Counter())[field.value] += 1
     pii = agg["pii"]
     if outcome.run.result.pii_detected:
@@ -153,8 +160,9 @@ def _finish(agg: Dict[str, Any], top: int, values: Dict[str, Counter]) -> Dict[s
         if kind == KIND_CATEGORY:
             entry["top_values"] = dict(counter.most_common(top))
         elif kind == KIND_INTEGER and len(counter) > 0:
-            numbers = [int(v) for v in counter]
-            entry["min_value"], entry["max_value"] = min(numbers), max(numbers)
+            numbers = [int(v) for v in counter if re.fullmatch(r"-?\d+", v) is not None]   # the labels are no numbers
+            if len(numbers) > 0:
+                entry["min_value"], entry["max_value"] = min(numbers), max(numbers)
         # Every other kind (free text such as district; an unknown kind) holds what the model copied from the
         # respondent: only the number of distinct values and the status counts are printed, never the values.
         # An integer field (age) prints the distinct count and the smallest and largest value only.
@@ -194,7 +202,7 @@ async def _run(args) -> Dict[str, Any]:
 
 def summarise_config(config: Any) -> Dict[str, Any]:
     """
-    {"prompt_name": <name or "(none)">, "fields": [{"name", "kind", "sensitive", "provisional"}, ...]} of a stored
+    {"prompt_name": <name or "(none)">, "fields": [{"name", "kind", "sensitive", "provisional", "multi", "versions", "applies_when"}, ...]} of a stored
     config JSON, read leniently (a malformed config is still shown, with what can be read); no band lists.
     """
     name = config.get("prompt_name") if isinstance(config, dict) else None
@@ -204,7 +212,9 @@ def summarise_config(config: Any) -> Dict[str, Any]:
         if not isinstance(item, dict):
             continue
         summary.append({"name": item.get("name"), "kind": item.get("kind"),
-                        "sensitive": item.get("sensitive") is True, "provisional": item.get("provisional") is True})
+                        "sensitive": item.get("sensitive") is True, "provisional": item.get("provisional") is True,
+                        "multi": item.get("multi") is True, "versions": item.get("versions"),
+                        "applies_when": item.get("applies_when")})
     return {"prompt_name": name if isinstance(name, str) else NO_PROMPT_LABEL, "fields": summary}
 
 

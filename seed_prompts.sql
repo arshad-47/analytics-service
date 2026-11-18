@@ -872,7 +872,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 
 - Each line is one message: [sequence] Bot: ... or [sequence] Respondent: ... . Only the Respondent lines carry facts about the respondent. A Bot line only tells you what was asked.
 - The questions about the respondent''s background (the fields listed below) may come at the start, in the middle or at the end, and may be answered after a follow-up question. Read the whole conversation before you answer.
-- Use only what the respondent explicitly said. Do not guess or infer: never infer gender from a name, a state from a language, or a district from a state.
+- Use only what the respondent explicitly said. Do not guess or infer: never infer gender from a name or a state from a language. A state may be derived from a named district only as the state field describes.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer.
 - If the respondent never answered the question for a field, the field is not provided.
 
@@ -881,10 +881,10 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 {{fields}}
 
 For each field return an object with:
-- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list; for a free-text field, the normalised text. null when the respondent did not answer.
+- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list (for a field marked "one or more", a JSON list of allowed values); for a whole-number field, the number the respondent states in digits (decimals allowed) or one of its special answers; for a free-text field, the normalised text or one of its special answers. null when the respondent did not answer (skipped, or the question was never asked).
 - "raw": the respondent''s own words for this field, trimmed and short. null when the respondent did not answer.
 - "confidence": optional, a number from 0 to 1, or null.
-When the respondent answered but their answer fits none of the allowed values, set "value" to null and put their words in "raw". Never invent a value that is not in the list.
+When the respondent answered but their answer fits none of the allowed values, use the field''s "Others" value (a valid answer that is not listed) or "Invalid response" value (gibberish, or nothing to do with the question) when the field has them; otherwise set "value" to null and put their words in "raw". Never invent a value that is not in the list. "Not answered" and "N/A" are never returned by you: use null.
 
 ## PII check (whole conversation)
 
@@ -944,7 +944,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 
 - Each line is one message: [sequence] Bot: ... or [sequence] Respondent: ... . Only the Respondent lines carry facts about the respondent. A Bot line only tells you what was asked.
 - The background questions may come at the start, in the middle or at the end, may be answered after a follow-up question, and one answer can fill several fields. Read the whole conversation before you answer.
-- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language, a city or a district, not a district from a state.
+- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language or a city, not a district from a state. A state may be derived from a district the respondent names, only as the state field describes.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer. Count an answer given to a follow-up question.
 - The respondent never answered the question for a field, or the bot never asked it: "value" null and "raw" null (not provided). The respondent answered but the answer fits no allowed value (or no band): "value" null and "raw" filled with their words. Never invent a value that is not allowed. A placeholder such as "N/A" or "not sure" is not a value for a free-text field.
 
@@ -953,19 +953,21 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 {{fields}}
 
 For each field return an object with:
-- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list; for a whole-number field, the number in digits only; for a free-text field, the normalised text. null when not provided or when nothing fits.
+- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list (for a field marked "one or more", a JSON list of allowed values); for a whole-number field, the number the respondent states in digits (decimals allowed) or one of its special answers; for a free-text field, the normalised text or one of its special answers. null when the respondent did not answer (skipped, or the question was never asked).
 - "raw": the respondent''s own words for this field, trimmed and short. null when the respondent did not answer.
 - "confidence": optional, a number from 0 to 1, or null.
 
 ## Rules for this persona
 
-- age: the number the respondent states as their own age, in digits. A class, a birth year or "I am in college" is not an age. If an age is given only inside another answer, still use it.
-- gender: map the respondent''s words with the guidance above; "skip" or "do not want to say" is Prefer not to say.
-- current_activity_status: what they do NOW. A student who also works: the main thing they say first. Preparing for an exam as a student is Studying.
-- education_level and course_details: only for a respondent who studies; the class as a number ("9"), or the year or level for college, and the stream or course in a few words. Not asked or not named: null.
-- institution_type: the kind of school or college they study or studied in. A working respondent is also asked: use their answer about their past school.
-- monthly_household_income: always MONTHLY. Work out the monthly amount of the household income, then pick the band. If the respondent says per year, annual, yearly or a lakh a year, or the bot''s question asked for the annual or yearly income, divide by 12 first (for example 3 lakh a year is 25,000 a month). If they say per month, use it as is. The period the respondent states wins over the period the bot asked. A range that spans two bands, an amount per week or day, or an amount whose period is unclear: value null, words in raw. "I do not know" is Don''t know. Fill it only when the respondent gave an amount.
-- disability: Yes only when the respondent says they (not someone else) have a disability, in answer to the question or anywhere else; No, Prefer not to say as in the guidance. disability_type: only when disability is Yes and they name the kind; otherwise null and null.
+- Only the fields listed above are asked in this questionnaire version: ignore any rule below about a field that is not listed.
+- age: the number the respondent states as their own age, in digits; decimals such as 15.5 are valid. A class, a birth year or "I am in college" is not an age. If an age is given only inside another answer, still use it. A range that spans more than one band or a vague answer ("thirty something") is Unclear.
+- gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
+- state and district: follow the field text, including how "Delhi/NCR" and a named district are handled.
+- current_activity_status: what they do NOW. A student who also works (for example part time) gets both Studying and Working, as a JSON list. Someone who dropped out or is not enrolled anywhere is Not currently studying. Preparing for an exam as a student is Studying.
+- education_level and course_details: only for a respondent who studies; if the bot never asked, null. A dropout gets the last COMPLETED level. course_details uses only the values of the respondent''s education level.
+- institution_type: the kind of school or institution they study or studied in. A working respondent is also asked: use their answer about their past school. An answer about a college is Invalid response (the question is about schools).
+- monthly_household_income and annual_household_income: work out the amount for the period of the field (MONTHLY or YEARLY), then pick the band. If the respondent states another period, convert first (for example 3 lakh a year is 25,000 a month). The period the respondent states wins over the period the bot asked. A range that spans two bands, an amount per week or day, or an amount whose period is unclear: Unclear. "I do not know" is Don''t know. Fill it only when the respondent states it.
+- disability: Yes only when the respondent says they (not someone else) have a disability, in answer to the question or anywhere else; No, Prefer not to say as in the guidance. disability_type: the kinds they name (a JSON list when several); otherwise null.
 
 ## PII check (whole conversation)
 
@@ -1013,7 +1015,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 
 - Each line is one message: [sequence] Bot: ... or [sequence] Respondent: ... . Only the Respondent lines carry facts about the respondent. A Bot line only tells you what was asked.
 - The background questions may come at the start, in the middle or at the end, may be answered after a follow-up question, and one answer can fill several fields. Read the whole conversation before you answer.
-- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language, a city or a district, not a district from a state.
+- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language or a city, not a district from a state. A state may be derived from a district the respondent names, only as the state field describes.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer. Count an answer given to a follow-up question.
 - The respondent never answered the question for a field, or the bot never asked it: "value" null and "raw" null (not provided). The respondent answered but the answer fits no allowed value (or no band): "value" null and "raw" filled with their words. Never invent a value that is not allowed. A placeholder such as "N/A" or "not sure" is not a value for a free-text field.
 
@@ -1022,15 +1024,16 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 {{fields}}
 
 For each field return an object with:
-- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list; for a whole-number field, the number in digits only; for a free-text field, the normalised text. null when not provided or when nothing fits.
+- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list (for a field marked "one or more", a JSON list of allowed values); for a whole-number field, the number the respondent states in digits (decimals allowed) or one of its special answers; for a free-text field, the normalised text or one of its special answers. null when the respondent did not answer (skipped, or the question was never asked).
 - "raw": the respondent''s own words for this field, trimmed and short. null when the respondent did not answer.
 - "confidence": optional, a number from 0 to 1, or null.
 
 ## Rules for this persona
 
-- age: the number the respondent states as their own age, in digits. A birth year or a date of birth is not an age.
-- gender: map the respondent''s words with the guidance above; "skip" or "do not want to say" is Prefer not to say.
-- occupation: the sector of the respondent''s work. A job title maps to its sector (teacher is Education, nurse is Health, farmer is Agriculture, shopkeeper is Retail and trade). If the work could sit in two sectors, the sector of the work wins over the employer. Homemaker, student, retired, unemployed, driver, artist, daily wage and anything else that fits no sector is Others, with their words in raw. Pick Invalid only for a gibberish answer.
+- age: the number the respondent states as their own age, in digits; decimals are valid. A birth year or a date of birth is not an age. A range that spans more than one band or a vague answer ("thirty something") is Unclear.
+- gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
+- state and district: follow the field text, including how "Delhi/NCR" and a named district are handled.
+- occupation: the sector of the respondent''s work. A job title maps to its sector (teacher or anganwadi teacher is Education, nurse is Health, farmer is Agriculture, shopkeeper is Retail and trade). If the work could sit in two sectors, the sector of the work wins over the employer. Someone between jobs or looking for work is Not currently working; homemaker, student and retired-or-other follow the guidance. A valid occupation that fits no sector (actor, driver, electrician, tailor, daily wage) is Others. "I work somewhere" or "in a private company" is Unclear. Invalid response only for a gibberish answer.
 
 ## PII check (whole conversation)
 
@@ -1078,7 +1081,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 
 - Each line is one message: [sequence] Bot: ... or [sequence] Respondent: ... . Only the Respondent lines carry facts about the respondent. A Bot line only tells you what was asked.
 - The background questions may come at the start, in the middle or at the end, may be answered after a follow-up question, and one answer can fill several fields. Read the whole conversation before you answer.
-- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language, a city or a district, not a district from a state.
+- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language or a city, not a district from a state. A state may be derived from a district the respondent names, only as the state field describes.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer. Count an answer given to a follow-up question.
 - The respondent never answered the question for a field, or the bot never asked it: "value" null and "raw" null (not provided). The respondent answered but the answer fits no allowed value (or no band): "value" null and "raw" filled with their words. Never invent a value that is not allowed. A placeholder such as "N/A" or "not sure" is not a value for a free-text field.
 
@@ -1087,20 +1090,21 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 {{fields}}
 
 For each field return an object with:
-- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list; for a whole-number field, the number in digits only; for a free-text field, the normalised text. null when not provided or when nothing fits.
+- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list (for a field marked "one or more", a JSON list of allowed values); for a whole-number field, the number the respondent states in digits (decimals allowed) or one of its special answers; for a free-text field, the normalised text or one of its special answers. null when the respondent did not answer (skipped, or the question was never asked).
 - "raw": the respondent''s own words for this field, trimmed and short. null when the respondent did not answer.
 - "confidence": optional, a number from 0 to 1, or null.
 
 ## Rules for this persona
 
-- state and district: where the bot asked, the CHILD''s state and the district where the child goes to school; if the bot asked where the parent stays, use that.
-- child_gender: the gender of the CHILD ("boy" is Male, "girl" is Female, "other" is Others), never the parent''s. If there are several children and no one child is meant, value null, words in raw.
-- disability and disability_type: about the CHILD only, never the parent. disability_type only when disability is Yes and the kind is named; otherwise null and null. The older questionnaire never asked: then both are not provided.
-- respondent_relationship: the respondent''s relation to the child. Grandparent, aunt, uncle, older sibling or any other caregiver is Guardian. "Both parents" or an unclear answer: value null, words in raw.
-- school_type: the kind of school the child goes to (government or private); another kind of school is Others.
-- child_grade: the class of the child, mapped to the exact band label: classes 1-5 Primary (Classes 1-5), 6-8 Middle (Classes 6-8), 9-10 Secondary (Classes 9-10), 11-12 Higher Secondary (Classes 11-12), a college course College/University. A class given as a word ("fifth") is a number. Only the older questionnaire asks it; if never asked, null and null. Nursery, LKG, UKG, or children in different bands: value null, words in raw.
+- Only the fields listed above are asked in this questionnaire version: ignore any rule below about a field that is not listed.
+- state and district: where the bot asked, the CHILD''s state and the district where the child goes to school; if the bot asked where the parent stays, use that. Follow the field text for "Delhi/NCR" and a named district.
+- child_gender: the gender of the CHILD ("boy" is Male, "girl" is Female, "other" is Others), never the parent''s. With several children, list every gender that applies once each, as a JSON list.
+- disability and disability_type: about the CHILD only, never the parent. disability_type: the kinds named (a JSON list when several); otherwise null.
+- respondent_relationship: the respondent''s relation to the child. Mother, Father; Guardian only when they say they are the guardian; an aunt, uncle, grandparent or other relative is Other relative; "parent" or "both parents" without saying which is Unmapped.
+- school_type: the kind of school the child goes to (government or private); another kind of school, a board, an international school or an aided school is Others. An answer about a college is Invalid response (the question is about schools).
+- child_grade: the class of the child, mapped to the exact band label; a class given as a word ("fifth") is a number. Several children: every band that applies, once each, as a JSON list. A child who dropped out gets the last completed level; a child not in school with no detail is Out of school / not currently enrolled. If the bot never asked, null.
 - parent_education: Yes if the respondent says they went to school or college, No if they never went to school. Their own education, never the child''s.
-- parent_education_level: the highest level the respondent reached, mapped to the band. If parent_education is No, the level is Did Not Go to School. "Studied up to class 7" is Middle (the last class attended). A degree is Undergraduate or Postgraduate by its level, PhD, diploma and vocational training are Others. Yes without any level: value null, words in raw.
+- parent_education_level: the highest level the respondent COMPLETED, mapped to the band. If parent_education is No, the level is Did not go to school. "Studied up to class 7" is Middle (the last class attended). A bachelor''s or master''s degree is Undergraduate/postgraduate; PhD, diploma and other settings are Others.
 
 ## PII check (whole conversation)
 
@@ -1148,7 +1152,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 
 - Each line is one message: [sequence] Bot: ... or [sequence] Respondent: ... . Only the Respondent lines carry facts about the respondent. A Bot line only tells you what was asked.
 - The background questions may come at the start, in the middle or at the end, may be answered after a follow-up question, and one answer can fill several fields. Read the whole conversation before you answer.
-- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language, a city or a district, not a district from a state.
+- Use only what the respondent explicitly said. Never infer: not a gender from a name, not a state from a language or a city, not a district from a state. A state may be derived from a district the respondent names, only as the state field describes.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer. Count an answer given to a follow-up question.
 - The respondent never answered the question for a field, or the bot never asked it: "value" null and "raw" null (not provided). The respondent answered but the answer fits no allowed value (or no band): "value" null and "raw" filled with their words. Never invent a value that is not allowed. A placeholder such as "N/A" or "not sure" is not a value for a free-text field.
 
@@ -1157,16 +1161,16 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 {{fields}}
 
 For each field return an object with:
-- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list; for a whole-number field, the number in digits only; for a free-text field, the normalised text. null when not provided or when nothing fits.
+- "value": for a field with allowed values, EXACTLY one allowed value as spelled in the list (for a field marked "one or more", a JSON list of allowed values); for a whole-number field, the number the respondent states in digits (decimals allowed) or one of its special answers; for a free-text field, the normalised text or one of its special answers. null when the respondent did not answer (skipped, or the question was never asked).
 - "raw": the respondent''s own words for this field, trimmed and short. null when the respondent did not answer.
 - "confidence": optional, a number from 0 to 1, or null.
 
 ## Rules for this persona
 
-- state and district: where the respondent teaches.
-- gender: map the respondent''s words with the guidance above; "skip" or "do not want to say" is Prefer not to say.
-- institution_type: the kind of institution the respondent teaches at. If they say "other" and then name a kind (for example a trust school), the band is Others and the kind goes in raw.
-- teaching_level: the bot asks "primary, middle, high school or college". Primary is Primary (classes 1-5) and middle is Middle (classes 6-8). "High school" is Secondary (classes 9-10) or Higher Secondary (classes 11-12) ONLY when the respondent names the classes; "college" is Undergraduate or Postgraduate ONLY when they name the degree level they teach. A bare "high school" or "college", or several levels at once (for example classes 6 to 10): value null, their words in raw. Vocational training or other settings are Others.
+- state and district: where the respondent teaches. Follow the field text for "Delhi/NCR" and a named district.
+- gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
+- institution_type: the kind of institution the respondent teaches at. If they say "other" and then name a kind (for example a trust school), the value is Others and the kind goes in raw. An aided school is Others. An answer about a college is Invalid response (the question is about schools).
+- teaching_level: the bot asks "primary, middle, high school or college". Primary is Primary (classes 1-5), middle is Middle (classes 6-8), "high school" is High school (classes 9-12); "college" alone is Undergraduate, and Postgraduate only when they say they teach a master''s level. Several levels (for example classes 6 to 10): every band that applies, once each, as a JSON list. Vocational training or other settings are Others.
 
 ## PII check (whole conversation)
 

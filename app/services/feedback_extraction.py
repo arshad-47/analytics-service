@@ -43,11 +43,17 @@ from app.services.feedback_extraction_constants import (
     FIELD_KINDS as _CONSTANT_FIELD_KINDS,
     KIND_CATEGORY,
     KIND_FREE_TEXT,
+    LABEL_INVALID,
+    LABEL_NOT_ANSWERED,
+    LABEL_NOT_APPLICABLE,
+    LABEL_OTHERS,
+    LABEL_UNMAPPED,
     LIMIT_BOUNDS,
     MASK_EMAIL,
     MASK_HANDLE,
     MASK_LINK,
     MASK_NUMBER,
+    MAX_BAND_NUMBER_DIGITS,
     MAX_DIGIT_GAP,
     MAX_JUSTIFICATION_CHARS,
     MIN_COMMA_JOIN_DIGITS,
@@ -62,7 +68,11 @@ from app.services.feedback_extraction_constants import (
     PII_DIGIT_RUN_BOUNDS,
     PII_TYPE_DESCRIPTIONS,
     PII_TYPES,
+    EXCLUSIVE_LABELS,
+    MULTI_VALUE_SEPARATOR,
     STATUS_EXTRACTED,
+    STATUS_NOT_APPLICABLE,
+    UNMAPPED_LABELS,
     STATUS_NOT_PROVIDED,
     STATUS_UNMAPPED,
     YEAR_MAX,
@@ -138,11 +148,27 @@ class FieldSpec:
     max_value: Optional[int] = None   # integer fields only: largest accepted value (inclusive)
     sensitive: bool = False           # a prompt rule (fill only when stated) AND raw_value is not stored (see keeps_raw)
     store_raw: Optional[bool] = None  # None = the default (not sensitive); True keeps raw_value of a sensitive field
+    multi: bool = False               # category fields only: the answer may be SEVERAL categories (value 'A, B', value_list [A, B])
+    aliases: Optional[Dict[str, Tuple[str, ...]]] = None   # category -> other spellings mapped to it by the code (not only hints to the model)
+    bands: Tuple["Band", ...] = ()    # integer fields only: the number is stored as the label of the band that holds it
+    versions: Optional[Tuple[str, ...]] = None   # questionnaire versions that ask this question; None = every version (else N/A)
+    applies_when: Optional[Tuple[str, Tuple[str, ...]]] = None   # (earlier field, its values): any other answer there makes this N/A
 
     @property
     def keeps_raw(self) -> bool:
         """Whether the respondent's own words (raw_value) of this field are stored. Sensitive fields: only on request."""
         return self.store_raw if self.store_raw is not None else not self.sensitive
+
+
+@dataclass(frozen=True)
+class Band:
+    """One band of a numeric field: `min` is inclusive, `max` exclusive, None = open on that side."""
+    label: str
+    min: Optional[float] = None
+    max: Optional[float] = None
+
+    def holds(self, number: float) -> bool:
+        return (self.min is None or number >= self.min) and (self.max is None or number < self.max)
 
 
 def _placeholder_key(text: str) -> str:
@@ -170,12 +196,16 @@ class ExtractionConfig:
     def field_names(self) -> Tuple[str, ...]:
         return tuple(f.name for f in self.fields)
 
+    def fields_for(self, version: Optional[str]) -> Tuple[FieldSpec, ...]:
+        """The fields the questionnaire `version` asks (every field when the version is unknown or the field names none)."""
+        return tuple(f for f in self.fields if version is None or f.versions is None or version in f.versions)
+
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _TOP_KEYS = {"schema_version", "persona", "session_type", "source_note", "fields", "pii", "llm", "prompt_name",
              "prompt_variables", "limits", "placeholders"}
 _FIELD_KEYS = {"name", "kind", "description", "categories", "guidance", "provisional", "min", "max", "sensitive",
-               "store_raw"}
+               "store_raw", "multi", "aliases", "bands", "versions", "applies_when"}
 _LLM_KEYS = {"model", "max_tokens", "timeout_seconds"}
 _PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds", "mask_before_call", "masking_prompt_name"}
 # The variables the engine itself fills; a config's prompt_variables may not shadow them.
@@ -315,6 +345,73 @@ def _parse_prompt_variables(raw: Any) -> Dict[str, str]:
     return parsed
 
 
+_ENGINE_LABEL_KEYS = frozenset({LABEL_NOT_ANSWERED.casefold(), LABEL_NOT_APPLICABLE.casefold()})
+
+
+def _parse_aliases(raw: Any, categories: Tuple[str, ...], where: str) -> Dict[str, Tuple[str, ...]]:
+    """{category: [other spellings]}: matched by the code (case and spacing ignored) after the model answered."""
+    if not isinstance(raw, dict) or len(raw) == 0:
+        raise ExtractionConfigError(f"{where}.aliases must be a non-empty object of category -> list of spellings")
+    taken = {_norm(c): c for c in categories}
+    parsed: Dict[str, Tuple[str, ...]] = {}
+    for category, spellings in raw.items():
+        if category not in categories:
+            raise ExtractionConfigError(f"{where}.aliases names a value that is not a category: {category!r}")
+        if not isinstance(spellings, list) or len(spellings) == 0 or any(not _is_text(a) for a in spellings):
+            raise ExtractionConfigError(f"{where}.aliases[{category!r}] must be a non-empty list of strings")
+        for spelling in spellings:
+            key = _norm(spelling)
+            if key in taken and taken[key] != category:
+                raise ExtractionConfigError(
+                    f"{where}.aliases spelling {spelling!r} of {category!r} already means {taken[key]!r}")
+            taken[key] = category
+        parsed[category] = tuple(a.strip() for a in spellings)
+    return parsed
+
+
+def _parse_bands(raw: Any, categories: Tuple[str, ...], where: str) -> Tuple[Band, ...]:
+    """Contiguous bands, lowest first: the first is open below, the last open above, each max is the next min."""
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise ExtractionConfigError(f"{where}.bands must be a list of at least two bands")
+    bands: List[Band] = []
+    labels = {_norm(c) for c in categories}
+    for position, item in enumerate(raw):
+        label_where = f"{where}.bands[{position}]"
+        if not isinstance(item, dict) or set(item) - {"label", "min", "max"}:
+            raise ExtractionConfigError(f"{label_where} must be an object with label, min, max")
+        label = item.get("label")
+        if not _is_text(label) or label != label.strip() or _norm(label) in labels:
+            raise ExtractionConfigError(f"{label_where}.label must be a unique non-empty string")
+        labels.add(_norm(label))
+        low, high = item.get("min"), item.get("max")
+        for bound in (low, high):
+            if bound is not None and (isinstance(bound, bool) or not isinstance(bound, (int, float))):
+                raise ExtractionConfigError(f"{label_where}: min and max must be numbers or null")
+        if (position == 0) != (low is None) or (position == len(raw) - 1) != (high is None):
+            raise ExtractionConfigError(f"{where}.bands: the first band is open below (min null), the last open above (max null)")
+        if bands and bands[-1].max != low:
+            raise ExtractionConfigError(f"{label_where}: min must equal the max of the band before it (no gap, no overlap)")
+        if low is not None and high is not None and not low < high:
+            raise ExtractionConfigError(f"{label_where}: min must be below max")
+        bands.append(Band(label, low, high))
+    return tuple(bands)
+
+
+def _parse_applies_when(raw: Any, earlier: List[FieldSpec], where: str) -> Tuple[str, Tuple[str, ...]]:
+    """{"field": <an EARLIER field>, "in": [its values]}: the field is N/A unless that field holds one of them."""
+    if not isinstance(raw, dict) or set(raw) != {"field", "in"}:
+        raise ExtractionConfigError(f'{where}.applies_when must be {{"field": <name>, "in": [<values>]}}')
+    referenced = next((f for f in earlier if f.name == raw["field"]), None)
+    if referenced is None:
+        raise ExtractionConfigError(f"{where}.applies_when.field must name a field listed BEFORE this one")
+    allowed = [*referenced.categories, *(b.label for b in referenced.bands)]
+    values = raw["in"]
+    if not isinstance(values, list) or len(values) == 0 or any(v not in allowed for v in values):
+        raise ExtractionConfigError(
+            f"{where}.applies_when.in must be a non-empty list of values of {referenced.name!r} (its categories or bands)")
+    return referenced.name, tuple(values)
+
+
 def parse_extraction_config(raw: Any) -> ExtractionConfig:
     """Validates a config_version.config JSON (a dict or its JSON text) and returns it parsed. Never defaults silently."""
     if isinstance(raw, str):
@@ -385,16 +482,31 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
         max_value: Optional[int] = None
         categories: Tuple[str, ...] = ()
         guidance = None
-        if kind == KIND_CATEGORY:
+        bands: Tuple[Band, ...] = ()
+        multi = item.get("multi", False)
+        if not isinstance(multi, bool):
+            raise ExtractionConfigError(f"{where}.multi must be a boolean")
+        if multi and kind != KIND_CATEGORY:
+            raise ExtractionConfigError(f"{where}: only a category field can be multi")
+        if "bands" in item and kind != KIND_INTEGER:
+            raise ExtractionConfigError(f"{where}: only an integer field has bands")
+        # Labels the model may answer with besides the band / free text (category fields: the allowed values).
+        if kind == KIND_CATEGORY or "categories" in item:
             cats = item.get("categories")
             if not isinstance(cats, list) or len(cats) == 0:
-                raise ExtractionConfigError(f"{where}.categories must be a non-empty list for a category field")
+                raise ExtractionConfigError(f"{where}.categories must be a non-empty list")
             seen_keys = set()
             for cat in cats:
                 if not _is_text(cat) or cat != cat.strip():
                     raise ExtractionConfigError(f"{where}.categories must be non-empty strings without surrounding spaces")
                 if _norm(cat) in seen_keys:
                     raise ExtractionConfigError(f"{where}.categories has a duplicate value (case-insensitive)")
+                if _norm(cat) in _ENGINE_LABEL_KEYS:
+                    raise ExtractionConfigError(
+                        f"{where}.categories must not list {LABEL_NOT_ANSWERED!r} or {LABEL_NOT_APPLICABLE!r}: "
+                        f"the engine writes those itself")
+                if multi and "," in cat:
+                    raise ExtractionConfigError(f"{where}.categories of a multi field must not contain a comma")
                 seen_keys.add(_norm(cat))
             categories = tuple(cats)
             guidance = item.get("guidance")
@@ -406,11 +518,13 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
                 if len(stray) > 0:
                     raise ExtractionConfigError(f"{where}.guidance names value(s) that are not categories: {stray}")
                 guidance = dict(guidance)
+        elif "guidance" in item:
+            raise ExtractionConfigError(f"{where}: a field without categories has no guidance")
+        aliases = _parse_aliases(item.get("aliases"), categories, where) if "aliases" in item else None
+        if kind == KIND_CATEGORY:
             if "min" in item or "max" in item:
                 raise ExtractionConfigError(f"{where}: a category field has no min or max")
         elif kind == KIND_INTEGER:
-            if "categories" in item or "guidance" in item:
-                raise ExtractionConfigError(f"{where}: an integer field has no categories or guidance")
             min_value, max_value = item.get("min"), item.get("max")
             if not _is_plain_int(min_value) or not _is_plain_int(max_value):
                 raise ExtractionConfigError(f"{where}: an integer field needs integer min and max (not booleans)")
@@ -418,13 +532,24 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
                 raise ExtractionConfigError(f"{where}: min and max must be within +-{MAX_INTEGER_BOUND}")
             if min_value > max_value:
                 raise ExtractionConfigError(f"{where}: min must not be greater than max")
+            if "bands" in item:
+                bands = _parse_bands(item["bands"], categories, where)
+            elif len(categories) > 0:
+                raise ExtractionConfigError(f"{where}: an integer field has categories only together with bands")
         else:
-            if "categories" in item or "guidance" in item:
-                raise ExtractionConfigError(f"{where}: a free_text field has no categories or guidance")
             if "min" in item or "max" in item:
                 raise ExtractionConfigError(f"{where}: a free_text field has no min or max")
+        versions: Optional[Tuple[str, ...]] = None
+        if "versions" in item:
+            raw_versions = item["versions"]
+            if not isinstance(raw_versions, list) or len(raw_versions) == 0 or any(
+                    not _is_text(v) or v != v.strip() for v in raw_versions) or len(set(raw_versions)) != len(raw_versions):
+                raise ExtractionConfigError(f"{where}.versions must be a non-empty list of distinct version keys")
+            versions = tuple(raw_versions)
+        applies_when = _parse_applies_when(item["applies_when"], fields, where) if "applies_when" in item else None
         fields.append(FieldSpec(name, kind, item["description"].strip(), categories, guidance, provisional,
-                                min_value, max_value, sensitive, store_raw))
+                                min_value, max_value, sensitive, store_raw, multi, aliases, bands, versions,
+                                applies_when))
 
     pii_types: Tuple[str, ...] = PII_TYPES
     pii_descriptions: Dict[str, str] = {}
@@ -886,23 +1011,6 @@ def apply_pii_precheck(result: "ExtractionResult", rows: Sequence[Mapping[str, A
     return apply_pii_kinds(result, pii_precheck_kinds(rows, config.pii_policy), config)
 
 
-def minimise_flagged(result: "ExtractionResult", config: ExtractionConfig) -> "ExtractionResult":
-    """
-    A session flagged pii_detected keeps no respondent words: raw_value is NULL for every field and the value of a
-    free_text field (it is text the respondent wrote) is NULL as well; the status stays, so a count of what was
-    answered is still possible. Category and integer values (a band from the config, a number inside a range) stay.
-    Such sessions are excluded from the export anyway; this makes sure a query that forgets the exclusion cannot
-    return the text that made the flag TRUE.
-    """
-    if not result.pii_detected:
-        return result
-    kinds = {spec.name: spec.kind for spec in config.fields}
-    fields = tuple(
-        replace(f, raw_value=None, value=None if kinds.get(f.field_name) == KIND_FREE_TEXT else f.value)
-        for f in result.fields)
-    return replace(result, fields=fields)
-
-
 # ------------------------------------------------------------------------------------------------ prompt
 
 _VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
@@ -912,16 +1020,27 @@ def _render_fields(config: ExtractionConfig) -> str:
     lines: List[str] = []
     for number, spec in enumerate(config.fields, start=1):
         if spec.kind == KIND_CATEGORY:
-            lines.append(f"{number}. {spec.name} (choose exactly one allowed value): {spec.description}")
+            how = ("choose one or more allowed values and return them as a JSON list" if spec.multi
+                   else "choose exactly one allowed value")
+            lines.append(f"{number}. {spec.name} ({how}): {spec.description}")
             lines.append("   Allowed values: " + "; ".join(spec.categories))
-            if spec.guidance is not None and len(spec.guidance) > 0:
-                lines.append("   How to recognise them: " + "; ".join(f"{k} = {v}" for k, v in spec.guidance.items()))
+        elif spec.kind == KIND_INTEGER and len(spec.bands) > 0:
+            lines.append(
+                f"{number}. {spec.name} (the number the respondent states, decimals allowed, as a JSON number "
+                f"between {spec.min_value} and {spec.max_value}; or exactly one of the special answers below; null "
+                f"when not stated): {spec.description}")
+            lines.append("   Special answers: " + "; ".join(spec.categories))
         elif spec.kind == KIND_INTEGER:
             lines.append(
                 f"{number}. {spec.name} (a whole number from {spec.min_value} to {spec.max_value}; return it as a "
                 f"JSON number, null when not stated): {spec.description}")
+        elif len(spec.categories) > 0:
+            lines.append(f"{number}. {spec.name} (free text, or exactly one of the special answers below): {spec.description}")
+            lines.append("   Special answers: " + "; ".join(spec.categories))
         else:
             lines.append(f"{number}. {spec.name} (free text): {spec.description}")
+        if spec.guidance is not None and len(spec.guidance) > 0:
+            lines.append("   How to recognise them: " + "; ".join(f"{k} = {v}" for k, v in spec.guidance.items()))
         if spec.sensitive:
             lines.append("   " + SENSITIVE_RULE)
     return "\n".join(lines)
@@ -948,8 +1067,8 @@ JUSTIFICATION_INSTRUCTION = (
 
 def _render_output_format(config: ExtractionConfig) -> str:
     example = {
-        "fields": {n: {"value": None, "raw": None, "confidence": None, "justification": None}
-                   for n in config.field_names()},
+        "fields": {f.name: {"value": [] if f.multi else None, "raw": None, "confidence": None, "justification": None}
+                   for f in config.fields},
         "pii": {"detected": False, "types": []},
     }
     return json.dumps(example, indent=2) + "\n\n" + JUSTIFICATION_INSTRUCTION
@@ -995,6 +1114,7 @@ class FieldResult:
     status: str                # 'extracted' | 'not_provided' | 'unmapped'
     confidence: Optional[float]
     justification: Optional[str] = None   # the model's own short reason for this value (or for leaving it empty)
+    value_list: Tuple[str, ...] = ()      # the individual labels: one for a single-value field, several for a multi field
 
 
 @dataclass(frozen=True)
@@ -1023,7 +1143,8 @@ SKIP_TOO_LONG = "conversation_too_long"
 def empty_result(config: ExtractionConfig) -> ExtractionResult:
     """A conversation with no respondent answer: nothing was provided and there is nothing that could be PII."""
     return ExtractionResult(
-        tuple(FieldResult(n, None, None, STATUS_NOT_PROVIDED, None) for n in config.field_names()), False, ())
+        tuple(with_label(f, FieldResult(f.name, None, None, STATUS_NOT_PROVIDED, None)) for f in config.fields),
+        False, ())
 
 
 def oversized_result(config: ExtractionConfig) -> ExtractionResult:
@@ -1034,7 +1155,35 @@ def oversized_result(config: ExtractionConfig) -> ExtractionResult:
     excluded from the export and a person can look at it. The respondent did answer, so the fields are 'unmapped'.
     """
     return ExtractionResult(
-        tuple(FieldResult(n, None, None, STATUS_UNMAPPED, None) for n in config.field_names()), True, ("other",))
+        tuple(with_label(f, FieldResult(f.name, None, None, STATUS_UNMAPPED, None)) for f in config.fields),
+        True, ("other",))
+
+
+def not_applicable_result(spec: FieldSpec, why: str) -> FieldResult:
+    """A field that does not apply: the value is 'N/A', the status not_applicable, and the justification says why (no respondent text)."""
+    return FieldResult(spec.name, LABEL_NOT_APPLICABLE, None, STATUS_NOT_APPLICABLE, None, why, (LABEL_NOT_APPLICABLE,))
+
+
+def complete_result(config: ExtractionConfig, version: Optional[str], asked: ExtractionResult) -> ExtractionResult:
+    """
+    The result for EVERY configured field, in config order. `asked` holds the fields the questionnaire `version`
+    asks (the model's answers); the others are 'N/A' without any model involvement. Then each `applies_when` rule is
+    applied in order: a field whose earlier field does not hold one of the listed values becomes 'N/A' whatever the
+    model wrote (a field that follows an N/A field is therefore N/A too).
+    """
+    by_name = {f.field_name: f for f in asked.fields}
+    results: Dict[str, FieldResult] = {}
+    for spec in config.fields:
+        if spec.name in by_name:
+            current = by_name[spec.name]
+        else:
+            current = not_applicable_result(spec, f"Not asked in questionnaire version {version}")
+        if spec.applies_when is not None:
+            earlier, allowed = spec.applies_when
+            if not any(label in allowed for label in results[earlier].value_list):
+                current = not_applicable_result(spec, f"Not asked: {earlier} is not one of the values that lead to this question")
+        results[spec.name] = current
+    return replace(asked, fields=tuple(results[spec.name] for spec in config.fields))
 
 
 def _strip_fences(text: str) -> str:
@@ -1152,7 +1301,22 @@ def _map_field(spec: FieldSpec, entry: Mapping[str, Any], config: Optional[Extra
     placeholders = config.placeholders if config is not None else DEFAULT_PLACEHOLDER_KEYS
     result = _map_field_values(spec, entry, limits, placeholders, config)
     raw = _neutralise(result.raw_value) if spec.keeps_raw else None
-    return replace(result, raw_value=raw, justification=_justification(entry.get("justification")))
+    return with_label(spec, replace(result, raw_value=raw, justification=_justification(entry.get("justification"))))
+
+
+def with_label(spec: FieldSpec, result: FieldResult) -> FieldResult:
+    """
+    A value is never empty: a field that was not answered gets 'Not answered', one that could not be mapped its
+    fallback label (see `fallback_label`), and `value_list` always lists the labels (one for a single-value field).
+    The status keeps what really happened (not_provided / unmapped) with the respondent's words in raw_value.
+    """
+    value = result.value
+    if result.status == STATUS_NOT_PROVIDED:
+        value = LABEL_NOT_ANSWERED
+    elif value is None:
+        value = fallback_label(spec)
+    values = result.value_list if len(result.value_list) > 0 and result.value is not None else (value,)
+    return replace(result, value=value, value_list=values)
 
 
 def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits, placeholders: FrozenSet[str],
@@ -1175,7 +1339,18 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
         value = None
     else:
         integer_text = None
-        value = _text_or_none(entry["value"], f"{where} value")
+        if spec.multi and isinstance(entry["value"], list):
+            # several categories as a JSON list; anything but strings is a malformed answer
+            if any(not isinstance(item, str) for item in entry["value"]) or len(entry["value"]) > MAX_MULTI_ITEMS:
+                raise ExtractionOutputError(f"{where} value must be a short list of strings")
+            value = None
+            multi_items = [_SPACE_RE.sub(" ", item).strip() for item in entry["value"] if len(item.strip()) > 0]
+        else:
+            value = _text_or_none(entry["value"], f"{where} value")
+            multi_items = None
+            if spec.multi and value is not None:
+                # a single string that lists several ("Studying, Working"): split it at commas and semicolons
+                multi_items = [part.strip() for part in re.split(r"[;,]", value) if len(part.strip()) > 0]
     raw = _text_or_none(entry.get("raw"), f"{where} raw")
     confidence = entry.get("confidence")
     if confidence is not None:
@@ -1190,6 +1365,11 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
         raw = raw[:limits.max_raw_chars]
 
     if spec.kind == KIND_FREE_TEXT:
+        if value is not None and len(spec.categories) > 0:
+            special = _canonical(spec, value)
+            if special is not None:
+                # one of the special answers of the field (Prefer not to say, Unmapped, Outside India, ...)
+                return _labelled(spec, special, raw if raw is not None else value, confidence)
         # A placeholder ("N/A", "null", "Not provided", ...) is the model saying "no answer", not an answer.
         if value is not None and _is_placeholder(value, placeholders):
             value = None
@@ -1201,7 +1381,12 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
     if spec.kind == KIND_INTEGER:
         if config is None:
             config = _bare_config(spec, limits, placeholders)
+        if len(spec.bands) > 0:
+            return _map_banded(spec, integer_text, raw, confidence, config)
         return _map_integer(spec, integer_text, raw, confidence, config)
+
+    if spec.multi:
+        return _map_multi(spec, multi_items, raw, confidence, limits)
 
     if value is None:
         if raw is None:
@@ -1210,9 +1395,11 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
         return FieldResult(spec.name, None, raw, STATUS_UNMAPPED, confidence)
 
     if spec.kind == KIND_CATEGORY:
-        canonical = {_norm(c): c for c in spec.categories}.get(_norm(value))
+        if _norm(value) in _NO_ANSWER_KEYS:
+            return FieldResult(spec.name, None, raw, STATUS_NOT_PROVIDED, confidence)   # the model says "not answered"
+        canonical = _canonical(spec, value)
         if canonical is not None:
-            return FieldResult(spec.name, canonical, raw if raw is not None else value, STATUS_EXTRACTED, confidence)
+            return _labelled(spec, canonical, raw if raw is not None else value, confidence)
         return FieldResult(spec.name, None, raw if raw is not None else value[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
 
@@ -1222,6 +1409,122 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
         return FieldResult(spec.name, None, raw if raw is not None else value[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
     return FieldResult(spec.name, value, raw if raw is not None else value, STATUS_EXTRACTED, confidence)
+
+
+MAX_MULTI_ITEMS = 40
+_NO_ANSWER_KEYS = frozenset({LABEL_NOT_ANSWERED.casefold(), LABEL_NOT_APPLICABLE.casefold(), "not applicable"})
+
+
+def _canonical(spec: FieldSpec, text: str) -> Optional[str]:
+    """The category (or special label) a model answer stands for: its own spelling or one of the config's aliases."""
+    key = _norm(text)
+    for category in spec.categories:
+        if _norm(category) == key:
+            return category
+    for category, spellings in (spec.aliases or {}).items():
+        if any(_norm(a) == key for a in spellings):
+            return category
+    return None
+
+
+def _labelled(spec: FieldSpec, label: str, raw: Optional[str], confidence: Optional[float]) -> FieldResult:
+    """An answer that is one of the field's labels; a label that needs a person's look (Unmapped ...) is `unmapped`."""
+    status = STATUS_UNMAPPED if label in UNMAPPED_LABELS else STATUS_EXTRACTED
+    return FieldResult(spec.name, label, raw, status, confidence)
+
+
+def fallback_label(spec: FieldSpec) -> str:
+    """
+    The value of a field whose answer cannot be mapped (the model's value is not allowed, an oversized session): the
+    field's own Unmapped label when it has one (state, district), else Others when it has that category (a valid
+    answer that is not listed), else Invalid response. A value is never empty.
+    """
+    for label in (LABEL_UNMAPPED, LABEL_OTHERS):
+        if any(_norm(c) == _norm(label) for c in spec.categories):
+            return next(c for c in spec.categories if _norm(c) == _norm(label))
+    return LABEL_INVALID
+
+
+def _map_multi(spec: FieldSpec, items: Optional[List[str]], raw: Optional[str], confidence: Optional[float],
+               limits: Limits) -> FieldResult:
+    """
+    A multi-value field: every item is matched to a category (aliases included); the answer is the distinct matches in
+    the CONFIG's category order (so one combination is always the same text), joined by ', ' as `value`, with the
+    individual labels in `value_list`. Labels that stand alone (Prefer not to say, Invalid response ...) are dropped
+    next to a real category; an item outside the categories becomes the field's Others when it has that category and
+    otherwise is dropped, and either way the status is `unmapped` so a person can look. No item at all: not provided
+    (or unmapped with the words when `raw` holds something).
+    """
+    if items is None or len(items) == 0:
+        if raw is None:
+            return FieldResult(spec.name, None, None, STATUS_NOT_PROVIDED, confidence)
+        return FieldResult(spec.name, None, raw, STATUS_UNMAPPED, confidence)
+    if all(_norm(item) in _NO_ANSWER_KEYS for item in items):
+        return FieldResult(spec.name, None, raw, STATUS_NOT_PROVIDED, confidence)
+    matched: List[str] = []
+    off_list = False
+    for item in items:
+        if _norm(item) in _NO_ANSWER_KEYS:
+            continue
+        canonical = _canonical(spec, item)
+        if canonical is None:
+            off_list = True
+            canonical = next((c for c in spec.categories if _norm(c) == _norm(LABEL_OTHERS)), None)
+        if canonical is not None and canonical not in matched:
+            matched.append(canonical)
+    if len(matched) == 0:
+        return FieldResult(spec.name, None, raw if raw is not None else MULTI_VALUE_SEPARATOR.join(items)[:limits.max_raw_chars],
+                           STATUS_UNMAPPED, confidence)
+    in_config_order = [c for c in spec.categories if c in matched]
+    real = [c for c in in_config_order if c not in EXCLUSIVE_LABELS]
+    ordered = real if len(real) > 0 else in_config_order[:1]
+    unmapped = off_list or any(c in UNMAPPED_LABELS for c in ordered)
+    return FieldResult(spec.name, MULTI_VALUE_SEPARATOR.join(ordered),
+                       raw if raw is not None else MULTI_VALUE_SEPARATOR.join(items)[:limits.max_raw_chars],
+                       STATUS_UNMAPPED if unmapped else STATUS_EXTRACTED, confidence, None, tuple(ordered))
+
+
+_DECIMAL_RE = re.compile(r"^-?\d{1,%d}(?:\.\d{1,4})?$" % MAX_BAND_NUMBER_DIGITS)
+
+
+def _map_banded(spec: FieldSpec, value: Any, raw: Optional[str], confidence: Optional[float],
+                config: ExtractionConfig) -> FieldResult:
+    """
+    A numeric field stored as a BAND (the age): `value` is the label of the band that holds the stated number, the
+    number itself (decimals allowed: 15.5) is kept as `raw_value`. The model may also answer one of the field's
+    special labels (Prefer not to say, Unclear, Invalid response); a number outside [min, max], text that is not a
+    number and a boolean are unmapped with the words kept. null / a placeholder is not provided.
+    """
+    if isinstance(value, str):
+        canonical = _canonical(spec, value)
+        if canonical is not None:
+            return _labelled(spec, canonical, raw if raw is not None else value, confidence)
+        if _is_placeholder(value, config.placeholders):
+            value = None
+    if value is None:
+        if raw is not None and _is_placeholder(raw, config.placeholders):
+            raw = None
+        if raw is None:
+            return FieldResult(spec.name, None, None, STATUS_NOT_PROVIDED, confidence)
+        return FieldResult(spec.name, None, raw, STATUS_UNMAPPED, confidence)
+    if isinstance(value, bool):
+        return FieldResult(spec.name, None, raw if raw is not None else str(value).lower(), STATUS_UNMAPPED, confidence)
+    if isinstance(value, str):
+        text = value[:config.limits.max_raw_chars]
+        if _DECIMAL_RE.fullmatch(value.strip()) is None:
+            return FieldResult(spec.name, None, raw if raw is not None else text, STATUS_UNMAPPED, confidence)
+        number = float(value.strip())
+        shown = value.strip()
+    else:
+        number = float(value)
+        shown = repr(value) if isinstance(value, float) else str(value)
+    kept_raw = raw if raw is not None else shown[:config.limits.max_raw_chars]
+    if not math.isfinite(number) or number < spec.min_value or number > spec.max_value:
+        return FieldResult(spec.name, None, kept_raw, STATUS_UNMAPPED, confidence)
+    band = next((b for b in spec.bands if b.holds(number)), None)
+    if band is None:      # cannot happen with contiguous bands, kept so a bad config never crashes a session
+        return FieldResult(spec.name, None, kept_raw, STATUS_UNMAPPED, confidence)
+    return FieldResult(spec.name, band.label, kept_raw, STATUS_EXTRACTED, confidence)
 
 
 def _bare_config(spec: FieldSpec, limits: Limits, placeholders: FrozenSet[str]) -> ExtractionConfig:
@@ -1308,6 +1611,7 @@ def extract(
     closing_keys: Sequence[str] = (),
     masking: Optional[Any] = None,
     progress: Optional[Callable[[str, str, Optional[Mapping[str, Any]]], None]] = None,
+    questionnaire_version: Optional[str] = None,
 ) -> ExtractionRun:
     """
     Conversation -> prompt -> `call_llm(prompt)` -> validated result. `call_llm` returns (answer text, usage dict).
@@ -1321,8 +1625,14 @@ def extract(
     receives (`mask_respondent_pii`), so none of it reaches the AI provider. The model still extracts the other
     fields, and pii_detected is TRUE when the model says so OR the check found something (a hit is recorded even when
     the model says false). With `pii.mask_before_call` false the text goes unmasked and the check only runs after the
-    call (the old behaviour). A flagged session keeps no respondent words (`minimise_flagged`). A bad answer raises
-    ExtractionOutputError with the call's usage attached.
+    call (the old behaviour). A flagged session keeps everything it extracted: the flag marks it, and what to exclude
+    from an export is decided by the query that makes it. A bad answer raises ExtractionOutputError with the call's
+    usage attached.
+
+    `questionnaire_version` (the session's version, 'V1', 'V2' ...) decides which fields are ASKED: a field that lists
+    versions (`FieldSpec.versions`) which do not include it is not sent to the model and comes back 'N/A' (status
+    not_applicable). After the answer, every `applies_when` rule is applied (`complete_result`), so the result always
+    has one entry per configured field and no value is ever empty.
 
     `masking` (a MaskingStep, when the config names `pii.masking_prompt_name`) adds a second call between the local
     check and the extraction call: the model masks personal data and abusive language in every respondent answer
@@ -1342,13 +1652,19 @@ def extract(
             except Exception:  # noqa: BLE001 - reporting must never fail the extraction
                 pass
 
+    full_config = config
+    config = replace(full_config, fields=full_config.fields_for(questionnaire_version))   # the fields this version asks
+
+    def done(result: ExtractionResult) -> ExtractionResult:
+        return complete_result(full_config, questionnaire_version, result)
+
     conversation = build_conversation(rows, closing_keys, config.limits)
     if conversation.respondent_answers == 0:
-        return ExtractionRun(empty_result(config), {}, False, len(conversation.turns), SKIP_NO_ANSWER)
+        return ExtractionRun(done(empty_result(config)), {}, False, len(conversation.turns), SKIP_NO_ANSWER)
     if conversation.oversized_respondent_message:
-        return ExtractionRun(oversized_result(config), {}, False, len(conversation.turns), SKIP_OVERSIZED)
+        return ExtractionRun(done(oversized_result(config)), {}, False, len(conversation.turns), SKIP_OVERSIZED)
     if conversation.too_long:
-        return ExtractionRun(oversized_result(config), {}, False, len(conversation.turns), SKIP_TOO_LONG)
+        return ExtractionRun(done(oversized_result(config)), {}, False, len(conversation.turns), SKIP_TOO_LONG)
     kinds: Tuple[str, ...] = ()
     if config.pii_policy.mask_before_call:
         masked_rows, kinds = mask_respondent_pii(rows, config.pii_policy)
@@ -1414,5 +1730,5 @@ def extract(
         result = apply_pii_precheck(result, rows, config)
     if masking_result is not None:
         result = apply_pii_kinds(result, masking_result.pii_types, config)
-    return ExtractionRun(minimise_flagged(result, config), usage, True, len(conversation.turns), None, masking_result,
+    return ExtractionRun(done(result), usage, True, len(conversation.turns), None, masking_result,
                          answer if isinstance(answer, str) else None)

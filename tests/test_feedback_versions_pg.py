@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import pytest
+import factories
 import pg_support
 
 from app.database.db import db
@@ -100,6 +101,9 @@ async def _add(conn, persona, stored_version, started_at, source="mitra"):
     else:
         event["data"]["botId"] = PERSONAS[persona]["bot_id"]
     await insert_or_update_submission(conn, event)
+    if source != "google_forms":
+        # these tests are about the date-window labels, which only apply to sessions without a bot id
+        await factories.as_window_stamped_session(conn, sid, stored_version)
     return sid
 
 

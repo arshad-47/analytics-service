@@ -441,15 +441,21 @@ def test_feedback_delete_does_not_need_a_config(monkeypatch):
 # insert_or_update_submission branch selection -------------------------------------------------
 
 def _ops_conn():
+    # A conversation_rows event also reads the persona's bot ids (to rank its bot id) before the writes and again after
+    # them (to relabel what the ranks moved): the bot-id lookups are the first and the last fetch, and the stored
+    # session lookup (none: a new session) is the first fetchrow.
     conn = FakeConn()
     conn.fetchrow = AsyncMock(side_effect=[
+        None,                                                                                # stored session: none
         {"id": "sub-uuid", "status": "pending", "session_id": "s" * 32, "inserted": True},  # submissions
         {"completion_status": "IN_PROGRESS", "inserted": True},                              # feedback_submissions
     ])
     conn.fetch = AsyncMock(side_effect=[
+        [],                                                                      # bot ids of the persona (rank)
         [{"sequence": 1, "inserted": True}, {"sequence": 2, "inserted": True}],  # feedbacks upsert
         [],                                                                      # unresolved parents
         [{"id": "child"}],                                                       # parent_id update
+        [],                                                                      # bot ids of the persona (relabel)
     ])
     return conn
 
@@ -469,7 +475,7 @@ def test_feedback_branch_runs_in_one_transaction_and_writes_feedback_tables():
         assert res["changed"] is True and res["status"] == "pending"
         assert res["messages_inserted"] == 2 and res["parents_set"] == 1
         # submissions row is typed 'feedback'; state/district stay NULL when the tags carry none
-        sub_args = conn.fetchrow.await_args_list[0].args
+        sub_args = next(c.args for c in conn.fetchrow.await_args_list if "INSERT INTO submissions" in c.args[0])
         assert sub_args[4] == "feedback" and sub_args[5] is None and sub_args[6] is None
     asyncio.run(run())
 
@@ -478,11 +484,17 @@ def test_feedback_nothing_written_reports_unchanged():
     async def run():
         conn = FakeConn()
         conn.fetchrow = AsyncMock(side_effect=[
+            {"session_type": "Youth_Voice", "source": "mitra", "questionnaire_version": "V1",
+             "program_id": None, "has_bot": True},  # the stored session (same bot, same rank)
             None,  # submissions upsert matched but changed nothing -> no RETURNING row
             {"id": "sub-uuid", "status": "success", "session_id": "s" * 32, "inserted": False},  # re-read
             None,  # feedback_submissions unchanged
         ])
-        conn.fetch = AsyncMock(side_effect=[[], [], []])
+        conn.fetch = AsyncMock(side_effect=[
+            [{"submission_id": "184884", "bot_id": "101", "questionnaire_version": "V1"}],  # bot ids (rank)
+            [], [], [],
+            [{"submission_id": "184884", "bot_id": "101", "questionnaire_version": "V1"}],  # bot ids (relabel)
+        ])
         res = await insert_or_update_submission(conn, _feedback_event())
         assert res["changed"] is False and res["status"] == "success"
         # no status reset when nothing changed
@@ -495,10 +507,11 @@ def test_feedback_content_change_resets_status_to_pending():
         conn = FakeConn()
         conn.fetchrow = AsyncMock(side_effect=[
             None,
+            None,
             {"id": "sub-uuid", "status": "success", "session_id": "s" * 32, "inserted": False},
             None,
         ])
-        conn.fetch = AsyncMock(side_effect=[[{"sequence": 2, "inserted": True}], [], []])
+        conn.fetch = AsyncMock(side_effect=[[], [{"sequence": 2, "inserted": True}], [], [], []])
         res = await insert_or_update_submission(conn, _feedback_event())
         assert res["changed"] is True and res["status"] == "pending"
         assert any("SET status = 'pending'" in c.args[0] for c in conn.execute.await_args_list)
@@ -540,6 +553,15 @@ def test_feedback_update_event_raises_before_any_write():
     (lambda e: e["data"].update(questionnaireVersion=""), "data.questionnaireVersion must be a non-empty string"),
     (lambda e: e["data"].update(questionnaireVersion="  "), "data.questionnaireVersion must be a non-empty string"),
     (lambda e: e["data"].update(questionnaireVersion=2), "data.questionnaireVersion must be a non-empty string"),
+    # NEW: a conversation_rows session needs a bot id that is a positive integer written in digits
+    (lambda e: e["data"].pop("botId"), "data.botId is invalid for adapter conversation_rows .bot id is missing"),
+    (lambda e: e["data"].update(botId=None), "data.botId is invalid for adapter conversation_rows .bot id is missing"),
+    (lambda e: e["data"].update(botId="  "), "data.botId is invalid for adapter conversation_rows .bot id is blank"),
+    (lambda e: e["data"].update(botId="abc"), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId="0"), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId="089"), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId=" 101 "), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId=101), "bot id must be a string"),
 ])
 def test_feedback_branch_rejects_malformed_events_before_writing(mutate, needle):
     async def run():
@@ -579,47 +601,66 @@ def test_feedback_write_passes_session_type_version_and_bot_meta():
         sql = args[0]
         assert "session_type" in sql and "questionnaire_version" in sql and "meta_data" in sql
         # $8 = session_type, $9 = questionnaire_version, $10 = meta_data json
-        assert args[8] == "Youth_Voice" and args[9] == "V2"
+        # CHANGED: the event says V2 (from the date windows) but the stored label of a bot session is the rank of its
+        # bot id among the bot ids of the persona: the only bot, so V1
+        assert args[8] == "Youth_Voice" and args[9] == "V1"
         assert json.loads(args[10]) == {"bot_id": "101", "bot_name": "Mitra Youth Test Bot"}
     asyncio.run(run())
 
 
-def test_feedback_write_trims_session_type_and_version():
+def test_feedback_write_trims_session_type_and_ranks_the_version():
     async def run():
         conn = _ops_conn()
         event = _feedback_event()
-        event["data"].update(sessionType="  Parent_Voice ", questionnaireVersion=" V1 ")
+        event["data"].update(sessionType="  Parent_Voice ", questionnaireVersion=" V7 ")
         await insert_or_update_submission(conn, event)
         args = _fs_args(conn)
-        assert args[8] == "Parent_Voice" and args[9] == "V1"
+        assert args[8] == "Parent_Voice" and args[9] == "V1"      # CHANGED: the event's version is not what is stored
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("bot_id, bot_name, expected", [
-    ("101", None, {"bot_id": "101"}),
-    (None, "Some Bot", {"bot_name": "Some Bot"}),
-    ("  ", "", None),
-    (None, None, None),
-    (" 101 ", " Some Bot ", {"bot_id": "101", "bot_name": "Some Bot"}),
+def test_feedback_write_ranks_the_incoming_bot_among_the_stored_ones():
+    async def run():
+        conn = _ops_conn()
+        conn.fetch = AsyncMock(side_effect=[
+            [{"submission_id": "other", "bot_id": "103", "questionnaire_version": "V1"}],   # bot ids (rank)
+            [{"sequence": 1, "inserted": True}, {"sequence": 2, "inserted": True}], [], [{"id": "child"}],
+            [{"submission_id": "other", "bot_id": "103", "questionnaire_version": "V1"},
+             {"submission_id": "184884", "bot_id": "101", "questionnaire_version": "V1"}],   # bot ids (relabel)
+            [], [],                                                                         # the two row-lock reads
+        ])
+        await insert_or_update_submission(conn, _feedback_event())
+        assert _fs_args(conn)[9] == "V1"           # 101 < 103
+        # 103 shifts to V2: its session is relabelled and sent back through processing
+        assert any("DELETE FROM feedback_extracted_data" in c.args[0] for c in conn.execute.await_args_list)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("bot_name, expected", [
+    (None, {"bot_id": "101"}),
+    ("  ", {"bot_id": "101"}),
+    ("", {"bot_id": "101"}),
+    (" Some Bot ", {"bot_id": "101", "bot_name": "Some Bot"}),
 ])
-def test_feedback_write_bot_meta_keeps_only_non_blank_values(bot_id, bot_name, expected):
+def test_feedback_write_bot_meta_keeps_only_non_blank_values(bot_name, expected):
+    # CHANGED: botId is required (was optional), so only botName can be blank now
     async def run():
         conn = _ops_conn()
         event = _feedback_event()
-        event["data"].update(botId=bot_id, botName=bot_name)
+        event["data"].update(botName=bot_name)
         await insert_or_update_submission(conn, event)
         meta = _fs_args(conn)[10]
-        assert (None if meta is None else json.loads(meta)) == expected
+        assert json.loads(meta) == expected
     asyncio.run(run())
 
 
-def test_feedback_write_without_bot_keys_has_no_meta():
+def test_feedback_write_without_bot_name_has_only_the_bot_id_in_meta():
     async def run():
         conn = _ops_conn()
         event = _feedback_event()
-        del event["data"]["botId"], event["data"]["botName"]
+        del event["data"]["botName"]
         await insert_or_update_submission(conn, event)
-        assert _fs_args(conn)[10] is None
+        assert json.loads(_fs_args(conn)[10]) == {"bot_id": "101"}
     asyncio.run(run())
 
 
@@ -743,8 +784,8 @@ def test_mitra_event_writes_null_source_ref():
     async def run():
         conn = _ops_conn()
         await insert_or_update_submission(conn, _feedback_event())
-        fs_args = conn.fetchrow.await_args_list[1].args
-        assert "INSERT INTO feedback_submissions" in fs_args[0] and fs_args[7] is None
+        fs_args = _fs_args(conn)
+        assert fs_args[7] is None
         # no google_forms lookup for mitra (the only fetchval calls are the persona pre-read of the write)
         assert not any("source_ref" in c.args[0] for c in conn.fetchval.await_args_list)
     asyncio.run(run())

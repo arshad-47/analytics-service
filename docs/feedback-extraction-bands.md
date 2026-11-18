@@ -2,9 +2,20 @@
 
 Written for: product (who confirms the bands) and the engineer who operates the extraction step.
 
-Each persona has its own extraction config (the DOTS metadata columns of its export) and its own prompt, both stored as data in the database. **Where the bands live:** the fields, bands and `prompt_name` of each persona are in the block `-- CONFIG feedback_extraction any <session_type>` of `seed_config.sql` (repo root, next to `schema.sql` and `seed_prompts.sql`), which gives a NEW database its version 1; in a running database the live values are the `config_version` rows (`python tools/run_feedback_extraction.py show-config`). There is no Python copy of them. The engine, the output contract and the pivot queries are in `docs/feedback-extraction-and-dots-queries.md`. Source of the bands: the Katha stories (all still Draft) as read in `docs/katha-stories-vs-dots-data-review.md` (findings B1-B5, H1-H8, M1-M7) and `docs/katha-sheet-review-comments.md` (C1-C15, F1-F4); the open questions are in `docs/katha-story-questions-for-product.md`. **Everything below except `state` and `district` is provisional**: product has not frozen the stories, so a band list can change by a new config version without a deploy (last sections).
+Each persona has its own extraction config (the DOTS metadata columns of its export) and its own prompt, both stored as data in the database. **Where the bands live:** the fields, category lists and `prompt_name` of each persona are in the block `-- CONFIG feedback_extraction any <session_type>` of `seed_config.sql` (repo root); the live truth is the `config_version` row. The category lists are the data team's finalised lists (the "DATA team finalised categories/bands" column of the 1MV dashboard requirements sheet), written in one normalised spelling.
 
-Reading the tables: **kind** is `category` (one allowed value), `free_text` or `integer` (a whole number, stored as its decimal string). **S** = sensitive: the prompt tells the model to fill it only when the respondent states it explicitly and never to infer it. **Prov.** = provisional. A field the respondent did not answer, or the bot never asked, is `not_provided` (value and raw NULL); a stated answer that fits no band is `unmapped` (value NULL, the words in `raw_value`).
+**What `feedback_extracted_data.value` holds.** A value is never empty. It is one of the field's categories, the label of its band (age and income are bands), or one of the labels the engine writes itself:
+
+| `status` | `value` | When |
+|---|---|---|
+| `extracted` | a category / band label | the respondent answered and it maps (also `Prefer not to say`, `Others`, `Outside India` ...) |
+| `unmapped` | the category (`Unmapped`, `Invalid response`, `Unclear`) the model chose, or the field's fallback (`Unmapped` if the field has it, else `Others`, else `Invalid response`) | answered but needs a person's look; the respondent's words are in `raw_value` |
+| `not_provided` | `Not answered` | the question applies but there is no answer (skipped, or the session ended first) |
+| `not_applicable` | `N/A` | the question does not exist in the session's questionnaire version (`versions`), or an earlier answer makes it moot (`applies_when`) |
+
+`value_list` always lists the individual labels (one for a single-value field); a **multi** field (`multi`) can hold several, written in the config's order joined by `, ` in `value` (for example `Studying, Working`) and listed in `value_list` (count categories with `value_list`). Labels use sentence case (`Prefer not to say`, `Invalid response`, `Others`, `Not sure`), proper nouns keep their capitals, money and age bands use symbols (`< 12`, `≥ 12 and < 16`, `≥ ₹83,000`). The engine's `Not answered` and `N/A` are never listed in a config's categories.
+
+Other config keys of a field: `aliases` (other spellings of a category, mapped by the code after the model answered: every spelling of Delhi, Orissa, Pondicherry ...), `bands` (a number stored as the label of the band that holds it; the number stays in `raw_value`), `versions` (the questionnaire versions that ask it; the others get `N/A` without asking the model), `applies_when` (`{"field": <an earlier field>, "in": [values]}`; any other answer there makes it `N/A`), `sensitive` (filled only when the respondent states it explicitly, `raw_value` not stored).
 
 Configs: `prompt_name` in each config names the persona's prompt exactly:
 
@@ -19,65 +30,63 @@ Configs: `prompt_name` in each config names the persona's prompt exactly:
 
 ## Shared across personas
 
-- **`state`** (category, not provisional): the 28 states and 8 union territories (official names, spelling variants in the guidance). A place that is not an Indian state or union territory is `unmapped`. Open: no "Others" / "Not provided" band, which authoritative list (H2, C10), whose state for Parent (H4).
-- **`district`** (free text, not provisional): the commonly used official spelling; no reference list (H2).
-- **`gender`** (Youth, General Public, Educator; `child_gender` for Parent): `Male`, `Female`, `Others`, `Prefer not to say`, `Invalid`; provisional. Open: M6 / C7 (does "skip" and "not sure" map to Prefer not to say, "Something Else" to Others); for Parent, H5 / F3 (Male/Female as seeded, or Boy/Girl as the bot says).
-- **`age`** (Youth, General Public; integer, 5 to 100, provisional): the stated number. The bounds only reject numbers that cannot be an age. The Youth maximum is not 25 on purpose: 25% of the Youth bot's first answers are over 25 and whether those are valid Youth responses is open (H1, C2), so a tight maximum would turn them into `unmapped` before product has decided. Banding is done later in SQL (the age bands overlap in the stories). Open: H1 (final bands, what is Invalid), C3 (General Public 60 is in two bands).
+- **`state`**: the 28 states and 8 union territories (`Delhi` is the one name; New Delhi, NCT, NCT of Delhi, Delhi NCR, Delhi/NCR and NCR are aliases), plus `Prefer not to say`, `Unmapped` (a direction, a region, a city, or a district name used in several states with no state given), `Invalid response`, `Outside India`. A region such as `Delhi/NCR` is decided with the district (Uttar Pradesh or Haryana district: that state; no district or a Delhi district: Delhi). When the respondent names no state but names a district that belongs to exactly one state, the state is derived from the district and the justification says so.
+- **`district`**: free text (the commonly used official spelling) or one of the special answers `Prefer not to say`, `Unmapped`, `Invalid response`, `Outside India`. No district reference list yet (a list such as LGD would let the code validate it and resolve names that exist in several states).
+- **`gender`** (Youth, General Public, Educator; `child_gender` for Parent, multi): `Male`, `Female`, `Others`, `Prefer not to say`, `Invalid response`, `Unsure / don't know`.
+- **`age`** (Youth, General Public): a number (decimals such as 15.5 are valid) stored as a band label; the stated number is `raw_value`. Special answers `Prefer not to say`, `Unclear`, `Invalid response`; a number outside 0 to 120 is `Invalid response`. Rows of respondents below 12 (and, for Youth, above 25) are recorded like any other; excluding them from a dashboard or a DOTS export is the job of the export query.
+- **Flagged sessions** (`pii_detected` TRUE) keep everything that was extracted, the respondent's words in `raw_value` included; the flag marks them and the export query decides what to leave out.
 
-## Youth (`Youth_Voice`, DOTS: 11 columns)
+## Youth (`Youth_Voice`, DOTS: 12 columns)
 
-| Field | Kind | Bands / range | S | Prov. | Source | Open product questions |
-|---|---|---|---|---|---|---|
-| `age` | integer | 5 to 100 | | yes | 2122, 2119 | H1, C2: bands without overlap, valid range |
-| `gender` | category | Male; Female; Others; Prefer not to say; Invalid | | yes | 2122 | M6, C7 |
-| `state` | category | 36 states and UTs | | no | 2122, 2119 | H2, C10 |
-| `district` | free text | | | no | 2122 | H2 |
-| `current_activity_status` | category | Studying; Working; Self-employed; Looking for work/Unemployed; Other; Invalid | | yes | 2122 (M7, C5) | the sheet's K9 lists four bands, M9 six; a student who also works; exam preparation (the seed says Studying); "doing something else" (Other) |
-| `education_level` | free text | the class as a number, or the college year in a few words | | yes | 2119 (H7, F1) | no bands exist: categories (for example 1-12, College) or raw? Empty when not studying |
-| `course_details` | free text | the course or stream in a few words | | yes | 2119 (H7, F1) | a standard list or the respondent's words? |
-| `institution_type` | category | Government; Government-aided; Private; Others; Invalid | | yes | 2122 (H8, C4) | "Not applicable" for a working respondent; international and open schools; colleges |
-| `monthly_household_income` | category | Less than ₹25,000; ₹25,000 - ₹66,000; ₹67,000 - ₹83,000; Above ₹83,000; Don't know | S | yes | 2122 (B4, C1); "Don't know" from C4 | edges without gap (the seed closes 66,001-66,999 and puts 83,000 in the third band in the guidance, labels unchanged); is "Don't know" a band; V1 and Google Form ask per YEAR |
-| `disability` | category | Yes; No; Prefer not to say; Invalid | S | yes | 2122 (C8) | "Not specified" and "Invalid" one band or two; the older V1 bot never asked |
-| `disability_type` | free text | the kind, only when `disability` is Yes | S | yes | 2119 (F2) | free text or a standard list (RPwD Act categories)? |
-
-Income rule (config description and prompt): the band is always MONTHLY. If the bot's question or the respondent speaks of a year (annual, yearly, a lakh a year) the model divides by 12 first, then picks the band; the period the respondent states wins over the period the bot asked; a range spanning two bands or an unclear period is `unmapped`. Open (C1): is dividing annual answers by 12 acceptable, or a separate annual column?
+| Field | Kind | Categories / bands | Flags |
+|---|---|---|---|
+| `gender` | category | Male; Female; Others; Prefer not to say; Invalid response; Unsure / don't know |  |
+| `age` | integer | < 12; ≥ 12 and < 16; ≥ 16 and < 22; ≥ 22 and < 26; ≥ 26 and < 30; ≥ 30 and < 35; ≥ 35 and < 40; ≥ 40 and < 45; ≥ 45 and < 50; ≥ 50 and < 55; ≥ 55 and < 60; ≥ 60 | special: Prefer not to say; Unclear; Invalid response |  |
+| `state` | category | the 36 states and union territories | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `district` | free_text | free text | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `current_activity_status` | category | Studying; Working; Self-employed; Looking for work/unemployed; Not currently studying; Others; Prefer not to say; Invalid response | multi |
+| `education_level` | category | Grade 6 to 10; Grade 11 to 12; Skill programs; Pursuing undergraduate and postgraduate; Others; Prefer not to say; Invalid response | N/A unless current_activity_status is Studying |
+| `course_details` | category | Science; Commerce; Electrical or electronics; Mechanical or manufacturing; Automobile or transport; Civil or construction; Computer or IT; Health; Beauty; Hospitality; Arts (BA or MA); Science (B.Sc or M.Sc); Commerce (B.Com or M.Com); Technology (B.Tech or M.Tech); Business administration (BBA or MBA); Computer applications (BCA or MCA); Medicine (MBBS or MD); Law (LLB or LLM); Others; Prefer not to say; Invalid response | N/A unless education_level is Grade 11 to 12 or Skill programs or Pursuing undergraduate and postgraduate |
+| `institution_type` | category | Government; Private; Government-aided; Others; Not sure; Prefer not to say; Invalid response |  |
+| `monthly_household_income` | category | Zero income / no income; < ₹25,000; ≥ ₹25,000 and < ₹66,000; ≥ ₹66,000 and < ₹83,000; ≥ ₹83,000; Don't know; Prefer not to say; Invalid response; Unclear | sensitive; only V2 |
+| `annual_household_income` | category | Zero income / no income; < ₹3 lakh; ≥ ₹3 lakh and < ₹8 lakh; ≥ ₹8 lakh and < ₹10 lakh; ≥ ₹10 lakh; Don't know; Prefer not to say; Invalid response; Unclear | sensitive; only V1 |
+| `disability` | category | Yes; No; Prefer not to say; Invalid response | sensitive |
+| `disability_type` | category | Physical disability; Intellectual disability; Others; Prefer not to say; Invalid response | sensitive; multi; N/A unless disability is Yes |
 
 ## General Public (`General_Public_Voice`, DOTS: 5 columns)
 
-| Field | Kind | Bands / range | S | Prov. | Source | Open product questions |
-|---|---|---|---|---|---|---|
-| `age` | integer | 5 to 100 | | yes | 2123, 2120 | C3: 60 is in two bands; smallest valid age |
-| `gender` | category | as above | | yes | 2123 | M6, C7 |
-| `state` | category | 36 states and UTs | | no | 2123 | H2, C10 |
-| `district` | free text | | | no | 2123 | H2 |
-| `occupation` | category | Education; Health; Government and public services; IT and services; Manufacturing; Agriculture; Retail and trade; NGO or social sector; Others; Invalid | | yes | 2123 (C6, M6) | the list is a SECTOR list: overlaps (a government school teacher: the seed says the sector wins), where homemaker, student, retired, unemployed, self-employed and daily-wage workers go (the seed: Others). The labels are capitalised; DOTS may want the raw answer (B3) |
+| Field | Kind | Categories / bands | Flags |
+|---|---|---|---|
+| `gender` | category | Male; Female; Others; Prefer not to say; Invalid response; Unsure / don't know |  |
+| `age` | integer | < 12; ≥ 12 and < 26; ≥ 26 and < 36; ≥ 36 and < 46; ≥ 46 and < 60; ≥ 60 | special: Prefer not to say; Unclear; Invalid response |  |
+| `state` | category | the 36 states and union territories | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `district` | free_text | free text | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `occupation` | category | Education; Health; Government and public services; IT and services; Manufacturing; Agriculture; Retail and trade; NGO or social sector; Others; Not currently working; Homemaker; Student; Prefer not to say; Unclear; Invalid response |  |
 
 ## Parent (`Parent_Voice`, DOTS: 10 columns; `child_*`, `disability*`, `school_type` are about the CHILD, `parent_*` about the respondent)
 
-| Field | Kind | Bands / range | S | Prov. | Source | Open product questions |
-|---|---|---|---|---|---|---|
-| `state` | category | 36 states and UTs | | no | 2124 | H4: the child's or the parent's state |
-| `district` | free text | | | no | 2124 | H4 |
-| `child_gender` | category | Male; Female; Others; Prefer not to say; Invalid | | yes | 2121 (H5, F3) | no story categories: Boy/Girl or Male/Female |
-| `disability` | category | Yes; No; Prefer not to say; Invalid | S | yes | 2124 (C9) | whose disability (the seed: the child's); "not asked" for V1 sessions |
-| `disability_type` | free text | the kind, only when `disability` is Yes | S | yes | 2121 (F2) | free text or a standard list |
-| `respondent_relationship` | category | Mother; Father; Guardian | | yes | 2121 (C11) | grandparent, aunt, uncle, older sibling (the seed: Guardian); "both parents" is `unmapped`; Others / Prefer not to say |
-| `school_type` | category | Government; Private; Others; Invalid | | yes | 2124 (H8, C4) | Government-aided for Parent; one name (the story says Child's Institution Type) |
-| `child_grade` | category | Primary (Classes 1-5); Middle (Classes 6-8); Secondary (Classes 9-10); Higher Secondary (Classes 11-12); College/University; Other | | yes | 2124 (C12) as quoted in the sheet review | the V2 bot no longer asks it (M5): V1 and Google Form only; Pre-primary (nursery, LKG, UKG) fits no band; several children |
-| `parent_education` | category | Yes; No | | yes | 2121 (H6, F4) | what the yes/no holds when not answered |
-| `parent_education_level` | category | Did Not Go to School; Primary; Middle; Secondary; Higher Secondary; Undergraduate; Postgraduate; Others; Invalid | | yes | 2124 (C13), ladder inferred from story 2116's copy of the text | H6: `Did Not Go to School` or N/A when `parent_education` is No; PhD above Postgraduate; diploma / ITI; "studied up to class 7" (the seed: the last class attended, Middle) |
+| Field | Kind | Categories / bands | Flags |
+|---|---|---|---|
+| `state` | category | the 36 states and union territories | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `district` | free_text | free text | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `child_gender` | category | Male; Female; Others; Prefer not to say; Invalid response; Unsure / don't know | multi |
+| `disability` | category | Yes; No; Prefer not to say; Invalid response | sensitive |
+| `disability_type` | category | Physical disability; Intellectual disability; Others; Prefer not to say; Invalid response | sensitive; multi; N/A unless disability is Yes |
+| `respondent_relationship` | category | Mother; Father; Guardian; Other relative; Unmapped; Prefer not to say; Invalid response |  |
+| `school_type` | category | Government; Private; Others; Not sure; Prefer not to say; Invalid response |  |
+| `child_grade` | category | Pre-primary; Primary (classes 1-5); Middle (classes 6-8); High school (classes 9-12); Undergraduate/postgraduate; Skill programs; Others; Prefer not to say; Invalid response; Unsure / don't know; Out of school / not currently enrolled | multi; only V1 |
+| `parent_education` | category | Yes; No; Prefer not to say; Invalid response |  |
+| `parent_education_level` | category | Pre-primary; Primary (classes 1-5); Middle (classes 6-8); High school (classes 9-12); Undergraduate/postgraduate; Skill programs; Others; Prefer not to say; Invalid response; Unsure / don't know; Did not go to school |  |
 
 ## Educator (`Educator_Voice`, DOTS: 5 columns)
 
-| Field | Kind | Bands / range | S | Prov. | Source | Open product questions |
-|---|---|---|---|---|---|---|
-| `state` | category | 36 states and UTs | | no | 2116 | H2, C10 |
-| `district` | free text | | | no | 2116 | H2 |
-| `gender` | category | as above | | yes | 2116 | M6, C7 |
-| `institution_type` | category | Government; Private; Others; Invalid | | yes | 2116 (H8, C4) | Government-aided; "Other: teacher trainer" shows both (bug 5759) |
-| `teaching_level` | category | Primary; Middle; Secondary; Higher Secondary; Undergraduate; Postgraduate; Others; Invalid | | yes | 2116 (B1, C14) | **blocking**: the bot asks "primary, middle, high school or college". "High school" and "college" without a named class or degree cannot be split, so the seed leaves them `unmapped` with the words in `raw_value` (re-bandable later). Change the bands to the bot's four options, change the question, or add a "Not specified" band; several levels at once; the metric's name |
-
-Sensitive fields: `monthly_household_income`, `disability` and `disability_type` for Youth, `disability` and `disability_type` for Parent. They are extracted and stored but must stay out of the DOTS export until product confirms (see the commented-out columns of the pivot queries). Gender and age are not marked sensitive: the bot asks them explicitly and the prompt already forbids inferring a gender from a name.
+| Field | Kind | Categories / bands | Flags |
+|---|---|---|---|
+| `state` | category | the 36 states and union territories | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `district` | free_text | free text | special: Prefer not to say; Unmapped; Invalid response; Outside India |  |
+| `gender` | category | Male; Female; Others; Prefer not to say; Invalid response; Unsure / don't know |  |
+| `institution_type` | category | Government; Private; Others; Not sure; Prefer not to say; Invalid response |  |
+| `teaching_level` | category | Pre-primary; Primary (classes 1-5); Middle (classes 6-8); High school (classes 9-12); Undergraduate; Postgraduate; Others; Prefer not to say; Invalid response | multi |
 
 ## Changing a band or a field (or a prompt) without a deploy
 

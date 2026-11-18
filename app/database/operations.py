@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 import asyncpg
 from datetime import datetime, timezone
 
+from app.database.feedback_bot_versions import apply_bot_version_ranks, label_for_incoming_bot, lock_personas
 from app.services.feedback_adapter_config import is_safe_code, is_safe_id, source_label_problem
 from app.services.feedback_constants import (
     ADAPTERS,
@@ -15,6 +16,8 @@ from app.services.feedback_constants import (
     MAX_SEQUENCE,
     NATURAL_KEY_ADAPTERS,
 )
+from app.services.feedback_versions import bot_id_problem
+from app.services.ingestion_validation import is_uuid
 
 logger = logging.getLogger("analytics_service.operations")
 
@@ -488,7 +491,14 @@ async def _ingest_feedback_submission(
     questionnaire_version = data.get("questionnaireVersion")
     if not isinstance(questionnaire_version, str) or len(questionnaire_version.strip()) == 0:
         raise ValueError(f"data.questionnaireVersion must be a non-empty string; rejecting {ident}.")
-    # The bot is informational (Mitra only): kept in meta_data, never matched on.
+    # The bot of a Mitra session (adapter conversation_rows) decides its questionnaire version: the stored version is
+    # the rank of its bot id among the bot ids of the persona, so the bot id is REQUIRED there and must be a positive
+    # integer written in digits (a numeric order must be well defined). Rejected here, before anything is written.
+    # A natural-key (wide_form) event carries no bot; botName is informational.
+    if not is_natural_key:
+        bot_problem = bot_id_problem(data.get("botId"))
+        if bot_problem is not None:
+            raise ValueError(f"data.botId is invalid for adapter {adapter} ({bot_problem}); rejecting {ident}.")
     bot_info = {
         key: value.strip()
         for key, value in (("bot_id", data.get("botId")), ("bot_name", data.get("botName")))
@@ -603,7 +613,46 @@ async def _write_feedback_submission(
     tags = event_payload.get("tags", {})
 
     async with conn.transaction():
+        # A Mitra bot session's questionnaire version is the rank of its bot id inside its persona (tenant, program,
+        # session_type, source). The persona advisory lock is the FIRST thing this transaction takes, before the metadata
+        # upserts, any row lock and the read of the bot ids, so two concurrent ingests of two new bots of one persona can
+        # not each rank without the other and no ingest can wait on the lock while holding a row another one needs (see
+        # app/database/feedback_bot_versions.py). A session that moves persona changes the ranks of its OLD persona too,
+        # so both are locked, in key order.
+        bot_id = None if is_natural_key else bot_info["bot_id"]
+        stored_version_before = None
+        old_bot_persona = None
+        if bot_id is not None:
+            event_program = tags.get("programId")
+            event_program = event_program.strip().lower() if isinstance(event_program, str) and len(event_program.strip()) > 0 else None
+            if event_program is not None and not is_uuid(event_program):
+                raise ValueError(f"tags.programId must be a UUID; rejecting {ident}.")
+            before = await conn.fetchrow(
+                """
+                SELECT fs.session_type, fs.source, fs.questionnaire_version, s.program_id::text AS program_id,
+                       (fs.meta_data ->> 'bot_id') IS NOT NULL AS has_bot
+                FROM feedback_submissions fs
+                JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
+                WHERE fs.submission_id = $1 AND fs.tenant_code = $2
+                """,
+                submission_id, tenant_code,
+            )
+            # the stored program stays when the event names none (the submissions upsert below COALESCEs)
+            effective_program = event_program if event_program is not None else (None if before is None else before["program_id"])
+            personas_to_lock = [(tenant_code, effective_program, session_type, source)]
+            if before is not None:
+                stored_version_before = before["questionnaire_version"]
+                if before["has_bot"]:
+                    old_bot_persona = (tenant_code, before["program_id"], before["session_type"], before["source"])
+                    personas_to_lock.append(old_bot_persona)
+            await lock_personas(conn, personas_to_lock)
+
         program_id, leader_id = await upsert_metadata(conn, tags, tenant_code)
+
+        if bot_id is not None:
+            questionnaire_version = await label_for_incoming_bot(
+                conn, tenant_code, effective_program, session_type, source, submission_id, bot_id
+            )
 
         # The persona the stored session had before this event (session_type, source, program): it selects the
         # extraction config, prompt and closing keys. Read under the row locks in the order the extraction save takes
@@ -782,7 +831,10 @@ async def _write_feedback_submission(
                 submission_id, tenant_code,
             )
             persona_changed = persona_before != _persona_key(session_type, source, program_now)
-        if persona_changed:
+        # The bot rank of the session itself changed (a redelivery with another bot id, or a lower bot id among the
+        # other sessions): what the older label's extraction wrote no longer describes it either.
+        version_changed = stored_version_before is not None and stored_version_before != questionnaire_version
+        if persona_changed or version_changed:
             # The session moved to another persona (a redelivery that changed only session_type, source or program):
             # what the OLD persona's extraction wrote no longer describes it. Drop its extracted fields and its
             # extraction record, and go back to "not checked" (the PII flag), in this same transaction; the session
@@ -806,6 +858,21 @@ async def _write_feedback_submission(
                 "WHERE submission_id = $1 AND tenant_code = $2 AND pii_detected IS NOT NULL",
                 submission_id, tenant_code,
             )
+
+        # The ranks of the persona(s) after this session: relabel every stored session whose label changed (a new bot id
+        # lower than stored ones shifts them) and send it back through processing; the old persona of a session that
+        # moved loses that session's bot id, which can shift its ranks too.
+        restamped: List[str] = []
+        if bot_id is not None:
+            program_final = await conn.fetchval(
+                "SELECT program_id::text FROM submissions WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            personas = [(tenant_code, program_final, session_type, source)]
+            if old_bot_persona is not None and old_bot_persona != personas[0]:
+                personas.append(old_bot_persona)
+            for persona in personas:
+                restamped.extend((await apply_bot_version_ranks(conn, *persona))["restamped"])
 
         changed = submission_changed or payload_changed or len(upserted) > 0 or parents_set > 0
         if changed and db_sub_status != "pending":
@@ -831,6 +898,8 @@ async def _write_feedback_submission(
         "messages_inserted": messages_inserted,
         "messages_updated": messages_updated,
         "parents_set": parents_set,
+        # other stored sessions of the persona whose questionnaire version moved with the bot ranks (now 'pending')
+        "restamped_submission_ids": [sid for sid in restamped if sid != submission_id],
     }
 
 

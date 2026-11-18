@@ -29,7 +29,7 @@ def _msg(sequence, text, parent=None):
             "translatedMessage": None, "messageAt": None, "parentSequence": parent}
 
 
-def _event(sid, sess, messages, bot_id=None):
+def _event(sid, sess, messages, bot_id=YOUTH["bot_id"]):
     event = {
         "submissionId": sid, "sessionId": sess, "submissionType": "feedback", "tenantCode": "mitra",
         "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z",
@@ -90,14 +90,16 @@ def test_a_parent_link_only_change_resets_the_flag_too():
     _run(body)
 
 
-def test_bot_info_is_stored_only_when_the_event_has_one():
+def test_the_bot_id_is_required_and_stored():
+    # CHANGED (was: stored only when the event has one): a conversation_rows event without a bot id is rejected now,
+    # because its questionnaire version is the rank of its bot id
     async def body(conn):
         sid, sess = f"p{uuid.uuid4().hex[:14]}", f"sess-{uuid.uuid4().hex}"
         msgs = [_msg(1, "How old are you?"), _msg(2, "17", 1)]
+        with pytest.raises(ValueError, match="data.botId is invalid"):
+            await insert_or_update_submission(conn, _event(sid, sess, msgs, bot_id=None))
+        assert await conn.fetchval("SELECT count(*) FROM submissions WHERE submission_id = $1", sid) == 0
         await insert_or_update_submission(conn, _event(sid, sess, msgs))
-        meta = await conn.fetchval("SELECT meta_data FROM feedback_submissions WHERE submission_id = $1", sid)
-        assert meta is None or "bot_id" not in (json.loads(meta) if isinstance(meta, str) else meta)
-        await insert_or_update_submission(conn, _event(sid, sess, msgs, bot_id=YOUTH["bot_id"]))
         meta = await conn.fetchval("SELECT meta_data FROM feedback_submissions WHERE submission_id = $1", sid)
         assert (json.loads(meta) if isinstance(meta, str) else meta)["bot_id"] == YOUTH["bot_id"]
     _run(body)

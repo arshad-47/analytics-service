@@ -165,7 +165,9 @@ names) is onboarded by adding config rows, with no code change.
   * `conversation_rows`: one row per message (a bot conversation export). Sessions grow, so a re-upload adds the new rows.
     Optional `column_map` (role to CSV column name; roles not listed keep the role name as header; required roles:
     `session_type`, `session_status`, `session`, `submission_id`, `language`, `sequence`, `message`, `created_at`, `stage`,
-    `sender_id`; optional: `bot_id`, `bot_name`, `translated_message`, `conversation_row_id`, `receiver_id`, `updated_at`)
+    `sender_id`; optional: `bot_name`, `translated_message`, `conversation_row_id`, `receiver_id`, `updated_at`; the `bot_id`
+    role is also REQUIRED in the file, see "Record questionnaire versions" below, but is named by `column_map` like the rest,
+    for example `"bot_id": "company_bot_id"`)
     and optional `completion_map` (the source's own status words to `COMPLETED` / `IN_PROGRESS`; the seed lists both
     explicitly). A source with other headers or other status words only changes these two keys.
   * `wide_form`: one row per respondent, one column per question (a form export). A response is final: it has a natural
@@ -220,13 +222,30 @@ curl -X POST localhost:8000/v1/upload/ -H "Authorization: Bearer $TOKEN" \
   -F tenant_code=mitra -F source=mitra -F file=@out/Youth_Voice.csv
 ```
 
-**3. Record questionnaire versions as data, not code.** Every session carries a `questionnaire_version` (V1, V2 ...)
-derived from when it started, using windows stored in the database (the persona's Mitra upload config). A new
-database only has the baseline `V1`. When a bot's questions change, record the moment the change went live; no code
-change and no deploy are needed, for V2, V3, V4 alike. You do not have to know the date: `detect` reads the
-questions the stored sessions were asked (the scripted question of each step, not the LLM probes), and when a new
-question set has appeared it proposes the next key, the instant it started and the `set` command to run. It is
-read-only; a person confirms by running `set`:
+**3. Questionnaire versions.** Every session carries a `questionnaire_version` (V1, V2 ...). Two rules, by kind of session:
+
+* **Mitra bot sessions (adapter `conversation_rows`): the version follows the ORDER OF THE BOT IDS.** A new questionnaire
+  is always a new bot id. Within a persona (tenant, program, `session_type`, source) the distinct bot ids stored are ranked
+  by number: the lowest bot id is `V1`, the next `V2`, then `V3` ... (for example bot 89 is `V1` and bot 103 is `V2`, in
+  whichever order their sessions arrive). The bot id is REQUIRED: the CSV needs the `bot_id` column (named by the config's
+  `column_map`, for example `company_bot_id`), a session needs exactly one bot id in it, and an event without a
+  `data.botId` that is a positive integer written in digits is rejected. When a bot id lower than stored ones appears
+  (89 after 103), the ranks of the others shift (103 becomes `V2`): in the same transaction as the ingest the stored
+  sessions whose label changed are relabelled and sent back through processing (their extracted fields, PII flag and
+  `meta_data.extraction` are removed and `submissions.status` is `pending`; `llm_logs` stay), because a field that exists
+  in one questionnaire version only is `N/A` by version. Nothing is recorded by hand. The `questionnaireVersion` of the
+  event (from the date windows below) is still required and validated, but it is not what is stored for these sessions.
+  `restamp` recomputes the bot-rank labels (the manual repair); `list` and `detect` show each bot with its label next to
+  the stamped ones.
+* **Google Forms (adapter `wide_form`) and sessions without a bot id: the version is data in the database.** A Google
+  Forms response gets the `questionnaire_version` of its form (set per form in its config). For the rest, the date
+  windows stored in the persona's upload config (`questionnaire_versions`, effective from a start time) apply, and `set`
+  is the manual override. A new database only has the baseline `V1`. When the questions of such a source change, record
+  the moment the change went live; no code change and no deploy are needed, for V2, V3, V4 alike. `set` refuses a persona
+  whose stored sessions carry bot ids (their version follows the bot id order, a window would change nothing). You do not
+  have to know the date: `detect` reads the questions the stored sessions were asked (the scripted question of each
+  step, not the LLM probes), and when a new question set has appeared it proposes the next key, the instant it started
+  and the `set` command to run. It is read-only; a person confirms by running `set`:
 ```bash
 python tools/questionnaire_versions.py detect --session-type Youth_Voice
 python tools/questionnaire_versions.py list
@@ -236,7 +255,7 @@ python tools/questionnaire_versions.py set --session-type Youth_Voice --key V3 \
     --effective-from 2026-12-01T10:30:00+05:30 --note "new confidence question"
 ```
 `set` writes a new config version (the old one stays as history and can be re-activated to roll back) and relabels
-the sessions already stored. Sessions uploaded before a version is recorded are relabelled when it is.
+the sessions already stored that have no bot id. Sessions uploaded before a version is recorded are relabelled when it is.
 `detect` learns what each version asks from its first 100 stored sessions (`--baseline-sessions`), so on a very
 small deployment lower that number; it finds new question sets but does not audit dates you recorded by hand.
 
@@ -327,8 +346,8 @@ same name) and `completion_map` (`COMPLETED` / `IN_PROGRESS` map to themselves);
 `questionnaire_version` `"V1"`; and `max_csv_upload_bytes`, `ingestion_schema`, `process_steps` as `migrate` does. An existing key
 is never overwritten, and a config whose result would not validate is not written (reported under `invalid`). It then fills
 `feedback_submissions.session_type` (from the only config of the session's tenant, source and program) and
-`questionnaire_version` (`conversation_rows`: from the config's windows and the session's first message; `wide_form`:
-the version all forms share) where they are NULL; a value already set is never changed. Finally it creates the unique
+`questionnaire_version` (`conversation_rows`: from the config's windows and the session's first message, a legacy session
+has no bot id; `wide_form`: the version all forms share) where they are NULL; a value already set is never changed. Finally it creates the unique
 index once the data allows it. If you later record a V2 window, run `tools/questionnaire_versions.py set` as usual: it
 relabels the sessions. `migrate` (only the three per-bot defaults and the adapter) stays for databases that already
 have `session_type`.

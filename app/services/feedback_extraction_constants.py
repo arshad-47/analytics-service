@@ -38,7 +38,26 @@ EXTRACTION_CONFIG_SCHEMA_VERSION = 1
 STATUS_EXTRACTED = "extracted"
 STATUS_NOT_PROVIDED = "not_provided"
 STATUS_UNMAPPED = "unmapped"
-EXTRACTION_STATUSES = (STATUS_EXTRACTED, STATUS_NOT_PROVIDED, STATUS_UNMAPPED)
+STATUS_NOT_APPLICABLE = "not_applicable"   # the question does not exist in the session's questionnaire version, or an earlier answer makes it moot
+EXTRACTION_STATUSES = (STATUS_EXTRACTED, STATUS_NOT_PROVIDED, STATUS_UNMAPPED, STATUS_NOT_APPLICABLE)
+
+# The labels the ENGINE writes into feedback_extracted_data.value: a value is never empty. One normalised spelling for
+# every program and every field (sentence case: the first word capitalised, the rest as written; proper nouns such as
+# state names keep their own capitals). A config's category lists use the same spellings for the labels they share.
+LABEL_NOT_ANSWERED = "Not answered"      # status not_provided: the question applies but there is no answer (skipped, or the session ended)
+LABEL_NOT_APPLICABLE = "N/A"             # status not_applicable: not asked in this questionnaire version, or an earlier answer makes it moot
+LABEL_PREFER_NOT_TO_SAY = "Prefer not to say"
+LABEL_INVALID = "Invalid response"       # gibberish or irrelevant to the question
+LABEL_OTHERS = "Others"                  # a valid answer that is not one of the listed categories
+LABEL_UNMAPPED = "Unmapped"              # a place that does not identify one state / district
+LABEL_UNCLEAR = "Unclear"                # an answer that cannot be put in one band (a range across bands, 'thirty something')
+# A model answer that names one of these is a value that needs a person's look: the status is `unmapped`, not `extracted`.
+UNMAPPED_LABELS = (LABEL_UNMAPPED, LABEL_INVALID, LABEL_UNCLEAR)
+# In a multi-value field these labels stand alone: next to a real category they are dropped (the real answer wins).
+EXCLUSIVE_LABELS = (LABEL_PREFER_NOT_TO_SAY, LABEL_INVALID, LABEL_UNCLEAR, LABEL_UNMAPPED, "Unsure / don't know", "Outside India")
+MULTI_VALUE_SEPARATOR = ", "             # feedback_extracted_data.value of a multi-value field; the labels contain no comma
+# What a banded number field accepts as a stated number (decimals: 15.5 is a valid age).
+MAX_BAND_NUMBER_DIGITS = 6
 
 KIND_CATEGORY = "category"
 KIND_FREE_TEXT = "free_text"

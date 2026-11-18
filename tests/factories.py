@@ -79,8 +79,10 @@ def conversation_messages(question: str = "How old are you?", answers=("41",), k
 def conversation_event(program: Dict[str, str], session_type: str, source: str = "mitra", version: str = "V1",
                        started_at: Optional[datetime] = None, *, adapter: str = "conversation_rows",
                        sid: Optional[str] = None, messages: Optional[List[Dict[str, Any]]] = None,
-                       source_ref: Optional[str] = None) -> Dict[str, Any]:
-    """A create event of one session of `program` as the platform publishes it (any source label, any adapter)."""
+                       source_ref: Optional[str] = None, bot_id: Optional[str] = "101") -> Dict[str, Any]:
+    """A create event of one session of `program` as the platform publishes it (any source label, any adapter).
+    A conversation_rows event carries `bot_id` (required there: its questionnaire version is the rank of its bot id
+    inside the persona); a wide_form event carries none."""
     sid = sid if sid is not None else f"c{uuid.uuid4().hex[:14]}"
     started_at = started_at if started_at is not None else at(2026, 11, 10, 8, 0, 0)
     event = {
@@ -96,12 +98,33 @@ def conversation_event(program: Dict[str, str], session_type: str, source: str =
     }
     if source_ref is not None:
         event["data"]["sourceRef"] = source_ref
+    if adapter != "wide_form" and bot_id is not None:
+        event["data"]["botId"] = bot_id
     return event
 
 
 async def store_session(conn, program: Dict[str, str], session_type: str, source: str, version: str,
                         started_at: datetime, **event_options) -> str:
-    """Stores one session through the real ingest path; returns its submission id."""
+    """Stores one session through the real ingest path; returns its submission id. The tests that use it are about
+    version labels that come from date windows, which only apply to a session WITHOUT a bot id (a bot session's label
+    is the rank of its bot id), so a conversation_rows session is stored and then turned into one carrying `version`
+    and no bot id (as_window_stamped_session); pass window_stamped=False to keep it a bot session."""
+    window_stamped = event_options.pop("window_stamped", True)
     event = conversation_event(program, session_type, source, version, started_at, **event_options)
     await insert_or_update_submission(conn, event)
+    if window_stamped and event["data"]["adapter"] != "wide_form":
+        await as_window_stamped_session(conn, event["submissionId"], version, program["tenant"])
     return event["submissionId"]
+
+
+async def as_window_stamped_session(conn, submission_id: str, version: str, tenant: str = "mitra") -> None:
+    """
+    Turns a stored conversation_rows session into one WITHOUT a bot id that carries `version` (what a session stored
+    before the bot id became required looks like). Tests of the date-window machinery (set / restamp / detect, which
+    only touch sessions without a bot id; a bot session's version is the rank of its bot id) use it to get sessions
+    whose label comes from a window.
+    """
+    await conn.execute(
+        "UPDATE feedback_submissions SET meta_data = COALESCE(meta_data, '{}'::jsonb) - 'bot_id', "
+        "questionnaire_version = $3 WHERE submission_id = $1 AND tenant_code = $2",
+        submission_id, tenant, version)

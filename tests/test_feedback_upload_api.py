@@ -293,24 +293,25 @@ def test_feedback_file_with_several_bot_ids_is_accepted_and_all_recorded(client,
     stores.config.assert_awaited_once_with(PROGRAM["id"], "mitra", tenant_code="mitra")  # the bot id never picks the config
 
 
-def test_feedback_file_without_bot_id_column_is_accepted(client, monkeypatch):
+def test_feedback_file_without_bot_id_column_is_rejected_nothing_stored(client, monkeypatch):
+    # CHANGED (was: accepted): the bot id decides the questionnaire version of a session, so the column is required
     stores = _patch_upload_pipeline(monkeypatch)
     header = HEADER.replace("bot_id,", "", 1)
     rows = [r.split(",", 1)[1] for r in _session("a" * 32, "1001")]
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files(_csv(rows, header)))
-    assert resp.status_code == 200, resp.text
-    meta = stores.insert.await_args.kwargs["meta_data"]
-    assert meta["session_type"] == "Youth_Voice"
-    assert "bot_ids" not in meta and "bot_id" not in meta  # nothing to record
-    stores.upload.assert_called_once()
+    assert resp.status_code == 400
+    assert resp.json()["errors"] == ["Missing required column(s): bot_id"]
+    _assert_nothing_stored(stores)
 
 
-def test_feedback_blank_bot_id_on_every_row_is_accepted(client, monkeypatch):
+def test_feedback_blank_bot_id_on_every_row_is_rejected_nothing_stored(client, monkeypatch):
+    # CHANGED (was: accepted)
     stores = _patch_upload_pipeline(monkeypatch)
     rows = [r.replace("90,Youth,", ",Youth,", 1) for r in _session("a" * 32, "1001")]
     resp = client.post("/v1/upload/", headers=_headers(), data=_form(), files=_files(_csv(rows)))
-    assert resp.status_code == 200, resp.text
-    assert "bot_ids" not in stores.insert.await_args.kwargs["meta_data"]
+    assert resp.status_code == 400
+    assert resp.json()["errors"] == ["bot_id is blank in every row; every session needs the bot id that asked its questions"]
+    _assert_nothing_stored(stores)
 
 
 def test_feedback_file_without_session_type_column_rejected_nothing_stored(client, monkeypatch):
@@ -555,7 +556,7 @@ def test_mitra_source_with_gforms_shaped_file_rejected(client, monkeypatch):
     assert resp.status_code == 400
     # a wide Google Forms export has none of the Mitra columns (the active config is looked up first)
     (error,) = resp.json()["errors"]
-    assert error == "Missing required column(s): " + ", ".join(COLUMN_ROLES_REQUIRED)
+    assert error == "Missing required column(s): " + ", ".join((*COLUMN_ROLES_REQUIRED, "bot_id"))
     _assert_nothing_stored(stores)
 
 

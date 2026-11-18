@@ -176,9 +176,10 @@ def test_each_persona_extracts_with_its_own_prompt_and_stores_every_dots_field_a
     async def body(conn, pool):
         for persona, p in PERSONAS.items():
             config = fx.parse_extraction_config(extraction_config_v1(persona))
-            values = {n: {"value": None, "raw": None} for n in config.field_names()}
+            # the sessions of this test are stamped V1: the model is asked (and answers) only the fields V1 asks
+            values = {f.name: {"value": None, "raw": None} for f in config.fields_for("V1")}
             if "age" in values:
-                values["age"] = {"value": "014", "raw": "fourteen"}      # the model's text; stored canonically
+                values["age"] = {"value": "014.5", "raw": "fourteen and a half"}      # the model's text; stored as its band
             values["state"] = {"value": "Kerala", "raw": "kerala"}
             answer = json.dumps({"fields": values, "pii": {"detected": False, "types": []}})
             sid = await _add(conn, persona, _messages())
@@ -192,7 +193,14 @@ def test_each_persona_extracts_with_its_own_prompt_and_stores_every_dots_field_a
             assert set(rows) == set(config.field_names())
             assert rows["state"]["value"] == "Kerala" and rows["state"]["status"] == "extracted"
             if "age" in rows:
-                assert (rows["age"]["value"], rows["age"]["status"]) == ("14", "extracted")
+                expected_band = "≥ 12 and < 16" if persona == "Youth" else "≥ 12 and < 26"
+                assert (rows["age"]["value"], rows["age"]["status"], rows["age"]["raw_value"]) == (
+                    expected_band, "extracted", "fourteen and a half")
+                assert list(rows["age"]["value_list"]) == [expected_band]
+            if persona == "Youth":      # V1: the monthly income was never asked, the code says so without the model
+                assert (rows["monthly_household_income"]["value"], rows["monthly_household_income"]["status"]) == ("N/A", "not_applicable")
+                assert (rows["annual_household_income"]["value"], rows["annual_household_income"]["status"]) == ("Not answered", "not_provided")
+                assert rows["disability_type"]["value"] == "N/A"       # no disability answer: the type does not apply
             prompt_version = await conn.fetchval(
                 "SELECT pv.id FROM prompt_version pv JOIN prompts pr ON pr.id = pv.prompt_id WHERE pr.name = $1",
                 PERSONA_PROMPT_NAMES[persona])

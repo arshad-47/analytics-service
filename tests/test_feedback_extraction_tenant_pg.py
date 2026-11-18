@@ -89,7 +89,7 @@ def _event(tenant, sid, marker, answer_count=1):
     return {
         "submissionId": sid, "sessionId": f"sess-{tenant}-{sid}", "submissionType": "feedback", "tenantCode": tenant,
         "eventType": "create", "eventPublishedAt": "2026-11-10T00:00:00.000Z", "tags": tags,
-        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice", "questionnaireVersion": "V2",
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice", "questionnaireVersion": "V2", "botId": "101",
                  "language": "en", "completionStatus": "COMPLETED", "submissionDate": "2026-11-10T00:00:00+00:00",
                  "messages": _messages(marker, answer_count)},
     }
