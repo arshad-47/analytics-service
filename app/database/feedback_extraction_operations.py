@@ -5,8 +5,11 @@ Database side of the feedback metadata extraction, shared by the Temporal activi
 `extract_submission` is the one entry point: it loads a stored session, its active extraction config version and
 the active prompt version the config selects (`prompt_name`, required), makes ONE LLM call with no database connection held, and (unless it is a dry run)
 writes the field rows, the PII flag and the llm log in ONE transaction. Re-running a session overwrites its rows.
-Nothing in here logs conversation text; error messages carry no respondent text and no provider text. The only text stored besides
-the extracted values is the MASKED question and answer JSON of the optional masking call (meta_data.extraction.masking).
+Nothing in here logs conversation text; error messages carry no respondent text and no provider text. The text stored
+besides the extracted values: the MASKED question and answer JSON of the optional masking call and the model's
+justifications (meta_data.extraction.masking, feedback_extracted_data.justification); the complete answers of the two
+calls of a session that is NOT flagged (meta_data.extraction.responses, replaced by every re-run); and a truncated copy
+of the answer of a call that failed to give a usable one (llm_logs.meta_data.response).
 
 A session can grow (a delta event) while the LLM call is running. The write transaction therefore locks the
 feedback_submissions row, re-reads the session and compares a content fingerprint with the one taken at load: if it
@@ -14,11 +17,13 @@ differs NOTHING is written (the PII flag stays as the ingest left it, NULL) and 
 the step is retried on the new content. A flag computed from older text is never stored.
 """
 import asyncio
+import copy
 import hashlib
 import json
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,8 +44,11 @@ from app.services.feedback_extraction_constants import (
     ACTIVITY_MARGIN_SECONDS,
     ANALYSIS_TYPE,
     CONFIG_TYPE_FEEDBACK_EXTRACTION,
+    FAILED_RESPONSE_MAX_CHARS,
     MIN_LLM_CALL_SECONDS,
     PII_MASKING_ANALYSIS_TYPE,
+    STAGE_METADATA_EXTRACTION,
+    STAGE_PII_MASKING,
 )
 from app.services.feedback_pii_masking import MaskingStep, masking_meta
 from app.services.llm import split_llm_usage
@@ -297,6 +305,7 @@ async def save_extraction(
     input_identity: Optional[Tuple[Any, Any, Optional[str]]] = None,
     masking: Optional[Mapping[str, Any]] = None,
     extra_llm_logs: Sequence[Mapping[str, Any]] = (),
+    responses: Optional[Mapping[str, str]] = None,
 ) -> None:
     """
     ONE transaction: lock the submissions row, then the feedback_submissions row (the order of the ingest path,
@@ -306,9 +315,15 @@ async def save_extraction(
     StaleExtractionError and write nothing. Otherwise upsert one row per field (a re-run overwrites; a field that is no longer configured is
     deleted), set feedback_submissions.pii_detected and merge the `extraction` object into its meta_data, and
     write the llm log (when the LLM was called). `run_at` is the time the input was loaded. The meta_data object
-    holds ids, PII types and the time; when the masking call ran (`masking`) it also holds that call's MASKED answers (never the original text). session_type / questionnaire_version are not copied into the rows.
+    holds ids, PII types and the time; when the masking call ran (`masking`) it also holds that call's MASKED answers and
+    findings (never the original text). `responses` ({'masking': text, 'extraction': text}, the complete answers of the
+    calls) is stored under `extraction.responses` ONLY when the session is not flagged pii_detected: the extraction
+    answer repeats what the respondent said, and a flagged session keeps no respondent words. The whole `extraction`
+    object is replaced by a re-run, so older responses never linger. session_type / questionnaire_version are not copied
+    into the rows.
     """
     names = [f.field_name for f in result.fields]
+    justifications = [f.justification for f in result.fields]
     confidences = [None if f.confidence is None else Decimal(str(f.confidence)) for f in result.fields]
     extraction_meta = {
         "config_version_id": str(config_version_id),
@@ -318,6 +333,9 @@ async def save_extraction(
     }
     if masking is not None:
         extraction_meta["masking"] = dict(masking)   # the MASKED answers, pii types and abuse flag of the masking call
+    kept_responses = {k: v for k, v in (responses or {}).items() if isinstance(v, str)}
+    if len(kept_responses) > 0 and not result.pii_detected:
+        extraction_meta["responses"] = kept_responses
     async with conn.transaction():
         # The ingest path takes these same row locks, in this same order (submissions, then feedback_submissions),
         # when it touches the session, so after these statements the messages and the persona cannot change
@@ -347,17 +365,18 @@ async def save_extraction(
             """
             INSERT INTO feedback_extracted_data (
                 submission_id, tenant_code, field_name,
-                value, raw_value, status, confidence, config_version_id, prompt_version_id, extracted_at
+                value, raw_value, status, confidence, justification, config_version_id, prompt_version_id, extracted_at
             )
-            SELECT $1, $2, t.field_name, t.value, t.raw_value, t.status, t.confidence,
+            SELECT $1, $2, t.field_name, t.value, t.raw_value, t.status, t.confidence, t.justification,
                    $3::uuid, $4::uuid, $5::timestamptz
-            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::numeric[])
-                 AS t(field_name, value, raw_value, status, confidence)
+            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::numeric[], $11::text[])
+                 AS t(field_name, value, raw_value, status, confidence, justification)
             ON CONFLICT (submission_id, tenant_code, field_name) DO UPDATE SET
                 value = EXCLUDED.value,
                 raw_value = EXCLUDED.raw_value,
                 status = EXCLUDED.status,
                 confidence = EXCLUDED.confidence,
+                justification = EXCLUDED.justification,
                 config_version_id = EXCLUDED.config_version_id,
                 prompt_version_id = EXCLUDED.prompt_version_id,
                 extracted_at = EXCLUDED.extracted_at,
@@ -366,7 +385,7 @@ async def save_extraction(
             submission_id, tenant_code,
             str(config_version_id), str(prompt_version_id), run_at,
             names, [f.value for f in result.fields], [f.raw_value for f in result.fields],
-            [f.status for f in result.fields], confidences,
+            [f.status for f in result.fields], confidences, justifications,
         )
         await conn.execute(
             """
@@ -401,14 +420,30 @@ def _safe_error_text(error: BaseException) -> str:
     return type(error).__name__
 
 
+def failed_response_meta(response: Any) -> Dict[str, Any]:
+    """
+    {'response': <the model's answer cut to FAILED_RESPONSE_MAX_CHARS>[, 'response_truncated': True]} for the llm log of
+    a call whose answer could not be used, {} when there is none (a timeout or a refused call has no answer). This is
+    the one place a failed answer is kept, so a bad answer can be read without calling the model again.
+    """
+    if not isinstance(response, str) or len(response) == 0:
+        return {}
+    meta: Dict[str, Any] = {"response": response[:FAILED_RESPONSE_MAX_CHARS]}
+    if len(response) > FAILED_RESPONSE_MAX_CHARS:
+        meta["response_truncated"] = True
+    return meta
+
+
 async def _log_failed_call(pool, submission_id, tenant_code, model, prompt_version_id, error: Optional[Exception], usage,
-                           analysis_type: str = ANALYSIS_TYPE) -> None:
+                           analysis_type: str = ANALYSIS_TYPE, response: Any = None) -> None:
     """
     Best effort: a failure of the logging must not hide the real error. `error` None logs the call as a success
-    (the masking call that worked before the extraction call failed: it still cost tokens).
+    (the masking call that worked before the extraction call failed: it still cost tokens). `response` (the answer of
+    a call that was made but not usable) is kept, cut, in the log's meta_data.
     """
     try:
         prompt_tokens, completion_tokens, usage_meta = split_llm_usage(usage)
+        usage_meta = {**usage_meta, **failed_response_meta(response)}
         async with pool.acquire() as conn:
             await insert_llm_log(
                 conn, submission_id, tenant_code, model, analysis_type, str(prompt_version_id),
@@ -491,6 +526,81 @@ def clamp_llm_timeout(timeout: int, activity_budget_seconds: int, elapsed_second
     return available
 
 
+# The stage timings have a clock of their own: the activity-budget arithmetic above reads `_monotonic` at exact points
+# (tests feed it a fixed sequence), and reporting a stage must never consume or shift those readings.
+_stage_clock = time.monotonic
+
+
+class StageTracker:
+    """
+    What the stages of the ONE Temporal activity did, in order: [{'name': 'pii_masking', 'status': 'success',
+    'seconds': 1.3, 'prompt_tokens': 812, 'completion_tokens': 140}, {'name': 'metadata_extraction', ...}]. A status is
+    'running' (started), 'success', 'failed' or 'skipped' (with a 'reason'). Temporal shows one activity for the
+    step, so this record is the stage-by-stage view of it: it is the activity's result, the step's entry in
+    submissions.process_status and, while the activity runs, its heartbeat details (`on_stage`, called with a copy of
+    the whole list after every change; Temporal throttles heartbeats, so a short stage can be missed live).
+    `update` is called on the worker thread that makes the LLM calls and from the event loop: it is thread-safe, never
+    carries text (names, statuses, seconds and token counts only), and an error in `on_stage` never reaches the
+    extraction.
+    """
+
+    def __init__(self, submission_id: str, on_stage: Optional[Callable[[List[Dict[str, Any]]], None]] = None, loop=None):
+        self._submission_id = submission_id
+        self._on_stage = on_stage
+        self._loop = loop
+        self._loop_thread = threading.get_ident()   # built on the event loop's thread (extract_submission is a coroutine)
+        self._lock = threading.Lock()
+        self._stages: List[Dict[str, Any]] = []
+        self._started: Dict[str, float] = {}
+
+    @property
+    def stages(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return copy.deepcopy(self._stages)
+
+    def update(self, stage: str, status: str, usage: Optional[Mapping[str, Any]] = None, reason: Optional[str] = None) -> None:
+        now = _stage_clock()
+        with self._lock:
+            if status == "running":
+                self._started[stage] = now
+                record: Dict[str, Any] = {"name": stage, "status": "running"}
+                self._stages.append(record)
+            else:
+                record = next((r for r in reversed(self._stages) if r["name"] == stage), None)
+                if record is None:       # a skipped stage never ran
+                    record = {"name": stage}
+                    self._stages.append(record)
+                record["status"] = status
+                if stage in self._started:
+                    record["seconds"] = round(now - self._started[stage], 2)
+                if usage is not None:
+                    prompt_tokens, completion_tokens, _ = split_llm_usage(dict(usage))
+                    record["prompt_tokens"] = prompt_tokens
+                    record["completion_tokens"] = completion_tokens
+                if reason is not None:
+                    record["reason"] = reason
+            snapshot = copy.deepcopy(self._stages)
+        logger.info("feedback extraction stage %s %s for submission %s%s", stage, status, self._submission_id,
+                    "" if "seconds" not in record else f" in {record['seconds']} s")
+        if self._on_stage is None:
+            return
+        try:
+            if self._loop is not None and threading.get_ident() != self._loop_thread:
+                # The Temporal SDK's heartbeat must be called on the event loop's thread; the calls run on a worker
+                # thread. call_soon_threadsafe carries this thread's context, so the activity is still the current one.
+                self._loop.call_soon_threadsafe(self._relay, snapshot)
+            else:
+                self._relay(snapshot)
+        except Exception:  # noqa: BLE001 - reporting must never fail the extraction
+            pass
+
+    def _relay(self, snapshot: List[Dict[str, Any]]) -> None:
+        try:
+            self._on_stage(snapshot)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @dataclass
 class SubmissionOutcome:
     submission_id: str
@@ -504,6 +614,7 @@ class SubmissionOutcome:
     written: bool
     field_kinds: Dict[str, str] = field(default_factory=dict)   # field name -> 'category' | 'free_text' | 'integer'
     prompt_name: Optional[str] = None                           # the prompt that was used
+    stages: List[Dict[str, Any]] = field(default_factory=list)  # what each LLM stage did, see StageTracker
 
 
 async def extract_submission(
@@ -516,6 +627,7 @@ async def extract_submission(
     write: bool = True,
     mark_processing: bool = False,
     activity_budget_seconds: Optional[int] = None,
+    on_stage: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> SubmissionOutcome:
     """
     Extracts the metadata of one stored feedback session.
@@ -535,12 +647,17 @@ async def extract_submission(
     function so far) - ACTIVITY_MARGIN_SECONDS (a WARNING names both numbers); a budget with nothing left raises
     ExtractionSetupError (non-retryable), a budget the preparation used up raises ExtractionBudgetExhaustedError
     (retryable), both before any call.
+    `on_stage` (the Temporal activity passes its heartbeat) is called with the stage list (see StageTracker) after each
+    stage change; the final list is `SubmissionOutcome.stages`, and `exc.stages` of an error raised after the calls
+    began. The complete answers of the calls are stored with the session (not when it is flagged) and the answer of a
+    call that was not usable is kept, cut, in its failed llm log.
     """
     if llm_function is None:
         from app.services.llm import openrouter_chat_completion
         llm_function = openrouter_chat_completion
     overrides = llm_overrides if llm_overrides is not None else {}
     started = _monotonic()   # the activity budget runs from here: the preparation below is part of it
+    tracker = StageTracker(submission_id, on_stage, asyncio.get_running_loop())
 
     async with pool.acquire() as conn:
         if mark_processing:
@@ -587,24 +704,29 @@ async def extract_submission(
     masking_step = None if masking_prompt is None else MaskingStep(
         masking_prompt["system_prompt"], masking_prompt["user_prompt"], make_call("masking"))
 
-    async def log_call(purpose: str, error: Optional[Exception], usage: Any) -> None:
+    async def log_call(purpose: str, error: Optional[Exception], usage: Any, response: Any = None) -> None:
         version = masking_version_id if purpose == "masking" else prompt_version_id
         await _log_failed_call(pool, submission_id, tenant_code, llm["model"], version, error, usage,
-                               PII_MASKING_ANALYSIS_TYPE if purpose == "masking" else ANALYSIS_TYPE)
+                               PII_MASKING_ANALYSIS_TYPE if purpose == "masking" else ANALYSIS_TYPE, response)
 
     try:
         run = await asyncio.to_thread(
             extract, inputs["rows"], config, prompt["system_prompt"], prompt["user_prompt"], make_call("extraction"),
-            inputs["closing_keys"], masking_step,
+            inputs["closing_keys"], masking_step, tracker.update,
         )
     except Exception as exc:
+        exc.stages = tracker.stages
         if write:
             failing = getattr(exc, "purpose", "extraction")
             if failing != "masking" and calls["masking"]["usage"] is not None:
                 await log_call("masking", None, calls["masking"]["usage"])
             if calls[failing]["made"]:
-                await log_call(failing, exc, getattr(exc, "usage", {}))
+                await log_call(failing, exc, getattr(exc, "usage", {}), getattr(exc, "response", None))
         raise
+    if not run.llm_called:
+        # No call was made (no respondent answer, an oversized message ...): say so, so the stage list is never empty.
+        for skipped in ([STAGE_PII_MASKING] if masking_step is not None else []) + [STAGE_METADATA_EXTRACTION]:
+            tracker.update(skipped, "skipped", reason=run.skip_reason)
 
     if write:
         llm_log = None
@@ -635,10 +757,13 @@ async def extract_submission(
                     result=run.result, config_version_id=config_version_id, prompt_version_id=prompt_version_id,
                     run_at=inputs["loaded_at"], llm_log=llm_log,
                     masking=masking_stored, extra_llm_logs=() if masking_log is None else (masking_log,),
+                    responses={"masking": None if run.masking is None else run.masking.response,
+                               "extraction": run.response},
                 )
             except StaleExtractionError as exc:
                 stale = exc
         if stale is not None:
+            stale.stages = tracker.stages
             # Nothing was written (the transaction rolled back). The call still cost tokens: log it as failed.
             # This runs AFTER the connection above went back to the pool: _log_failed_call takes its own, and
             # holding one while waiting for another would deadlock a pool whose connections all hold a stale result.
@@ -653,4 +778,5 @@ async def extract_submission(
     return SubmissionOutcome(
         submission_id, tenant_code, inputs["session_type"], inputs["questionnaire_version"], run, llm["model"],
         config_version_id, prompt_version_id, write, {f.name: f.kind for f in config.fields}, prompt["name"],
+        tracker.stages,
     )

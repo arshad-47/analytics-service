@@ -28,6 +28,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from app.services.feedback_extraction_constants import (
+    STAGE_METADATA_EXTRACTION,
+    STAGE_PII_MASKING,
     DEFAULT_MAX_BOT_MESSAGE_CHARS,
     DEFAULT_MAX_CONVERSATION_CHARS,
     DEFAULT_MAX_RAW_CHARS,
@@ -47,6 +49,7 @@ from app.services.feedback_extraction_constants import (
     MASK_LINK,
     MASK_NUMBER,
     MAX_DIGIT_GAP,
+    MAX_JUSTIFICATION_CHARS,
     MIN_COMMA_JOIN_DIGITS,
     MAX_LLM_TIMEOUT_SECONDS,
     MAX_PII_TYPE_DESCRIPTION_CHARS,
@@ -937,12 +940,19 @@ def _render_pii_types(config: ExtractionConfig) -> str:
     return "\n".join(f"- {t}: {_pii_type_description(config, t)}" for t in config.pii_types)
 
 
+JUSTIFICATION_INSTRUCTION = (
+    '"justification" is one short sentence (at most 20 words) saying why you chose the value, or why you left it null '
+    'or put the answer in "raw". Describe the reasoning; do not quote the respondent\'s words. null when the '
+    "respondent did not answer.")
+
+
 def _render_output_format(config: ExtractionConfig) -> str:
     example = {
-        "fields": {n: {"value": None, "raw": None, "confidence": None} for n in config.field_names()},
+        "fields": {n: {"value": None, "raw": None, "confidence": None, "justification": None}
+                   for n in config.field_names()},
         "pii": {"detected": False, "types": []},
     }
-    return json.dumps(example, indent=2)
+    return json.dumps(example, indent=2) + "\n\n" + JUSTIFICATION_INSTRUCTION
 
 
 def _fill(template: str, variables: Mapping[str, str]) -> str:
@@ -984,6 +994,7 @@ class FieldResult:
     raw_value: Optional[str]   # as the model returned it; kept for unmapped
     status: str                # 'extracted' | 'not_provided' | 'unmapped'
     confidence: Optional[float]
+    justification: Optional[str] = None   # the model's own short reason for this value (or for leaving it empty)
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1012,7 @@ class ExtractionRun:
     conversation_turns: int
     skip_reason: Optional[str] = None   # SKIP_NO_ANSWER | SKIP_OVERSIZED | SKIP_TOO_LONG when llm_called is False
     masking: Optional[Any] = None       # MaskingResult of the model-based masking call (app/services/feedback_pii_masking.py)
+    response: Optional[str] = None      # the extraction call's answer as the model returned it (None when no call was made)
 
 
 SKIP_NO_ANSWER = "no_respondent_answer"
@@ -1067,6 +1079,20 @@ _INTEGER_TEXT_RE = re.compile(r"-?[0-9]{1,%d}" % _MAX_INTEGER_DIGITS)
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
+def _justification(value: Any) -> Optional[str]:
+    """
+    The model's short explanation of a value, kept as informational text: optional (an older prompt does not ask for
+    it), so a missing, blank or malformed one (a number, a list) is None and never fails the session; one line, cut to
+    MAX_JUSTIFICATION_CHARS, and neutralised like every stored text (an export cannot run it as a formula).
+    """
+    if not isinstance(value, str):
+        return None
+    text = _clean(value)
+    if len(text) == 0:
+        return None
+    return _neutralise(text[:MAX_JUSTIFICATION_CHARS])
+
+
 def _neutralise(text: Optional[str]) -> Optional[str]:
     """A stored respondent text that starts with = + - @ gets a leading apostrophe, so an export cannot run it as a formula."""
     if text is not None and len(text) > 0 and text[0] in _FORMULA_PREFIXES:
@@ -1126,13 +1152,13 @@ def _map_field(spec: FieldSpec, entry: Mapping[str, Any], config: Optional[Extra
     placeholders = config.placeholders if config is not None else DEFAULT_PLACEHOLDER_KEYS
     result = _map_field_values(spec, entry, limits, placeholders, config)
     raw = _neutralise(result.raw_value) if spec.keeps_raw else None
-    return replace(result, raw_value=raw)
+    return replace(result, raw_value=raw, justification=_justification(entry.get("justification")))
 
 
 def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits, placeholders: FrozenSet[str],
                       config: Optional[ExtractionConfig]) -> FieldResult:
     where = f"field {spec.name!r}"
-    unknown = set(entry) - {"value", "raw", "confidence"}
+    unknown = set(entry) - {"value", "raw", "confidence", "justification"}
     if len(unknown) > 0:
         raise ExtractionOutputError(f"{where} has {len(unknown)} unexpected key(s)")
     if "value" not in entry:
@@ -1207,7 +1233,8 @@ def parse_model_response(text: Any, config: ExtractionConfig) -> ExtractionResul
     """
     Strictly validates the model's answer. Accepted shape (markdown fences around it are tolerated):
 
-        {"fields": {"<name>": {"value": str|null, "raw": str|null, "confidence": number|null}, ...},
+        {"fields": {"<name>": {"value": str|null, "raw": str|null, "confidence": number|null,
+                               "justification": str|null (optional)}, ...},
          "pii": {"detected": bool, "types": [str, ...]}}
 
     (for an 'integer' field "value" may also be a JSON number)
@@ -1280,6 +1307,7 @@ def extract(
     call_llm: LlmCall,
     closing_keys: Sequence[str] = (),
     masking: Optional[Any] = None,
+    progress: Optional[Callable[[str, str, Optional[Mapping[str, Any]]], None]] = None,
 ) -> ExtractionRun:
     """
     Conversation -> prompt -> `call_llm(prompt)` -> validated result. `call_llm` returns (answer text, usage dict).
@@ -1300,7 +1328,20 @@ def extract(
     check and the extraction call: the model masks personal data and abusive language in every respondent answer
     (question and answer JSON in, masked answers out), the extraction prompt receives the masked answers, and
     pii_detected is also TRUE when that call found personal data. The masked answers come back in the run's `masking`.
+
+    `progress(stage, status, usage)` (optional) is told when a call starts ('running') and how it ended ('success' with
+    the call's usage, or 'failed'), for STAGE_PII_MASKING and STAGE_METADATA_EXTRACTION. It runs on the calling thread,
+    never receives text, and an error in it is not allowed to disturb the extraction. A call whose answer cannot be
+    used raises with the answer attached as `exc.response` (for a failure log); a successful run carries the answers
+    in `run.response` and `run.masking.response`.
     """
+    def note(stage: str, status: str, usage: Optional[Mapping[str, Any]] = None) -> None:
+        if progress is not None:
+            try:
+                progress(stage, status, usage)
+            except Exception:  # noqa: BLE001 - reporting must never fail the extraction
+                pass
+
     conversation = build_conversation(rows, closing_keys, config.limits)
     if conversation.respondent_answers == 0:
         return ExtractionRun(empty_result(config), {}, False, len(conversation.turns), SKIP_NO_ANSWER)
@@ -1320,29 +1361,47 @@ def extract(
         # (it is retried); the original text is never used as a fallback.
         from app.services.feedback_pii_masking import (
             MaskingResult, apply_masked_answers, build_masking_input, parse_masking_response, render_masking_prompt)
+        from app.services.feedback_pii_masking import parse_masking_details
         pairs = build_masking_input(conversation)
-        masking_answer, masking_usage = masking.call_llm(render_masking_prompt(masking, pairs))
+        note(STAGE_PII_MASKING, "running")
+        try:
+            masking_answer, masking_usage = masking.call_llm(render_masking_prompt(masking, pairs))
+        except Exception:
+            note(STAGE_PII_MASKING, "failed")
+            raise
         masking_usage = masking_usage if isinstance(masking_usage, dict) else {}
         try:
-            masked, masked_types, abusive, severities = parse_masking_response(
+            masked, masked_types, abusive, severities, findings = parse_masking_details(
                 masking_answer, list(pairs), config.pii_types)
         except ExtractionOutputError as exc:
             exc.usage = masking_usage
             exc.purpose = "masking"
+            exc.response = masking_answer
+            note(STAGE_PII_MASKING, "failed", masking_usage)
             raise
+        note(STAGE_PII_MASKING, "success", masking_usage)
         masking_result = MaskingResult(
             {key: {"question": pairs[key]["question"], "answer": masked[key]} for key in pairs},
-            masked_types, abusive, severities, masking_usage)
+            masked_types, abusive, severities, masking_usage, findings,
+            masking_answer if isinstance(masking_answer, str) else None)
         conversation = apply_masked_answers(conversation, masked)
     prompt = render_prompt(system_template, user_template, config, conversation)
     try:
-        answer, usage = call_llm(prompt)
+        note(STAGE_METADATA_EXTRACTION, "running")
+        try:
+            answer, usage = call_llm(prompt)
+        except Exception:
+            note(STAGE_METADATA_EXTRACTION, "failed")
+            raise
         usage = usage if isinstance(usage, dict) else {}
         try:
             result = parse_model_response(answer, config)
         except ExtractionOutputError as exc:
             exc.usage = usage
+            exc.response = answer
+            note(STAGE_METADATA_EXTRACTION, "failed", usage)
             raise
+        note(STAGE_METADATA_EXTRACTION, "success", usage)
     except Exception as exc:
         if masking_result is not None:
             # The masking call worked and was billed before this failure: callers that total usage need it.
@@ -1355,4 +1414,5 @@ def extract(
         result = apply_pii_precheck(result, rows, config)
     if masking_result is not None:
         result = apply_pii_kinds(result, masking_result.pii_types, config)
-    return ExtractionRun(minimise_flagged(result, config), usage, True, len(conversation.turns), None, masking_result)
+    return ExtractionRun(minimise_flagged(result, config), usage, True, len(conversation.turns), None, masking_result,
+                         answer if isinstance(answer, str) else None)

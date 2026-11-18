@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -59,6 +59,26 @@ def _activity_budget_seconds() -> Optional[int]:
     return int(timeout.total_seconds()) if timeout is not None else None
 
 
+def _report_stages(stages: List[Dict[str, Any]]) -> None:
+    """
+    The stage list as this attempt's heartbeat details: the Temporal UI shows them on the pending activity while it
+    runs (and between retries), so "pii_masking success, metadata_extraction running" is visible live. Temporal throttles
+    heartbeats, so a very short stage can be coalesced; the complete list is in the activity's result. Outside a
+    Temporal activity (tests, the CLI) this does nothing.
+    """
+    try:
+        activity.heartbeat({"stages": stages})
+    except RuntimeError:
+        pass
+
+
+def _failed_stage(exc: BaseException) -> Optional[str]:
+    stages = getattr(exc, "stages", None)
+    if not isinstance(stages, list):
+        return None
+    return next((s.get("name") for s in reversed(stages) if isinstance(s, dict) and s.get("status") == "failed"), None)
+
+
 def _attempt() -> int:
     try:
         return int(activity.info().attempt)
@@ -84,6 +104,10 @@ async def feedback_metadata_extraction_activity(params: Dict[str, Any]) -> Dict[
     the budget minus the margin and minus the time the preparation already used (a WARNING names both numbers)
     instead of failing the run; when the preparation used up the budget the step is retried. To give a longer call
     a bigger budget, set llm_timeout_seconds on the workflow step.
+    Inside this ONE activity the stages run in order: the optional model-based PII / abusive-language masking
+    (`pii_masking`), then the extraction (`metadata_extraction`). Temporal shows a single activity, so the stage view
+    is: heartbeat details while it runs, `stages` in the result when it completes, the failed stage in the error text
+    and details, and the same list in the workflow step's entry of submissions.process_status.
     A conversation without a respondent answer makes no LLM call. Like the other steps this does not set the
     submission's terminal status; the workflow does that once every step has completed.
     """
@@ -102,16 +126,23 @@ async def feedback_metadata_extraction_activity(params: Dict[str, Any]) -> Dict[
             db.pool, submission_id, tenant_code,
             llm_overrides=overrides, write=True, mark_processing=True,
             activity_budget_seconds=_activity_budget_seconds(),
+            on_stage=_report_stages,
         )
     except Exception as exc:
         # Never the message of an extraction error at INFO or above beyond its type: it is built without
         # respondent text, but the provider's error body is not ours to repeat.
-        logger.error("Feedback metadata extraction failed for submission %s: %s", submission_id, type(exc).__name__)
+        failed_stage = _failed_stage(exc)
+        logger.error("Feedback metadata extraction failed for submission %s%s: %s", submission_id,
+                     "" if failed_stage is None else f" in stage {failed_stage}", type(exc).__name__)
         # The workflow's own exception handler marks the step and the submission failed once this propagates.
-        # A failure that retrying cannot fix is raised as non-retryable: no second and third paid attempt.
+        # A failure that retrying cannot fix is raised as non-retryable: no second and third paid attempt. Its text
+        # names the stage that failed and its details carry the stage list (both visible in the Temporal UI).
         non_retryable = classify_failure(exc, _attempt())
         if non_retryable is not None:
-            raise non_retryable from None
+            stages = getattr(exc, "stages", None)
+            text = non_retryable.message if failed_stage is None else f"{non_retryable.message} (stage: {failed_stage})"
+            raise ApplicationError(text, {"stages": stages} if isinstance(stages, list) else {},
+                                   type=non_retryable.type, non_retryable=True) from None
         raise
 
     result = outcome.run.result
@@ -120,4 +151,6 @@ async def feedback_metadata_extraction_activity(params: Dict[str, Any]) -> Dict[
         "llm_called": outcome.run.llm_called,
         "pii_detected": result.pii_detected,
         "fields": {f.field_name: f.status for f in result.fields},
+        # One entry per LLM stage (pii_masking when configured, then metadata_extraction): status, seconds, tokens.
+        "stages": outcome.stages,
     }

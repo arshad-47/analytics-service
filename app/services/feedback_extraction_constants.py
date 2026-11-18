@@ -18,6 +18,18 @@ ANALYSIS_TYPE = STEP_NAME
 # extraction call (`pii.masking_prompt_name` of the extraction config; app/services/feedback_pii_masking.py).
 PII_MASKING_ANALYSIS_TYPE = "feedback_pii_and_abusive_language_detection"
 
+# The stages of the ONE Temporal activity of the step, in the order they run (reported in the activity's result, in its
+# heartbeat details and in submissions.process_status; the masking stage exists only when the config switches it on).
+STAGE_PII_MASKING = "pii_masking"
+STAGE_METADATA_EXTRACTION = "metadata_extraction"
+
+# A justification is the model's own short explanation of a value (feedback_extracted_data.justification) or of a PII /
+# abuse finding (meta_data.extraction.masking.findings). Longer text is cut; it is never trusted as a value.
+MAX_JUSTIFICATION_CHARS = 300
+# The response text of a FAILED call kept in llm_logs.meta_data (successful calls keep theirs in
+# feedback_submissions.meta_data.extraction.responses, see docs/feedback-extraction-and-dots-queries.md).
+FAILED_RESPONSE_MAX_CHARS = 4000
+
 CONFIG_TYPE_FEEDBACK_EXTRACTION = "feedback_extraction"
 CONFIG_SOURCE_ANY = "any"
 EXTRACTION_CONFIG_SCHEMA_VERSION = 1

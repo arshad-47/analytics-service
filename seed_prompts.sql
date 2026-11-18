@@ -1281,16 +1281,16 @@ Return ONLY a valid JSON object (strict JSON, no text outside it). One entry for
   "<answer key>": {
     "masked_text": "the answer with every personal or abusive span replaced by its tag; the answer unchanged when there is nothing to mask",
     "pii_found": [
-      {"type": "PERSON|LOCATION|ID|PHONE|EMAIL", "confidence": 0.0, "reason": "max 8 words"}
+      {"type": "PERSON|LOCATION|ID|PHONE|EMAIL", "confidence": 0.0, "justification": "max 12 words, why this is personal data"}
     ],
     "abusive_language": true/false,
     "abusive_spans": [
-      {"severity": "mild|moderate|severe", "confidence": 0.0, "reason": "max 8 words"}
+      {"severity": "mild|moderate|severe", "confidence": 0.0, "justification": "max 12 words, why this is abusive"}
     ]
   }
 }
 
-Do not copy the original personal or abusive text into pii_found or abusive_spans. Use empty arrays and false for a clean answer. masked_text is never null and never empty unless the answer was empty.',
+Do not copy the original personal or abusive text into pii_found, abusive_spans or any justification: describe it ("a person name", "an insult aimed at a teacher"), never quote it. Use empty arrays and false for a clean answer. masked_text is never null and never empty unless the answer was empty.',
   E'Analyse the following answers:
 {{text}}',
   TRUE,

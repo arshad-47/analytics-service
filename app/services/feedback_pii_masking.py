@@ -31,6 +31,7 @@ from app.services.feedback_extraction import (
     ROLE_RESPONDENT,
     Turn,
     _clean,
+    _justification,
     _no_duplicates,
     _reject_constant,
     _strip_fences,
@@ -57,6 +58,8 @@ class MaskingResult:
     abusive_language: bool
     abusive_severities: Tuple[str, ...]
     usage: Dict[str, Any] = field(default_factory=dict)
+    findings: Tuple[Dict[str, Any], ...] = ()      # what was found, per answer, with the model's justification (no text)
+    response: Optional[str] = None                 # the answer of the call as the model returned it
 
 
 @dataclass(frozen=True)
@@ -101,14 +104,46 @@ def _entry(raw: Any) -> Optional[Mapping[str, Any]]:
     return raw if isinstance(raw, dict) else None
 
 
+def _confidence(value: Any) -> Optional[float]:
+    """A finding's confidence: a number from 0 to 1, anything else is ignored (informational, like the field's)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if 0 <= value <= 1 else None
+
+
+def _finding(answer: str, kind: str, label_key: str, label: Any, item: Any) -> Dict[str, Any]:
+    """
+    One entry of meta_data.extraction.masking.findings: which answer, what kind of finding, its type or severity and,
+    when the model gave them, its confidence and justification. NEVER the matched text (the prompt forbids it and
+    nothing here reads it). The justification is the model's `justification` key; `reason` (the key of the older prompt
+    text and of the story prompt) is read when `justification` is absent.
+    """
+    entry: Dict[str, Any] = {"answer": answer, "kind": kind, label_key: label.strip().lower() if isinstance(label, str) else None}
+    if isinstance(item, dict):
+        confidence = _confidence(item.get("confidence"))
+        if confidence is not None:
+            entry["confidence"] = confidence
+        text = _justification(item["justification"] if "justification" in item else item.get("reason"))
+        if text is not None:
+            entry["justification"] = text
+    return entry
+
+
 def parse_masking_response(text: Any, expected: Sequence[str], pii_types: Sequence[str]
                            ) -> Tuple[Dict[str, str], Tuple[str, ...], bool, Tuple[str, ...]]:
+    """(masked text per key, pii type names, abusive flag, abuse severities): `parse_masking_details` without the findings."""
+    return parse_masking_details(text, expected, pii_types)[:4]
+
+
+def parse_masking_details(text: Any, expected: Sequence[str], pii_types: Sequence[str]
+                          ) -> Tuple[Dict[str, str], Tuple[str, ...], bool, Tuple[str, ...], Tuple[Dict[str, Any], ...]]:
     """
-    (masked text per key, pii type names, abusive flag, abuse severities). STRICT: the answer must be one JSON object
+    (masked text per key, pii type names, abusive flag, abuse severities, findings). STRICT: the answer must be one JSON object
     with an entry for EVERY expected key and a string `masked_text` in each; anything else raises
     ExtractionOutputError (the message names the key, never any text) and the original text is never used as a
     fallback, so a session is never reported masked when the model did not return its masked text. Extra keys are
-    ignored. A PII tag word in a masked text counts as PII found even when `pii_found` says nothing.
+    ignored. A PII tag word in a masked text counts as PII found even when `pii_found` says nothing. `findings` lists
+    every item of `pii_found` / `abusive_spans` per answer with its justification and confidence (see `_finding`).
     """
     if not isinstance(text, str):
         raise ExtractionOutputError("the masking answer is not text")
@@ -122,6 +157,7 @@ def parse_masking_response(text: Any, expected: Sequence[str], pii_types: Sequen
     types: List[str] = []
     abusive = False
     severities: List[str] = []
+    findings: List[Dict[str, Any]] = []
 
     def add_type(word: Any) -> None:
         key = word.strip().lower() if isinstance(word, str) else "other"
@@ -141,7 +177,9 @@ def parse_masking_response(text: Any, expected: Sequence[str], pii_types: Sequen
         found = entry.get("pii_found")
         if isinstance(found, list):
             for item in found:
-                add_type(item.get("type") if isinstance(item, dict) else None)
+                kind = item.get("type") if isinstance(item, dict) else None
+                add_type(kind)
+                findings.append(_finding(key, "pii", "type", kind, item))
         elif found is True:
             add_type(None)
         for tag in _PII_TAG_RE.findall(masked_text):
@@ -154,9 +192,10 @@ def parse_masking_response(text: Any, expected: Sequence[str], pii_types: Sequen
                 severity = span.get("severity") if isinstance(span, dict) else None
                 if isinstance(severity, str) and severity.strip().lower() in ABUSE_SEVERITIES:
                     abusive = True
+                    findings.append(_finding(key, "abusive_language", "severity", severity, span))
                     if severity.strip().lower() not in severities:
                         severities.append(severity.strip().lower())
-    return masked, tuple(types), abusive, tuple(sorted(severities, key=ABUSE_SEVERITIES.index))
+    return (masked, tuple(types), abusive, tuple(sorted(severities, key=ABUSE_SEVERITIES.index)), tuple(findings))
 
 
 def apply_masked_answers(conversation: Conversation, masked: Mapping[str, str]) -> Conversation:
@@ -170,11 +209,16 @@ def apply_masked_answers(conversation: Conversation, masked: Mapping[str, str]) 
 
 
 def masking_meta(result: MaskingResult, prompt_version_id: Any) -> Dict[str, Any]:
-    """The object stored under feedback_submissions.meta_data.extraction.masking (masked text only)."""
+    """
+    The object stored under feedback_submissions.meta_data.extraction.masking: masked text, and what was found with the
+    model's justification per finding (never the matched text). The raw answer of the call is stored separately, under
+    meta_data.extraction.responses, and only for a session that is not flagged.
+    """
     return {
         "prompt_version_id": str(prompt_version_id),
         "pii_types": list(result.pii_types),
         "abusive_language": result.abusive_language,
         "abusive_severities": list(result.abusive_severities),
+        "findings": [dict(f) for f in result.findings],
         "conversation": result.conversation,
     }

@@ -717,6 +717,7 @@ CREATE TABLE feedback_extracted_data (
     raw_value             TEXT, -- the respondent's words as the model returned them; kept for unmapped values
     status                TEXT NOT NULL CHECK (status IN ('extracted', 'not_provided', 'unmapped')),
     confidence            NUMERIC CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)), -- only if the model gave one
+    justification         TEXT, -- the model's own short reason for the value (or for leaving it empty); NULL if it gave none
     config_version_id     UUID REFERENCES config_version(id) ON DELETE SET NULL, -- the extraction config version used
     prompt_version_id     UUID REFERENCES prompt_version(id) ON DELETE SET NULL,
     extracted_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -727,6 +728,9 @@ CREATE TABLE feedback_extracted_data (
         REFERENCES submissions(submission_id, tenant_code) ON DELETE CASCADE,
     UNIQUE (submission_id, tenant_code, field_name)
 );
+
+-- Databases created before the justification existed: the column is added here at every startup.
+ALTER TABLE feedback_extracted_data ADD COLUMN IF NOT EXISTS justification TEXT;
 
 -- session_type and questionnaire_version are NOT copied here (a copy would go stale when
 -- tools/questionnaire_versions.py relabels sessions): join feedback_submissions for them.

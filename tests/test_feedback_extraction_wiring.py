@@ -116,7 +116,7 @@ def test_the_activity_runs_inside_temporals_activity_environment_and_determinist
     async def ok(pool, submission_id, tenant_code, **kwargs):
         assert kwargs["activity_budget_seconds"] is None or kwargs["activity_budget_seconds"] > 0
         result = fx.empty_result(fx.parse_extraction_config(extraction_config_v1("Youth")))
-        return SimpleNamespace(run=SimpleNamespace(result=result, llm_called=False))
+        return SimpleNamespace(run=SimpleNamespace(result=result, llm_called=False), stages=[])
 
     monkeypatch.setattr(activity_module, "extract_submission", ok)
     out = asyncio.run(ActivityEnvironment().run(activity_module.feedback_metadata_extraction_activity, params))
@@ -150,7 +150,7 @@ def test_activity_passes_ids_and_overrides_and_marks_processing(monkeypatch):
     async def fake_extract_submission(pool, submission_id, tenant_code, **kwargs):
         seen.update(pool=pool, submission_id=submission_id, tenant_code=tenant_code, **kwargs)
         result = fx.empty_result(fx.parse_extraction_config(extraction_config_v1("Youth")))
-        return SimpleNamespace(run=SimpleNamespace(result=result, llm_called=False))
+        return SimpleNamespace(run=SimpleNamespace(result=result, llm_called=False), stages=[])
 
     monkeypatch.setattr(activity_module, "extract_submission", fake_extract_submission)
     monkeypatch.setattr(activity_module, "db", SimpleNamespace(pool="POOL"))
@@ -165,7 +165,8 @@ def test_activity_passes_ids_and_overrides_and_marks_processing(monkeypatch):
     assert seen["llm_overrides"] == {"llm_model": "m", "max_tokens": None, "llm_timeout_seconds": 20}
     assert out == {"status": "success", "llm_called": False, "pii_detected": False,
                    "fields": dict.fromkeys(fx.parse_extraction_config(extraction_config_v1("Youth")).field_names(),
-                                           "not_provided")}
+                                           "not_provided"),
+                   "stages": []}
 
 
 def test_activity_rejects_a_foreign_analysis_type_and_reraises_core_errors(monkeypatch):

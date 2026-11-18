@@ -216,6 +216,10 @@ class ConfigDrivenProcessingWorkflow:
                     status_val = res.get("status", "success") if isinstance(res, dict) else "success"
                     steps_execution[idx]["status"] = status_val
                     steps_execution[idx]["completed_timestamp"] = workflow.now().isoformat()
+                    stages = res.get("stages") if isinstance(res, dict) else None
+                    if isinstance(stages, list):
+                        # what each LLM stage of the one activity did (pii_masking, metadata_extraction)
+                        steps_execution[idx]["stages"] = stages
                     completed_steps.append(step_name)
                     workflow.logger.info(f"Completed workflow step: '{step_name}' with status: {status_val}")
 
