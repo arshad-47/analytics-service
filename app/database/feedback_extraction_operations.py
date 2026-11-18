@@ -39,6 +39,7 @@ from app.services.feedback_extraction import (
     ExtractionRun,
     extract,
     parse_extraction_config,
+    submission_geography,
 )
 from app.services.feedback_extraction_constants import (
     ACTIVITY_MARGIN_SECONDS,
@@ -248,15 +249,23 @@ async def load_closing_keys(conn, tenant_code: str, session_type: str, program_i
     return keys
 
 
+def asked_fields(config: Optional[ExtractionConfig], questionnaire_version: Any) -> Tuple[str, ...]:
+    """The names of the fields the session's questionnaire version asks (empty when there is no config to tell)."""
+    if config is None:
+        return ()
+    return tuple(f.name for f in config.fields_for(questionnaire_version))
+
+
 def persona_identity(session_type: Any, source: Any, program_id: Any,
-                     questionnaire_version: Any = None) -> Tuple[Any, Any, Optional[str], Any]:
+                     asked: Tuple[str, ...] = ()) -> Tuple[Any, Any, Optional[str], Tuple[str, ...]]:
     """
     What selects the extraction config, the prompt, the closing keys and the questions asked of a session: session_type,
-    source, program and questionnaire version (the version decides which fields are N/A). Compared (with the message
-    fingerprint) under the write locks: a redelivery that moves a session to another persona, or a relabel of its
-    questionnaire version, without touching its messages must not let the old values overwrite it.
+    source, program and the FIELDS its questionnaire version asks (`asked_fields`). Compared (with the message
+    fingerprint) under the write locks: a redelivery that moves a session to another persona, or a relabel that changes
+    which fields are asked, without touching its messages must not let the old values overwrite it. A relabel that
+    asks the same fields (every General Public relabel) changes nothing, so it must NOT discard a finished call.
     """
-    return (session_type, source, None if program_id is None else str(program_id), questionnaire_version)
+    return (session_type, source, None if program_id is None else str(program_id), asked)
 
 
 async def load_submission_inputs(conn, submission_id: str, tenant_code: str) -> Dict[str, Any]:
@@ -284,7 +293,7 @@ async def load_submission_inputs(conn, submission_id: str, tenant_code: str) -> 
         "session_type": head["session_type"],
         "questionnaire_version": head["questionnaire_version"],
         "identity": persona_identity(head["session_type"], head["source"], head["program_id"],
-                                     head["questionnaire_version"]),
+                                     asked_fields(config_row["config"], head["questionnaire_version"])),
         "rows": [dict(r) for r in rows],
         "fingerprint": rows_fingerprint(rows),
         "loaded_at": loaded_at,
@@ -310,6 +319,7 @@ async def save_extraction(
     masking: Optional[Mapping[str, Any]] = None,
     extra_llm_logs: Sequence[Mapping[str, Any]] = (),
     responses: Optional[Mapping[str, str]] = None,
+    config: Optional[ExtractionConfig] = None,
 ) -> None:
     """
     ONE transaction: lock the submissions row, then the feedback_submissions row (the order of the ingest path,
@@ -364,10 +374,10 @@ async def save_extraction(
                 f"it must run again on the new content")
         if input_identity is not None and persona_identity(
                 feedback["session_type"], feedback["source"], master["program_id"],
-                feedback["questionnaire_version"]) != input_identity:
+                asked_fields(config, feedback["questionnaire_version"])) != input_identity:
             raise StaleExtractionError(
-                f"feedback session {submission_id} was moved to another persona (session_type, source, program or "
-                f"questionnaire version) "
+                f"feedback session {submission_id} was moved to another persona (session_type, source, program) or "
+                f"relabelled to a questionnaire version that asks other fields "
                 f"while its extraction was running; nothing was written, it must run again for the new persona")
         await conn.execute(
             """
@@ -408,12 +418,23 @@ async def save_extraction(
             """
             UPDATE feedback_submissions
             SET pii_detected = $3,
+                abusive_language = $5,
                 meta_data = COALESCE(meta_data, '{}'::jsonb) || jsonb_build_object('extraction', $4::jsonb),
                 updated_at = now()
             WHERE submission_id = $1 AND tenant_code = $2
             """,
             submission_id, tenant_code, result.pii_detected, json.dumps(extraction_meta),
+            None if masking is None else bool(masking.get("abusive_language")),
         )
+        if config is not None and len(config.submission_columns) > 0:
+            # Same transaction as the extraction: the platform-facing columns never disagree with the extracted rows.
+            # Column names come from the fixed whitelist inside submission_geography, never from the config text.
+            geography = submission_geography(config, result)
+            assignments = ", ".join(f"{column} = ${index}" for index, column in enumerate(geography, start=3))
+            await conn.execute(
+                f"UPDATE submissions SET {assignments}, updated_at = now() WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code, *geography.values(),
+            )
         for log in extra_llm_logs:
             await insert_llm_log(conn, submission_id, tenant_code, **log)
         if llm_log is not None:
@@ -769,6 +790,7 @@ async def extract_submission(
                     masking=masking_stored, extra_llm_logs=() if masking_log is None else (masking_log,),
                     responses={"masking": None if run.masking is None else run.masking.response,
                                "extraction": run.response},
+                    config=config,
                 )
             except StaleExtractionError as exc:
                 stale = exc

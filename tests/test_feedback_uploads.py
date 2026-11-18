@@ -491,7 +491,9 @@ def test_bad_sessions_skipped_good_ones_still_build_with_all_problems(config):
     assert len(bad["problems"]) >= 4                                  # all problems, not just the first
 
     joined = " | ".join(by_id["900204"]["problems"])
-    assert "both empty" in joined and "created_at" in joined
+    # CHANGED: a row with a missing or unparsable created_at no longer skips the session (messageAt is null and it is
+    # counted as a warning), so only the empty message of the bot row is a problem here.
+    assert "both empty" in joined and "created_at" not in joined
 
     blank = by_id["900205"]
     assert blank["sessionId"] is None and blank["problems"] == ["session is blank in 1 row(s)"]
@@ -896,7 +898,8 @@ def test_mode_none_treats_the_blank_first_row_as_the_usual_problems(config):
     assert events == []
     text = " | ".join(skipped[0]["problems"])
     assert "sender_id is blank in 1 row(s)" in text
-    assert "created_at is missing or unparsable in 1 row(s)" in text
+    # CHANGED: the blank time of that one row is only a warning now (the other rows carry a valid time)
+    assert "created_at" not in text
 
 
 def test_a_config_without_opening_row_behaves_like_mode_none(config):
@@ -918,21 +921,32 @@ def test_blank_sender_on_a_non_opening_row_is_still_a_problem(config):
     assert events == [] and "sender_id is blank in 1 row(s)" in skipped[0]["problems"]
 
 
-def test_blank_created_at_on_a_non_opening_row_is_still_a_problem(config):
+def test_blank_created_at_on_a_non_opening_row_gives_a_null_message_time(config):
+    # CHANGED: was "is still a problem" (the whole session was skipped); now only that row has messageAt null
     rows = new_rows(V1_STYLE)
     rows[3]["created_at"] = ""
+    report = {}
+    events, skipped = build(make_df(rows), config, report=report)
+    assert skipped == [] and len(events) == 1
+    assert by_sequence(events[0])[4]["messageAt"] is None and report["rows_without_message_time"] == 1
+
+
+def test_a_session_without_any_valid_created_at_is_still_skipped_with_the_old_text(config):
+    rows = new_rows(V1_STYLE)
+    for row in rows:
+        row["created_at"] = ""
     events, skipped = build(make_df(rows), config)
     assert events == []
-    assert any("created_at is missing or unparsable in 1 row(s)" in p for p in skipped[0]["problems"])
+    assert any("created_at is missing or unparsable in" in p for p in skipped[0]["problems"])
 
 
-def test_unparsable_created_at_on_a_non_opening_row_is_a_problem(config):
+def test_unparsable_created_at_on_a_non_opening_row_gives_a_null_message_time(config):
+    # CHANGED: was "is a problem" (the whole session was skipped); now the session is kept and the row has no time
     rows = new_rows(V2_STYLE)
     rows[1]["created_at"] = "not a date"
     events, skipped = build(make_df(rows), config)
-    problem = " | ".join(skipped[0]["problems"])
-    assert events == [] and "created_at is missing or unparsable in 1 row(s) (data row(s) 2)" in problem
-    assert "not a date" not in problem
+    assert skipped == [] and len(events) == 1
+    assert by_sequence(events[0])[2]["messageAt"] is None
 
 
 def test_blank_row_with_a_stage_is_not_an_opening_row(config):
@@ -941,7 +955,8 @@ def test_blank_row_with_a_stage_is_not_an_opening_row(config):
     events, skipped = build(make_df(rows), config)
     assert events == []
     text = " | ".join(skipped[0]["problems"])
-    assert "sender_id is blank" in text and "created_at is missing" in text
+    # CHANGED: the blank time is only a warning now, the blank sender still skips the session
+    assert "sender_id is blank" in text and "created_at" not in text
 
 
 def test_blank_row_with_a_time_is_not_an_opening_row(config):

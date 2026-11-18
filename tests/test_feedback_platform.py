@@ -511,7 +511,8 @@ def test_hostile_cell_values_never_appear_in_problems():
     flat = json.dumps(skipped)
     assert "9876543210" not in flat and "Govt School" not in flat and "my phone" not in flat
     joined = " | ".join(skipped[0]["problems"])
-    assert "created_at is missing or unparsable in 1 row(s) (data row(s) 1)" in joined
+    # CHANGED: a bad created_at on one row is a warning (messageAt null) and no longer a session problem
+    assert "created_at" not in joined
     assert "sequence is not an integer in 1 row(s) (data row(s) 2)" in joined
 
 
@@ -613,11 +614,13 @@ def test_an_out_of_range_created_at_skips_only_that_session(stamp):
     config = ptm_config()
     good = ptm_rows(meeting="good", session="sg")
     bad = ptm_rows(meeting="bad", session="sb")
-    bad[1]["spoken_at"] = stamp
+    # CHANGED: every row of the bad session is out of range (one bad row alone only gets messageAt null now)
+    for row in bad:
+        row["spoken_at"] = stamp
     events, skipped = build(ptm_df(good + bad), config)       # must not raise OverflowError
     assert [e["submissionId"] for e in events] == ["good"]
     assert [s["submissionId"] for s in skipped] == ["bad"]
-    assert "created_at is missing or unparsable in 1 row(s)" in skipped[0]["problems"][0]
+    assert "created_at is missing or unparsable in 3 row(s)" in skipped[0]["problems"][0]
 
 
 def test_an_out_of_range_form_timestamp_skips_only_that_response():

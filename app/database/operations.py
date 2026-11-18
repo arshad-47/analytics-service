@@ -845,7 +845,15 @@ async def _write_feedback_submission(
                 submission_id, tenant_code,
             )
             await conn.execute(
-                "UPDATE feedback_submissions SET pii_detected = NULL, meta_data = meta_data - 'extraction' "
+                "UPDATE feedback_submissions SET pii_detected = NULL, abusive_language = NULL, "
+                "meta_data = meta_data - 'extraction' "
+                "WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            # The state / district copied from the old extraction describe the old persona's answers: cleared,
+            # the new extraction writes them again (config `copy_to_submission`).
+            await conn.execute(
+                "UPDATE submissions SET state = NULL, district = NULL "
                 "WHERE submission_id = $1 AND tenant_code = $2",
                 submission_id, tenant_code,
             )
@@ -854,8 +862,9 @@ async def _write_feedback_submission(
             # of the older text no longer describes the session. Back to "not checked" (NULL) until the extraction
             # runs again, so an export never trusts a stale flag.
             await conn.execute(
-                "UPDATE feedback_submissions SET pii_detected = NULL "
-                "WHERE submission_id = $1 AND tenant_code = $2 AND pii_detected IS NOT NULL",
+                "UPDATE feedback_submissions SET pii_detected = NULL, abusive_language = NULL "
+                "WHERE submission_id = $1 AND tenant_code = $2 "
+                "AND (pii_detected IS NOT NULL OR abusive_language IS NOT NULL)",
                 submission_id, tenant_code,
             )
 
@@ -863,6 +872,7 @@ async def _write_feedback_submission(
         # lower than stored ones shifts them) and send it back through processing; the old persona of a session that
         # moved loses that session's bot id, which can shift its ranks too.
         restamped: List[str] = []
+        reset: List[str] = []
         if bot_id is not None:
             program_final = await conn.fetchval(
                 "SELECT program_id::text FROM submissions WHERE submission_id = $1 AND tenant_code = $2",
@@ -872,7 +882,9 @@ async def _write_feedback_submission(
             if old_bot_persona is not None and old_bot_persona != personas[0]:
                 personas.append(old_bot_persona)
             for persona in personas:
-                restamped.extend((await apply_bot_version_ranks(conn, *persona))["restamped"])
+                applied = await apply_bot_version_ranks(conn, *persona)
+                restamped.extend(applied["restamped"])
+                reset.extend(applied["reset"])
 
         changed = submission_changed or payload_changed or len(upserted) > 0 or parents_set > 0
         if changed and db_sub_status != "pending":
@@ -898,8 +910,12 @@ async def _write_feedback_submission(
         "messages_inserted": messages_inserted,
         "messages_updated": messages_updated,
         "parents_set": parents_set,
-        # other stored sessions of the persona whose questionnaire version moved with the bot ranks (now 'pending')
+        # other stored sessions of the persona whose questionnaire version moved with the bot ranks
         "restamped_submission_ids": [sid for sid in restamped if sid != submission_id],
+        # the subset of those that was SET BACK TO 'pending' (a field is asked in one version only, so the stored
+        # extraction no longer describes it): the consumer dispatches exactly these after the commit. The others only
+        # got a new label and keep their extraction and status.
+        "reset_submission_ids": [sid for sid in reset if sid != submission_id],
     }
 
 

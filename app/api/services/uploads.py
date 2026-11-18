@@ -1116,7 +1116,11 @@ def _validate_for_publish(
                 entry["sourceRef"] = source_ref
             skipped.append(entry)
             continue
-        payloads.append((json.dumps(event, default=str), f"{record_id}-{len(payloads)}"))
+        # ONE key for the whole upload: a Kafka key picks the partition and order is only kept inside a partition, so
+        # distinct keys per event would let a topic with several partitions deliver the sessions in another order
+        # than build_feedback_events (bot id ascending) put them in. The consumer ranks the bot ids of a persona as
+        # the sessions arrive.
+        payloads.append((json.dumps(event, default=str), f"{record_id}"))
         kinds.append(kind)
     return payloads, skipped, kinds
 
@@ -1133,6 +1137,8 @@ async def _prepare_conversation_rows_payloads(
     against the stored sessions, then schema validation of the sessions to publish. Returns
     (payloads, skipped, report). Raises _FeedbackStageFailure.
     """
+    warnings: Dict[str, int] = {}
+
     def _build_sync() -> tuple:
         return feedback_uploads.build_feedback_events(
             df,
@@ -1141,6 +1147,7 @@ async def _prepare_conversation_rows_payloads(
             leader_info=ctx["leader_info"],
             tenant_code=tenant_code,
             source=source,
+            report=warnings,
         )
 
     try:
@@ -1176,6 +1183,10 @@ async def _prepare_conversation_rows_payloads(
         "sessions_new": kinds.count("new"),
         "sessions_updated": kinds.count("updated"),
         "sessions_unchanged": unchanged,
+        # counts only (never text): rows kept with a null message time or a placeholder text, cells whose control
+        # characters were replaced; a warning never skips a session
+        "warnings": dict(warnings),
+        "nul_bytes_removed": int(df.attrs.get(feedback_uploads.NUL_BYTES_ATTR, 0)),
     }
     return payloads, skipped, report
 
@@ -1244,6 +1255,11 @@ _ADAPTER_PREPARERS = {
 }
 
 
+# csv_uploads.status of a finished feedback upload (VARCHAR(20)). Others: pending, in_progress, on_hold, failed.
+UPLOAD_STATUS_SUCCESS = "success"
+UPLOAD_STATUS_PARTIAL = "partial"
+
+
 async def _process_feedback_inline(
     record_id: int,
     record: dict,
@@ -1255,7 +1271,8 @@ async def _process_feedback_inline(
     re-resolve program/leader/config, build one event per session (conversation_rows) or per new response
     (wide_form), apply the delta check, schema-validate each event, publish the valid ones to
     Kafka and send every skipped session / response to the DLQ. File-level problems were rejected in
-    handle_upload; a bad session is skipped (not fatal), so the record still ends 'success'.
+    handle_upload; a bad session is skipped (not fatal): the record still finishes with its report, as 'success' when
+    nothing was skipped and as 'partial' when at least one session or response was (UPLOAD_STATUS_PARTIAL).
     Fetch / config-resolution / delta-lookup / Kafka-publish failures end 'on_hold', exactly as
     story/discussion.
     """
@@ -1392,6 +1409,7 @@ async def _process_feedback_inline(
     final_meta: Dict[str, Any] = {
         "rows_pushed": len(payloads),
         "sessions_skipped": len(skipped),
+        "sessions_dead_lettered": 0,
         **report,
         "config_version_id": ctx["config_version_id"],
         "processed_at": datetime.now(timezone.utc).isoformat(),
@@ -1408,11 +1426,14 @@ async def _process_feedback_inline(
         if len(skipped) > FEEDBACK_MAX_REPORTED_ERRORS:
             final_meta["truncated"] = True
 
-    # --- 6. Success (bad sessions are skipped, not fatal) ---
-    await operations.update_status(record_id, "success", final_meta)
+    # --- 6. Finished (bad sessions are skipped, not fatal). 'success' says that every session of the file was taken;
+    # 'partial' that some were skipped (their reasons are in meta_data and on the DLQ): an operator who only reads the
+    # status must not see 'success' for a file that lost sessions. Both are finished uploads with a report. ---
+    final_status = UPLOAD_STATUS_PARTIAL if len(skipped) > 0 else UPLOAD_STATUS_SUCCESS
+    await operations.update_status(record_id, final_status, final_meta)
     logger.info(
-        "Feedback record %s processed successfully: %d event(s) pushed to Kafka, %d skipped, report %s",
-        record_id, len(payloads), len(skipped), report,
+        "Feedback record %s finished as %s: %d event(s) pushed to Kafka, %d skipped, report %s",
+        record_id, final_status, len(payloads), len(skipped), report,
     )
 
 
@@ -1488,6 +1509,9 @@ async def handle_upload(
             "config_version": ctx["config_version"],
         })
         meta_data["session_type"] = ctx["session_type"]
+        nul_bytes = int(df.attrs.get(feedback_uploads.NUL_BYTES_ATTR, 0)) if ctx["adapter"] == ADAPTER_CONVERSATION_ROWS else 0
+        if nul_bytes > 0:
+            meta_data["nul_bytes_removed"] = nul_bytes
         if len(ctx["bot_ids"]) > 0:
             meta_data["bot_ids"] = ctx["bot_ids"]
     else:

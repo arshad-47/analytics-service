@@ -1432,7 +1432,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
+      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. 'Delhi/NCR' or 'NCR' is decided with the place the respondent names: Noida, Greater Noida and Ghaziabad give Uttar Pradesh, Gurugram (Gurgaon) and Faridabad give Haryana, a Delhi place (or no place at all) gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district or a city that belongs to exactly one state, answer with that state and say in the justification that it was derived; a name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped. A place outside India makes the state 'Outside India' (and the district too).",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -1549,7 +1549,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. A city that is not itself a district name is answered with the district it belongs to when you are sure (Noida is in Gautam Buddha Nagar), otherwise Unmapped. A place outside India is 'Outside India', also when the state is. When there is no district to return, answer with one of the special answers.",
       "categories": [
         "Prefer not to say",
         "Unmapped",
@@ -1845,7 +1845,8 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
       "ly",
       "tv",
       "info"
-    ]
+    ],
+    "extraction_text": "original"
   },
   "limits": {
     "max_respondent_message_chars": 20000,
@@ -1883,9 +1884,20 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
     "skipped",
     "नहीं पता",
     "पता नहीं",
-    "लागू नहीं"
+    "लागू नहीं",
+    "idk",
+    "i dont know",
+    "i don't know",
+    "i do not know",
+    "no idea"
   ],
-  "llm": {}
+  "llm": {
+    "max_tokens": 10000
+  },
+  "copy_to_submission": {
+    "state": "state",
+    "district": "district"
+  }
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid)
@@ -1911,7 +1923,7 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent's child (or, where the bot asked the parent's own state, the respondent) lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
+      "description": "The Indian state or union territory the respondent's child (or, where the bot asked the parent's own state, the respondent) lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. 'Delhi/NCR' or 'NCR' is decided with the place the respondent names: Noida, Greater Noida and Ghaziabad give Uttar Pradesh, Gurugram (Gurgaon) and Faridabad give Haryana, a Delhi place (or no place at all) gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district or a city that belongs to exactly one state, answer with that state and say in the justification that it was derived; a name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped. A place outside India makes the state 'Outside India' (and the district too).",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -2028,7 +2040,7 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent's child attends school in (or, where the bot asked the parent's own district, the district the respondent lives in) (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "description": "The district the respondent's child attends school in (or, where the bot asked the parent's own district, the district the respondent lives in) (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. A city that is not itself a district name is answered with the district it belongs to when you are sure (Noida is in Gautam Buddha Nagar), otherwise Unmapped. A place outside India is 'Outside India', also when the state is. When there is no district to return, answer with one of the special answers.",
       "categories": [
         "Prefer not to say",
         "Unmapped",
@@ -2286,7 +2298,8 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
       "ly",
       "tv",
       "info"
-    ]
+    ],
+    "extraction_text": "original"
   },
   "limits": {
     "max_respondent_message_chars": 20000,
@@ -2324,9 +2337,20 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
     "skipped",
     "नहीं पता",
     "पता नहीं",
-    "लागू नहीं"
+    "लागू नहीं",
+    "idk",
+    "i dont know",
+    "i don't know",
+    "i do not know",
+    "no idea"
   ],
-  "llm": {}
+  "llm": {
+    "max_tokens": 10000
+  },
+  "copy_to_submission": {
+    "state": "state",
+    "district": "district"
+  }
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid)
@@ -2422,7 +2446,7 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
+      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. 'Delhi/NCR' or 'NCR' is decided with the place the respondent names: Noida, Greater Noida and Ghaziabad give Uttar Pradesh, Gurugram (Gurgaon) and Faridabad give Haryana, a Delhi place (or no place at all) gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district or a city that belongs to exactly one state, answer with that state and say in the justification that it was derived; a name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped. A place outside India makes the state 'Outside India' (and the district too).",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -2539,7 +2563,7 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "description": "The district the respondent lives in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. A city that is not itself a district name is answered with the district it belongs to when you are sure (Noida is in Gautam Buddha Nagar), otherwise Unmapped. A place outside India is 'Outside India', also when the state is. When there is no district to return, answer with one of the special answers.",
       "categories": [
         "Prefer not to say",
         "Unmapped",
@@ -2642,7 +2666,8 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
       "ly",
       "tv",
       "info"
-    ]
+    ],
+    "extraction_text": "original"
   },
   "limits": {
     "max_respondent_message_chars": 20000,
@@ -2680,9 +2705,20 @@ SELECT '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid, 1, TRUE, $cfg$
     "skipped",
     "नहीं पता",
     "पता नहीं",
-    "लागू नहीं"
+    "लागू नहीं",
+    "idk",
+    "i dont know",
+    "i don't know",
+    "i do not know",
+    "no idea"
   ],
-  "llm": {}
+  "llm": {
+    "max_tokens": 10000
+  },
+  "copy_to_submission": {
+    "state": "state",
+    "district": "district"
+  }
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '880879eb-a540-53ea-bb7e-074743fa7d87'::uuid)
@@ -2708,7 +2744,7 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
     {
       "name": "state",
       "kind": "category",
-      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. A region such as 'Delhi/NCR' or 'NCR' is decided with the district: a district of Uttar Pradesh or Haryana gives that state, no district or a Delhi district gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district that belongs to exactly one state, answer with that state and say in the justification that it was derived from the district; a district name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped; a place outside India is Outside India.",
+      "description": "The Indian state or union territory the respondent lives in, as answered to the bot's state question. Map spelling variants, abbreviations and older names to the official name. 'Delhi/NCR' or 'NCR' is decided with the place the respondent names: Noida, Greater Noida and Ghaziabad give Uttar Pradesh, Gurugram (Gurgaon) and Faridabad give Haryana, a Delhi place (or no place at all) gives Delhi. When the respondent names no state (or only a direction, a region or a city) but names a district or a city that belongs to exactly one state, answer with that state and say in the justification that it was derived; a name used in several states, with no state given, is Unmapped. A direction ('North India') or a place that is not one state or union territory is Unmapped. A place outside India makes the state 'Outside India' (and the district too).",
       "categories": [
         "Andhra Pradesh",
         "Arunachal Pradesh",
@@ -2825,7 +2861,7 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
     {
       "name": "district",
       "kind": "free_text",
-      "description": "The district the respondent teaches in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. When there is no district to return, answer with one of the special answers.",
+      "description": "The district the respondent teaches in (free text). Return the commonly used official spelling of the district name (for example 'Bengaluru Urban', 'Mysuru'). If the bot asked the respondent to choose between districts, use the one they chose. Do not guess a district the respondent did not name. A city that is not itself a district name is answered with the district it belongs to when you are sure (Noida is in Gautam Buddha Nagar), otherwise Unmapped. A place outside India is 'Outside India', also when the state is. When there is no district to return, answer with one of the special answers.",
       "categories": [
         "Prefer not to say",
         "Unmapped",
@@ -2959,7 +2995,8 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
       "ly",
       "tv",
       "info"
-    ]
+    ],
+    "extraction_text": "original"
   },
   "limits": {
     "max_respondent_message_chars": 20000,
@@ -2997,9 +3034,20 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
     "skipped",
     "नहीं पता",
     "पता नहीं",
-    "लागू नहीं"
+    "लागू नहीं",
+    "idk",
+    "i dont know",
+    "i don't know",
+    "i do not know",
+    "no idea"
   ],
-  "llm": {}
+  "llm": {
+    "max_tokens": 10000
+  },
+  "copy_to_submission": {
+    "state": "state",
+    "district": "district"
+  }
 }
 $cfg$::jsonb, 'seed', 'Initial extraction config: the DOTS metadata columns of the persona with the data team''s finalised category lists and the persona''s own prompt'
 WHERE EXISTS (SELECT 1 FROM config WHERE id = '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid)

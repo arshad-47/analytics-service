@@ -57,6 +57,9 @@ def _four_field_raw(persona="Youth"):
             raw["fields"].append(dict(by_name[school_name], name="school_type"))
     raw["prompt_name"] = "Feedback Metadata Extraction"       # the program-neutral template prompt of seed_prompts.sql
     raw["pii"].pop("masking_prompt_name", None)               # these tests count one call per session; the masking call has its own file
+    # Several tests below are about the deterministic masking of what the MODEL receives, so they read the masked text
+    # ('original' is the default of a new config and is covered by tests/test_feedback_original_text*.py).
+    raw["pii"]["extraction_text"] = "masked"
     return raw
 
 

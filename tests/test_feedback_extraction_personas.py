@@ -127,7 +127,9 @@ def test_state_is_the_36_states_and_uts_plus_the_special_answers_and_district_is
 def test_every_variant_of_delhi_is_an_alias_of_the_one_delhi_value_and_a_region_is_decided_with_the_district():
     state = {f.name: f for f in _config("Youth").fields}["state"]
     assert set(state.aliases["Delhi"]) >= {"New Delhi", "NCT", "NCT of Delhi", "Delhi NCR", "Delhi/NCR", "NCR"}
-    assert "derived from the district" in state.description and "'Delhi/NCR'" in state.description
+    assert "it was derived" in state.description and "'Delhi/NCR'" in state.description
+    assert "Noida" in state.description and "Uttar Pradesh" in state.description and "Gurugram" in state.description and "Haryana" in state.description
+    assert "outside india" in state.description.lower()          # a place outside India makes the district 'Outside India' too
     for persona in PERSONA_NAMES:
         assert {f.name: f for f in _config(persona).fields}["state"].aliases == state.aliases
 

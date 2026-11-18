@@ -83,8 +83,9 @@ async def _session(conn, masking=MASKING_NAME, sid=None):
 async def _set_config(conn, masking):
     raw = {"schema_version": 1, "persona": "Youth", "session_type": "Youth_Voice", "prompt_name": "Feedback Metadata Extraction",
            "fields": [{"name": "district", "kind": "free_text", "description": "District."}]}
-    if masking is not None:
-        raw["pii"] = {"masking_prompt_name": masking}
+    # the tests of this file are about the masked copy reaching the extraction call ('original' is the default, see
+    # tests/test_feedback_original_text_pg.py)
+    raw["pii"] = {"extraction_text": "masked"} if masking is None else {"masking_prompt_name": masking, "extraction_text": "masked"}
     await conn.execute("UPDATE config_version SET config = $2::jsonb WHERE config_id = $1::uuid",
                        extraction_config_id("Youth_Voice"), json.dumps(raw))
 

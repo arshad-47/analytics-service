@@ -198,6 +198,45 @@ def parse_masking_details(text: Any, expected: Sequence[str], pii_types: Sequenc
     return (masked, tuple(types), abusive, tuple(sorted(severities, key=ABUSE_SEVERITIES.index)), tuple(findings))
 
 
+_SPACE_SPLIT_RE = re.compile(r"\s+")
+_EDGE_PUNCTUATION = ",.;:!?()[]{}<>\"'/\\|*~`"
+MIN_SCRUB_WORD_CHARS = 3
+
+
+def _words(text: str) -> List[str]:
+    """Words split at white space with the punctuation at their edges removed. NOT a word-character match: in Indic scripts
+    the vowel signs are not word characters and would cut a word into pieces too short to compare."""
+    return [w for w in (part.strip(_EDGE_PUNCTUATION).casefold() for part in _SPACE_SPLIT_RE.split(text)) if len(w) > 0]
+
+
+def _removed_words(original: str, masked: str) -> FrozenSet[str]:
+    """The words of the answer that are NOT in its masked text: what the masking took out (names, places, ids)."""
+    kept = set(_words(masked))
+    return frozenset(w for w in _words(original) if len(w) >= MIN_SCRUB_WORD_CHARS and w not in kept)
+
+
+def scrub_findings(findings: Sequence[Mapping[str, Any]], pairs: Mapping[str, Mapping[str, str]],
+                   masked: Mapping[str, str]) -> Tuple[Dict[str, Any], ...]:
+    """
+    The findings with every justification that repeats a word the masking took out of its answer DROPPED (the finding
+    itself stays): the masked copy is the part that may be shared, and the prompt asks the model to describe a finding
+    ('a person name'), never to quote it; a model that quotes anyway must not put the matched text back into meta_data.
+    """
+    removed: Dict[str, FrozenSet[str]] = {}
+    scrubbed: List[Dict[str, Any]] = []
+    for finding in findings:
+        entry = dict(finding)
+        justification = entry.get("justification")
+        key = entry.get("answer")
+        if isinstance(justification, str) and key in pairs and key in masked:
+            if key not in removed:
+                removed[key] = _removed_words(pairs[key]["answer"], masked[key])
+            if len(removed[key] & set(_words(justification))) > 0:
+                del entry["justification"]
+        scrubbed.append(entry)
+    return tuple(scrubbed)
+
+
 def apply_masked_answers(conversation: Conversation, masked: Mapping[str, str]) -> Conversation:
     """The same conversation with the text of every respondent turn replaced by its masked text (bot turns unchanged)."""
     turns = tuple(

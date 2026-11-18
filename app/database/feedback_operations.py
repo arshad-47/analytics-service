@@ -629,20 +629,28 @@ async def _bot_rank_overview(conn, cfg: Mapping[str, Any]) -> List[Dict[str, Any
 async def _restamp_bot_sessions(conn, cfg: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Recompute the bot-rank labels of every persona (program) among the bot sessions ONE config governs and relabel
-    what differs, sending each relabelled session back through processing (apply_bot_version_ranks). This is the
-    manual repair of the ingest rule. Writes through `conn` (the caller owns the transaction); the personas are locked
-    first, in one fixed order. Returns {"personas": n, "sessions": n, "changed": n, "reprocess": [submission_id]}.
+    what differs (apply_bot_version_ranks: a relabelled session whose asked fields do not change only gets the new
+    label, one whose fields change is sent back through processing). This is the manual repair of the ingest rule.
+    Writes through `conn` (the caller owns the transaction); the personas are locked first, in one fixed order.
+    Returns {"personas": n, "sessions": n, "changed": n (every relabelled session), "label_only": n (relabelled
+    without reprocessing), "reprocess": [submission_id] (set back to 'pending'; real-time mode does not start them
+    by itself here, batch mode or the retry sweep picks them up)}.
     """
     programs = sorted({row["program_id"] for row in await _governed_bot_rows(conn, cfg)}, key=lambda p: (p is not None, p))
     personas = [(cfg["tenant_code"], program, cfg["session_type"], cfg["config_source"]) for program in programs]
     await lock_personas(conn, personas)
     sessions = 0
+    relabelled = 0
     reprocess: List[str] = []
+    label_only = 0
     for persona in personas:
         applied = await apply_bot_version_ranks(conn, *persona)
         sessions += applied["sessions"]
-        reprocess.extend(applied["restamped"])
-    return {"personas": len(personas), "sessions": sessions, "changed": len(reprocess), "reprocess": reprocess}
+        relabelled += len(applied["restamped"])
+        reprocess.extend(applied["reset"])
+        label_only += len(applied["label_only"])
+    return {"personas": len(personas), "sessions": sessions, "changed": relabelled, "label_only": label_only,
+            "reprocess": reprocess}
 
 
 async def restamp_questionnaire_versions(
@@ -669,11 +677,12 @@ async def restamp_questionnaire_versions(
 
     Mitra bot sessions (a bot id stored) are NOT relabelled from the windows: their label is the rank of their bot id
     inside the persona (lowest bot id = V1, see app/database/feedback_bot_versions.py). This function recomputes those
-    labels too (it is the manual repair of the ingest rule): a session whose label changes is sent back through
-    processing (extraction deleted, PII flag reset, status 'pending').
+    labels too (it is the manual repair of the ingest rule): a session whose label changes AND whose active extraction
+    config asks different fields for the old and the new label is sent back through processing (extraction deleted,
+    PII flag reset, status 'pending'); one that asks the same fields only gets the new label.
 
     Returns {"session_types": {key: {"sessions", "changed", "versions": {label: n}, "bot_sessions": {"personas",
-    "sessions", "changed", "reprocess": [submission_id]}, tenant_code, program_id, program_name, session_type,
+    "sessions", "changed", "label_only", "reprocess": [submission_id]}, tenant_code, program_id, program_name, session_type,
     source}}, "changed": total (window and bot relabels), "dry_run": bool}; `key` is the session_type, or
     tenant/program/session_type/source when the session_type alone would collide. With dry_run nothing is written.
     One transaction. Raises ValueError when an active config has an invalid questionnaire_versions list.

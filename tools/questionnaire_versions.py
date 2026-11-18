@@ -6,7 +6,7 @@ TWO RULES, by kind of session:
   * Mitra bot sessions (they carry a bot id): the version FOLLOWS THE ORDER OF THE BOT IDS of the persona (tenant,
     program, session_type, source): the lowest bot id is V1, the next V2, and so on (numeric order). A new
     questionnaire is a new bot id, so nothing is recorded here: the ingest stamps it and, when a new bot id is lower
-    than stored ones, relabels the shifted sessions and sends them back through extraction. Date windows never
+    than stored ones, relabels the shifted sessions, sending back through extraction only those whose asked fields change. Date windows never
     touch these sessions; `set` refuses a persona that has them; `restamp` is the manual REPAIR of the bot labels.
   * Google Forms (per-form version) and sessions without a bot id: the date windows below (and `set` for a manual
     override).
@@ -38,8 +38,10 @@ stays as history and can be re-activated to roll back) and relabels the already 
 transaction (sessions with a bot id are not relabelled, `set` refuses a persona that has them). Use --dry-run
 first: it prints what would change and writes nothing. `restamp` relabels the sessions without a bot id from the
 current windows (needed after editing the config by hand) AND recomputes the bot-rank labels of the sessions with a
-bot id; each relabelled bot session goes back through processing (extraction deleted, PII flag reset, status
-'pending') and is listed under "bot_sessions.reprocess". Reads DATABASE_URL like the application does.
+bot id. A relabelled bot session whose persona asks the same fields for the old and the new label only gets the
+new label ("bot_sessions.label_only" counts them: extraction, PII flag and status stay); one whose fields differ goes
+back through processing (extraction deleted, PII flag reset, status 'pending') and is listed under
+"bot_sessions.reprocess" (batch mode or the retry sweep starts it; the tool does not call Temporal). Reads DATABASE_URL like the application does.
 Prints JSON with counts only.
 
 A change is picked up by the Kafka consumers only when their config cache entry expires (60 seconds): for up to one

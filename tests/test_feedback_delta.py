@@ -187,7 +187,7 @@ def test_mitra_session_id_conflict_is_a_session_error_dead_lettered_others_still
     h.state.return_value = _stored("1001", "f" * 32)  # 1001 is stored under another session token
     h.run(file_bytes=_csv(_session(SESS_A, "1001") + _session(SESS_B, "1002")))
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"   # CHANGED: an upload that skipped sessions ends 'partial'
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 1
     assert (meta["sessions_new"], meta["sessions_updated"], meta["sessions_unchanged"]) == (1, 0, 0)
     (entry,) = meta["schema_validation_errors"]
@@ -215,7 +215,7 @@ def test_mitra_builder_skipped_sessions_are_not_looked_up_and_stay_in_the_report
     bad = _session("c" * 32, "1003", status="DONE")  # builder skips it
     h.run(file_bytes=_csv(_session(SESS_A, "1001") + bad))
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"   # CHANGED: an upload that skipped sessions ends 'partial'
     h.state.assert_awaited_once_with("mitra", ["1001"])
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 1 and meta["sessions_new"] == 1
 
@@ -345,7 +345,7 @@ def test_new_shape_session_of_only_the_opening_row_is_skipped_and_not_looked_up(
     only_opening = _session_new_shape("c" * 32, "1003")[:1]
     h.run(file_bytes=_csv(_session_new_shape(SESS_A, "1001") + only_opening))
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"   # CHANGED: an upload that skipped sessions ends 'partial'
     h.state.assert_awaited_once_with("mitra", ["1001"])  # the opening-row-only session never reaches the lookup
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 1 and meta["sessions_new"] == 1
     (entry,) = meta["schema_validation_errors"]
@@ -484,7 +484,7 @@ def test_gforms_skipped_responses_go_to_dlq_with_row_numbers_status_still_succes
     h.run(file_bytes=("\n".join(lines) + "\n").encode())
 
     status, meta = h.final
-    assert status == "success", meta
+    assert status == "partial", meta   # CHANGED: an upload that skipped sessions ends 'partial'
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 2 and meta["sessions_dead_lettered"] == 2
     assert meta["responses_new"] == 1 and meta["rows_read"] == 3
     errors = {e["row"]: e for e in meta["schema_validation_errors"]}
@@ -517,7 +517,7 @@ def test_gforms_schema_failed_event_is_skipped_dead_lettered_with_source_ref(mon
     monkeypatch.setattr(uploads_service_module, "validate_ingestion_schema", fail_first)
     h.run(file_bytes=file_bytes)
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"   # CHANGED: an upload that skipped sessions ends 'partial'
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 1 and meta["responses_new"] == 1
     (entry,) = meta["schema_validation_errors"]
     assert entry["sourceRef"] == refs[0] and entry["problems"] == ["bad event"]

@@ -875,6 +875,7 @@ You read ONE complete conversation between a feedback bot ("Bot") and a responde
 - Use only what the respondent explicitly said. Do not guess or infer: never infer gender from a name or a state from a language. A state may be derived from a named district only as the state field describes.
 - If the bot asked again after an unclear answer, or the respondent corrected themselves, use their latest clear answer.
 - If the respondent never answered the question for a field, the field is not provided.
+- A reply that only says NA, N/A, idk, I do not know, skip, none or nothing is not an answer: the field is not provided (null).
 
 ## Fields to extract
 
@@ -959,6 +960,7 @@ For each field return an object with:
 
 ## Rules for this persona
 
+- No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
 - Only the fields listed above are asked in this questionnaire version: ignore any rule below about a field that is not listed.
 - age: the number the respondent states as their own age, in digits; decimals such as 15.5 are valid. A class, a birth year or "I am in college" is not an age. If an age is given only inside another answer, still use it. A range that spans more than one band or a vague answer ("thirty something") is Unclear.
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
@@ -1030,6 +1032,7 @@ For each field return an object with:
 
 ## Rules for this persona
 
+- No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
 - age: the number the respondent states as their own age, in digits; decimals are valid. A birth year or a date of birth is not an age. A range that spans more than one band or a vague answer ("thirty something") is Unclear.
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - state and district: follow the field text, including how "Delhi/NCR" and a named district are handled.
@@ -1096,6 +1099,7 @@ For each field return an object with:
 
 ## Rules for this persona
 
+- No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
 - Only the fields listed above are asked in this questionnaire version: ignore any rule below about a field that is not listed.
 - state and district: where the bot asked, the CHILD''s state and the district where the child goes to school; if the bot asked where the parent stays, use that. Follow the field text for "Delhi/NCR" and a named district.
 - child_gender: the gender of the CHILD ("boy" is Male, "girl" is Female, "other" is Others), never the parent''s. With several children, list every gender that applies once each, as a JSON list.
@@ -1167,6 +1171,7 @@ For each field return an object with:
 
 ## Rules for this persona
 
+- No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
 - state and district: where the respondent teaches. Follow the field text for "Delhi/NCR" and a named district.
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - institution_type: the kind of institution the respondent teaches at. If they say "other" and then name a kind (for example a trust school), the value is Others and the kind goes in raw. An aided school is Others. An answer about a college is Invalid response (the question is about schools).
@@ -1250,6 +1255,7 @@ Mask any detail or combination of details that could identify or reveal a specif
 - Specific small places or institutions: a village, a ward, a street, a house address, the name of one specific school or college (for example "DPS School"). Tag: <LOCATION>
   Example: "my daughter studies in Dumra village school" -> "my daughter studies in <LOCATION>"
 - The answer to a question that asks for a name, a number, an address or a school, even when it is a single word.
+- A role or relationship that points to ONE specific person when it comes with a place or an office: "my husband is the MLA of our constituency", "sister of the district collector", "the only headmaster of the school in X". Replace the role with <ID>. A plain occupation ("teacher", "farmer") is not one of these and stays.
 
 ### Do NOT mask
 - District and state names (Rohtas, Patna, Bihar, Karnataka): too broad to identify anyone.

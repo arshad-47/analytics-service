@@ -120,7 +120,9 @@ def test_empty_and_oversized_sessions_have_no_empty_value_either():
     empty = fx.empty_result(config)
     assert [(f.value, f.status) for f in empty.fields] == [("Not answered", "not_provided")] * 2
     big = fx.oversized_result(config)
-    assert [(f.value, f.status) for f in big.fields] == [("Others", "unmapped"), ("Invalid response", "unmapped")]
+    # nothing was extracted, so no real category may be claimed: 'Not answered', status unmapped (kept on the review list)
+    assert [(f.value, f.status) for f in big.fields] == [("Not answered", "unmapped")] * 2
+    assert all("size limit" in f.justification for f in big.fields)
 
 
 # ------------------------------------------------------------------------------------------------ aliases

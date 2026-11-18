@@ -17,6 +17,12 @@ ANALYSIS_TYPE = STEP_NAME
 # Prompt analysis_type and llm_logs.analysis_type of the optional model-based masking call that runs before the
 # extraction call (`pii.masking_prompt_name` of the extraction config; app/services/feedback_pii_masking.py).
 PII_MASKING_ANALYSIS_TYPE = "feedback_pii_and_abusive_language_detection"
+# What the EXTRACTION call reads (config `pii.extraction_text`): the ORIGINAL conversation (so the extracted words, raw_value
+# included, are the respondent's own and can be analysed first), or the masked one (the model-masked copy, the way the
+# step worked before). The masked copy is built either way: it is what may be shared with DOTS or a dashboard.
+EXTRACTION_TEXT_ORIGINAL = "original"
+EXTRACTION_TEXT_MASKED = "masked"
+EXTRACTION_TEXTS = (EXTRACTION_TEXT_ORIGINAL, EXTRACTION_TEXT_MASKED)
 
 # The stages of the ONE Temporal activity of the step, in the order they run (reported in the activity's result, in its
 # heartbeat details and in submissions.process_status; the masking stage exists only when the config switches it on).
@@ -55,6 +61,11 @@ LABEL_UNCLEAR = "Unclear"                # an answer that cannot be put in one b
 UNMAPPED_LABELS = (LABEL_UNMAPPED, LABEL_INVALID, LABEL_UNCLEAR)
 # In a multi-value field these labels stand alone: next to a real category they are dropped (the real answer wins).
 EXCLUSIVE_LABELS = (LABEL_PREFER_NOT_TO_SAY, LABEL_INVALID, LABEL_UNCLEAR, LABEL_UNMAPPED, "Unsure / don't know", "Outside India")
+# Answers that are not a place: never copied into submissions.state / district (see `copy_to_submission` in the config).
+NON_GEOGRAPHY_LABELS = (LABEL_NOT_ANSWERED, LABEL_NOT_APPLICABLE, LABEL_PREFER_NOT_TO_SAY, LABEL_INVALID, LABEL_UNMAPPED,
+                        LABEL_UNCLEAR, LABEL_OTHERS, "Outside India", "Unsure / don't know")
+# The submissions columns an extracted field may be copied to (the column names are fixed here, never taken from a config).
+SUBMISSION_GEOGRAPHY_COLUMNS = ("state", "district")
 MULTI_VALUE_SEPARATOR = ", "             # feedback_extracted_data.value of a multi-value field; the labels contain no comma
 # What a banded number field accepts as a stated number (decimals: 15.5 is a valid age).
 MAX_BAND_NUMBER_DIGITS = 6
@@ -122,6 +133,7 @@ DEFAULT_PLACEHOLDERS: Tuple[str, ...] = (
     "n/a", "na", "n.a", "nil", "null", "none", "nan", "undefined", "unknown", "not known", "not provided",
     "not specified", "not applicable", "not available", "not mentioned", "not given", "not answered",
     "no answer", "no district", "nothing", "not sure", "dont know", "don't know", "do not know", "skip", "skipped",
+    "idk", "i dont know", "i don't know", "i do not know", "no idea",
 )
 MAX_PLACEHOLDERS = 500
 MAX_PLACEHOLDER_CHARS = 100

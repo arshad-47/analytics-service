@@ -823,7 +823,9 @@ def test_background_all_sessions_published_status_success(monkeypatch):
     h.dlq.assert_not_called()
 
     payloads = h.push.call_args.args[0]
-    assert [key for _, key in payloads] == ["7-0", "7-1"]
+    # CHANGED: one Kafka key per upload (was "7-0", "7-1"): events of one upload stay in one partition, so their order
+    # (bot id ascending) is the order in which they are consumed
+    assert [key for _, key in payloads] == ["7", "7"]
     event = json.loads(payloads[0][0])
     assert event["submissionType"] == "feedback" and event["submissionId"] == "1001"
     assert event["tags"]["programId"] == PROGRAM["id"] and event["tags"]["leaderCategoryId"] == LEADER["id"]
@@ -939,16 +941,18 @@ def test_background_stored_file_of_another_persona_is_put_on_hold(monkeypatch):
     h.push.assert_not_called()
 
 
-def test_background_skipped_sessions_go_to_dlq_listed_in_meta_status_still_success(monkeypatch):
+def test_background_skipped_sessions_go_to_dlq_listed_in_meta_status_partial(monkeypatch):
     h = BgHarness(monkeypatch)
     bad = _session("c" * 32, "1003", status="DONE")  # session_status not COMPLETED / IN_PROGRESS
     empty_msg = _session("d" * 32, "1004")
-    empty_msg[2] = _row("90", "d" * 32, "1004", 3, "", "", "LANG_Q", 120)  # empty answer
+    # CHANGED: the empty row is a BOT row now (sender 1). An empty respondent row (sender 120) is kept with a
+    # placeholder text since the upload hardening, so it no longer skips the session.
+    empty_msg[3] = _row("90", "d" * 32, "1004", 4, "", "", "THANK_YOU", 1)
     file_bytes = _csv(_session("a" * 32, "1001") + bad + empty_msg)
     h.run(file_bytes=file_bytes)
 
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"          # CHANGED: was "success"; a file that lost sessions no longer reads as success
     assert meta["rows_pushed"] == 1
     assert meta["sessions_skipped"] == 2
     assert meta["sessions_dead_lettered"] == 2
@@ -984,7 +988,7 @@ def test_background_schema_failed_event_is_skipped_and_dead_lettered(monkeypatch
     monkeypatch.setattr(uploads_service_module, "validate_ingestion_schema", fail_second)
     h.run(file_bytes=GOOD_FILE)
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"          # CHANGED: was "success"
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 1
     assert meta["schema_validation_errors"] == [
         {"submissionId": "1002", "sessionId": "b" * 32, "problems": ["'data.messages' is empty"]}
@@ -993,16 +997,16 @@ def test_background_schema_failed_event_is_skipped_and_dead_lettered(monkeypatch
     assert [headers["submissionId"] for _, headers in messages] == ["1002"]
 
 
-def test_background_dlq_failure_is_recorded_but_upload_still_success(monkeypatch):
+def test_background_dlq_failure_is_recorded_but_upload_still_finishes_partial(monkeypatch):
     h = BgHarness(monkeypatch)
     h.dlq.side_effect = RuntimeError("dlq broker down")
     file_bytes = _csv(_session("a" * 32, "1001") + _session("c" * 32, "1003", status="DONE"))
     h.run(file_bytes=file_bytes)
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"          # CHANGED: was "success"
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 1
     assert "dlq broker down" in meta["dlq_publish_error"]
-    assert "sessions_dead_lettered" not in meta
+    assert meta["sessions_dead_lettered"] == 0      # CHANGED: the key is always present now (0 when the DLQ failed)
     assert len(meta["schema_validation_errors"]) == 1
 
 
@@ -1013,7 +1017,7 @@ def test_background_error_list_capped_at_200_with_truncated_marker(monkeypatch):
         rows += _session(f"{i:032d}", str(i), status="DONE")
     h.run(file_bytes=_csv(rows))
     status, meta = h.final
-    assert status == "success"
+    assert status == "partial"          # CHANGED: was "success"
     assert meta["rows_pushed"] == 1 and meta["sessions_skipped"] == 250
     assert len(meta["schema_validation_errors"]) == 200
     assert meta["truncated"] is True
@@ -1022,11 +1026,11 @@ def test_background_error_list_capped_at_200_with_truncated_marker(monkeypatch):
     assert meta["sessions_dead_lettered"] == 250
 
 
-def test_background_all_sessions_skipped_is_still_success(monkeypatch):
+def test_background_all_sessions_skipped_finishes_partial(monkeypatch):
     h = BgHarness(monkeypatch)
     h.run(file_bytes=_csv(_session("c" * 32, "1003", status="DONE")))
     status, meta = h.final
-    assert status == "success" and meta["rows_pushed"] == 0 and meta["sessions_skipped"] == 1
+    assert status == "partial" and meta["rows_pushed"] == 0 and meta["sessions_skipped"] == 1   # CHANGED: was "success"
     h.push.assert_not_called()
     h.dlq.assert_called_once()
 

@@ -619,7 +619,13 @@ def test_feedback_write_trims_session_type_and_ranks_the_version():
     asyncio.run(run())
 
 
-def test_feedback_write_ranks_the_incoming_bot_among_the_stored_ones():
+def test_feedback_write_ranks_the_incoming_bot_among_the_stored_ones(monkeypatch):
+    # CHANGED: a relabelled session is only reprocessed when the persona's active extraction config asks different
+    # fields for the old and the new label; the config lookup is faked here as "no config" (safe side: reprocess),
+    # the decision itself is tested in tests/test_feedback_relabel.py and tests/test_feedback_relabel_pg.py.
+    from app.database import feedback_bot_versions
+    monkeypatch.setattr(feedback_bot_versions, "_persona_extraction_config", AsyncMock(return_value=None))
+
     async def run():
         conn = _ops_conn()
         conn.fetch = AsyncMock(side_effect=[

@@ -31,8 +31,11 @@ ROWS = [
 ]
 
 
-def _config(masking="Feedback PII and Abusive-Language Detection"):
+def _config(masking="Feedback PII and Abusive-Language Detection", extraction_text="masked"):
+    """`extraction_text` is 'masked' here: these tests are about the masked copy reaching the extraction call (the
+    default, 'original', is covered by tests/test_feedback_original_text.py)."""
     raw = extraction_config_v1("Youth")
+    raw["pii"]["extraction_text"] = extraction_text
     if masking is None:
         raw["pii"].pop("masking_prompt_name", None)
     else:

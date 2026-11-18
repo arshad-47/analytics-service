@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from temporalio.client import Client
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from app.config import settings
 from app.database import feedback_operations
@@ -37,6 +38,11 @@ FEEDBACK_CONFIG_REPLAY_HINT = (
 # How long the consumer trusts a persona's feedback settings (ingestion schema, process steps) before it reads the
 # config again; a new config version is picked up within this time and replaces the cached one.
 FEEDBACK_CONFIG_CACHE_TTL_SECONDS = 60.0
+
+# At most this many relabelled sessions (set back to 'pending' by a bot-rank shift) are started per ingested event in
+# real-time mode; the rest stay 'pending' (batch mode, or a later pass, picks them up). Bounds the work one Kafka
+# message can trigger when a persona has thousands of sessions.
+MAX_RELABEL_DISPATCH_PER_INGEST = 100
 
 
 def _payload_fingerprint(raw_payload: str) -> str:
@@ -209,7 +215,7 @@ class IngestionConsumer:
         except Exception as e:
             logger.error(f"Failed to connect to Temporal: {e}. Worker will not be able to trigger real-time flows.")
 
-    async def _trigger_realtime_workflow(self, submission_id: str, tenant_code: str, submission_type: str):
+    async def _trigger_realtime_workflow(self, submission_id: str, tenant_code: str, submission_type: str) -> str:
         """
         Starts a Temporal workflow execution in real-time.
 
@@ -219,6 +225,12 @@ class IngestionConsumer:
         (the bulk retry picks it up once the config is fixed) and returns normally: the message is NOT retried or
         dead-lettered (retrying cannot succeed and would only produce an identifier-less DLQ entry for a stored
         row). A database error is never caught here: it propagates, so process_message is retried as before.
+
+        The claim is the workflow id `realtime-<submission>-<tenant>`: Temporal refuses a second RUNNING workflow
+        with the same id (WorkflowAlreadyStartedError, not an error here: the session is already being processed,
+        its row is left as it is), while a finished one with that id may be started again (a session that was
+        processed and then set back to 'pending'). The row only moves to 'processing' while it is still 'pending'.
+        Returns what happened: "started", "already_running", "completed_at_ingest" (no steps) or "left_pending".
         """
         # A feedback submission whose type has no process steps is complete once ingested: mark it
         # 'success' here (batch mode does the same through the workflow) instead of leaving it 'pending'
@@ -237,7 +249,7 @@ class IngestionConsumer:
                     )
                     # only while the row is still 'pending' (a workflow may have taken it meanwhile)
                     await mark_pending_submission_config_failed(conn, submission_id, tenant_code, str(exc))
-                    return
+                    return "left_pending"
         if is_feedback and len(feedback_steps) == 0:
             async with db.pool.acquire() as conn:
                 await update_submission_status(
@@ -245,7 +257,7 @@ class IngestionConsumer:
                     {"status": "success", "steps": [], "timestamp": datetime.now(timezone.utc).isoformat()},
                 )
             logger.info(f"No process steps defined for submission type '{submission_type}'. Marked submission {submission_id} as 'success' at ingestion.")
-            return
+            return "completed_at_ingest"
 
         if not self.temporal_client:
             try:
@@ -253,12 +265,12 @@ class IngestionConsumer:
                 self.temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
             except Exception as e:
                 logger.error(f"Failed to connect to Temporal: {e}. Leaving submission {submission_id} as 'pending'.")
-                return
+                return "left_pending"
 
         process_steps = feedback_steps if is_feedback else settings.get_process_config(submission_type)
         if len(process_steps) == 0:
             logger.warning(f"No process steps defined for submission type '{submission_type}'. Skipping orchestration.")
-            return
+            return "left_pending"
 
         workflow_id = f"realtime-{submission_id}-{tenant_code}"
         payload = {
@@ -291,6 +303,10 @@ class IngestionConsumer:
                 )
                 
             logger.info(f"Workflow {workflow_id} triggered successfully.")
+            return "started"
+        except WorkflowAlreadyStartedError:
+            logger.info(f"Workflow {workflow_id} is already running; not starting it twice (submission {submission_id}).")
+            return "already_running"
         except Exception as e:
             logger.error(f"Failed to trigger workflow {workflow_id}: {e}. Leaving submission {submission_id} as 'pending'.")
             # Reset client on connection / gRPC issues to trigger reconnect next time
@@ -298,6 +314,52 @@ class IngestionConsumer:
             if any(term in err_str for term in ["connect", "rpc", "connection", "unavailable"]):
                 logger.info("Detected connection issue with Temporal. Resetting client to trigger reconnect on next message.")
                 self.temporal_client = None
+            return "left_pending"
+
+    async def _dispatch_reset_sessions(self, reset_ids, tenant_code: str, submission_type: str) -> None:
+        """
+        Real-time mode: start the workflow of every stored session that an ingest relabelled AND set back to 'pending'
+        (a bot-rank shift that changed the fields it is asked; app/database/feedback_bot_versions.py). Without this
+        such a session would stay 'pending' with no extracted rows, because only the ingested session gets a workflow.
+        Runs after the ingest transaction committed, so the ingest never waits for Temporal. Batch mode starts nothing.
+
+        Only sessions that are still 'pending' are started (one that moved on meanwhile is left alone), through
+        _trigger_realtime_workflow and its claim (a running workflow of the session is never started twice). At most
+        MAX_RELABEL_DISPATCH_PER_INGEST are started; the rest stay 'pending' with a warning. A failure on one session
+        is logged and does not stop the others or the message (the ingest is committed and a redelivery would be a
+        no-op, so retrying the message could not start them). Logs counts only.
+        """
+        if not isinstance(reset_ids, list) or len(reset_ids) == 0:
+            return
+        if settings.PROCESSING_MODE.lower().strip() != "real-time":
+            logger.info(f"Batch mode enabled. {len(reset_ids)} relabelled session(s) stay 'pending' for the batch run.")
+            return
+        async with db.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT submission_id FROM submissions WHERE tenant_code = $1 AND submission_id = ANY($2::text[]) "
+                "AND status = 'pending' ORDER BY submission_id",
+                tenant_code, reset_ids,
+            )
+        pending = [row["submission_id"] for row in rows]
+        to_start = pending[:MAX_RELABEL_DISPATCH_PER_INGEST]
+        skipped = len(pending) - len(to_start)
+        if skipped > 0:
+            logger.warning(
+                f"{skipped} relabelled session(s) over the per-ingest limit of {MAX_RELABEL_DISPATCH_PER_INGEST} stay "
+                f"'pending' (tenant {tenant_code}); batch mode or a retry sweep picks them up."
+            )
+        outcomes: dict = {}
+        for sid in to_start:
+            try:
+                outcome = await self._trigger_realtime_workflow(sid, tenant_code, submission_type)
+            except Exception as exc:  # noqa: BLE001 - one session must not stop the rest; the row stays 'pending'
+                outcome = "error"
+                logger.error(f"Could not start the workflow of relabelled session {sid} (tenant {tenant_code}): {type(exc).__name__}")
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        logger.info(
+            f"Relabelled sessions set back to 'pending': {len(reset_ids)}; still pending {len(pending)}; "
+            f"dispatch outcomes {dict(sorted(outcomes.items()))} (tenant {tenant_code})."
+        )
 
     async def _send_to_dlq(self, raw_payload: str, reason: str, identifiers: dict = None) -> None:
         """
@@ -435,6 +497,8 @@ class IngestionConsumer:
                     # response): nothing was written, so there is nothing to (re)process. A still-'pending'
                     # row falls through and is processed.
                     logger.info(f"Feedback submission {submission_id} under tenant {tenant_code} is unchanged. Nothing to process.")
+                    # a repair of drifted labels can still have reset OTHER sessions in this ingest
+                    await self._dispatch_reset_sessions(res.get("reset_submission_ids"), tenant_code, submission_type)
                     return
                 
                 # Check orchestration mode
@@ -444,6 +508,9 @@ class IngestionConsumer:
                     await self._trigger_realtime_workflow(submission_id, tenant_code, submission_type)
                 else:
                     logger.info(f"Batch mode enabled. Queued submission {submission_id} in 'pending' status.")
+                if is_feedback:
+                    # other stored sessions this ingest set back to 'pending' (relabelled by a bot-rank shift)
+                    await self._dispatch_reset_sessions(res.get("reset_submission_ids"), tenant_code, submission_type)
 
             elif event_type == "update":
                 if is_feedback_type(submission_type):

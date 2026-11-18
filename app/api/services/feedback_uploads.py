@@ -14,6 +14,7 @@ Flow used by the upload service:
 """
 import csv
 import io
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,8 +40,24 @@ from app.services.feedback_constants import (
     SYNTHESISED_FIRST_QUESTION_SEQUENCE,
 )
 
+logger = logging.getLogger("analytics_service.api.services.feedback_uploads")
+
 _INT_RE = re.compile(r"^[0-9]+$")
 _ISO_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+# C0 control characters except TAB (0x09), LF (0x0a) and CR (0x0d), plus DEL (0x7f). Zero-width and right-to-left marks
+# (U+200B..U+200F, U+202A..U+202E), emoji and every other printable character are NOT in the class: they are part of
+# what a respondent typed. NUL (0x00) is in the class for frames built without parse_feedback_csv.
+_CONTROL_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Optional config keys of this adapter, each with a default in code (a config that does not set them behaves as before
+# plus these defaults): `empty_message_placeholder` and `datetime.formats`.
+DEFAULT_EMPTY_MESSAGE_PLACEHOLDER = "[no text]"
+CONFIG_KEY_EMPTY_MESSAGE_PLACEHOLDER = "empty_message_placeholder"
+# Accepted in addition to ISO 8601 (which is tried first): day-first dates, as a spreadsheet saved in a European or
+# Indian locale writes them. Month-first is NOT accepted: 03/04/2026 is ambiguous and a wrong guess would move a
+# session by months, so it stays an unparsable value (the row then has no message time).
+DEFAULT_DAY_FIRST_FORMATS: Tuple[str, ...] = (
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d/%m/%Y",
+)
 # Row numbers listed in a problem message (the rest is only counted). Problems carry counts, row numbers and column
 # names, NEVER a cell value: a misaligned or hostile file can hold respondent text in any column, and the problems go to
 # the DLQ, the logs, csv_uploads.meta_data and the 400 body.
@@ -50,6 +67,10 @@ _SAMPLE_SIZE = 3
 # ---------------------------------------------------------------------------------------------
 # Parsing and file-level checks
 # ---------------------------------------------------------------------------------------------
+
+# The key of df.attrs that carries the number of NUL bytes parse_feedback_csv removed (0 when none).
+NUL_BYTES_ATTR = "nul_bytes_removed"
+
 
 def parse_feedback_csv(file_bytes: bytes) -> pd.DataFrame:
     """
@@ -61,6 +82,15 @@ def parse_feedback_csv(file_bytes: bytes) -> pd.DataFrame:
     """
     if file_bytes is None or len(file_bytes) == 0:
         raise ValueError("The uploaded CSV file is empty.")
+    # pandas' C parser ends a cell at a NUL byte and silently drops the rest of it ("options<NUL> today" would be read
+    # as "options"), so the bytes are removed BEFORE parsing and counted; the count goes to the upload report through
+    # df.attrs. Only the count is logged, never text.
+    nul_bytes = file_bytes.count(b"\x00")
+    if nul_bytes > 0:
+        file_bytes = file_bytes.replace(b"\x00", b"")
+        logger.warning("Removed %d NUL byte(s) from the uploaded feedback CSV before parsing", nul_bytes)
+        if len(file_bytes) == 0:
+            raise ValueError("The uploaded CSV file is empty.")
     try:
         df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, keep_default_na=False, encoding="utf-8-sig")
     except pd.errors.EmptyDataError:
@@ -72,6 +102,7 @@ def parse_feedback_csv(file_bytes: bytes) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     if len(df) == 0:
         raise ValueError("The uploaded CSV file has a header but no data rows.")
+    df.attrs[NUL_BYTES_ATTR] = nul_bytes
     return df
 
 
@@ -209,8 +240,9 @@ def _resolve_timezone(name: str):
         raise ValueError(f"config.datetime.fallback_timezone {name!r} is not a known timezone")
 
 
-def _parse_datetime(value: str, fallback_tz) -> Optional[datetime]:
-    """Aware datetime, or None when unparsable. Naive values are read in `fallback_tz`."""
+def _parse_datetime(value: str, fallback_tz, day_first_formats: Tuple[str, ...] = DEFAULT_DAY_FIRST_FORMATS) -> Optional[datetime]:
+    """Aware datetime, or None when unparsable. Naive values are read in `fallback_tz`. ISO 8601 is tried first, then
+    each of `day_first_formats` (strptime patterns, no offset in them)."""
     text = value.strip()
     if text == "":
         return None
@@ -227,6 +259,13 @@ def _parse_datetime(value: str, fallback_tz) -> Optional[datetime]:
                 return None
             dt = ts.to_pydatetime()
     if dt is None:
+        for pattern in day_first_formats:
+            try:
+                dt = datetime.strptime(text, pattern)
+                break
+            except ValueError:
+                continue
+    if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=fallback_tz)
@@ -235,6 +274,55 @@ def _parse_datetime(value: str, fallback_tz) -> Optional[datetime]:
     except (OverflowError, ValueError):
         return None  # year 0001 / 9999 at an offset: not representable in UTC, so it is an unparsable date
     return dt
+
+
+def _clean_text(text: str) -> str:
+    """The text with every C0 control character (except TAB, LF, CR) and DEL replaced by one space each."""
+    return _CONTROL_CHARS_RE.sub(" ", text)
+
+
+def _datetime_formats(config: Dict[str, Any]) -> Tuple[str, ...]:
+    """The day-first formats of the file: the defaults followed by the optional config `datetime.formats` (a list of
+    strptime patterns). Raises ValueError naming the key when the list is malformed."""
+    block = config.get("datetime", {})
+    if not isinstance(block, dict):
+        raise ValueError("Feedback config 'datetime' must be an object")
+    extra = block.get("formats")
+    if extra is None:
+        return DEFAULT_DAY_FIRST_FORMATS
+    if not isinstance(extra, list) or not all(isinstance(f, str) and len(f.strip()) > 0 for f in extra):
+        raise ValueError("Feedback config 'datetime.formats' must be a list of non-empty strptime patterns")
+    for pattern in extra:
+        try:
+            datetime.strptime(datetime(2026, 1, 2, 3, 4, 5).strftime(pattern), pattern)
+        except ValueError:
+            raise ValueError("Feedback config 'datetime.formats' has a pattern that does not read its own output")
+    return DEFAULT_DAY_FIRST_FORMATS + tuple(f for f in extra if f not in DEFAULT_DAY_FIRST_FORMATS)
+
+
+def _folded_completion_map(completion_map: Dict[str, str]) -> Dict[str, str]:
+    """lower-cased key -> platform status, so a status word is read ignoring case (the file value is trimmed already).
+    Raises ValueError when two keys differ only by case and map to different statuses: which one a changed spelling
+    means would be a guess."""
+    folded: Dict[str, str] = {}
+    for word, target in completion_map.items():
+        key = word.strip().lower()
+        if key in folded and folded[key] != target:
+            raise ValueError(
+                "Feedback config 'completion_map' has two keys that differ only by case and map to different statuses"
+            )
+        folded[key] = target
+    return folded
+
+
+def _empty_message_placeholder(config: Dict[str, Any]) -> str:
+    """The text kept for a respondent row without any text (optional config `empty_message_placeholder`)."""
+    value = config.get(CONFIG_KEY_EMPTY_MESSAGE_PLACEHOLDER, DEFAULT_EMPTY_MESSAGE_PLACEHOLDER)
+    if not isinstance(value, str) or len(value.strip()) == 0 or _CONTROL_CHARS_RE.search(value) is not None:
+        raise ValueError(
+            f"Feedback config '{CONFIG_KEY_EMPTY_MESSAGE_PLACEHOLDER}' must be a non-empty string without control characters"
+        )
+    return value
 
 
 def _normalise_answer(text: str) -> str:
@@ -265,6 +353,9 @@ def _check_config(config: Dict[str, Any]) -> None:
     # adapter / max_csv_upload_bytes / ingestion_schema / process_steps (+ optional expect_stages) live in the config too
     validate_feedback_config_keys(config)
     validate_adapter_config(config)
+    _datetime_formats(config)
+    _empty_message_placeholder(config)
+    _folded_completion_map(resolve_completion_map(config))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -280,9 +371,19 @@ def build_feedback_events(
     tenant_code: str,
     source: str,
     published_at: Optional[str] = None,
+    report: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Build one Kafka event per good session.
+
+    `report`, when given, is filled with WARNING counts (a warning never skips a session):
+    rows_without_message_time and respondent_rows_without_text count rows of ACCEPTED sessions (a row whose created_at
+    is missing or unparsable gets messageAt null; a respondent row without any text is kept with the config's
+    empty_message_placeholder), cells_with_control_characters counts the message / translated_message cells of the
+    whole file whose control characters were replaced by spaces. Counts only, no text.
+    Events are returned ordered by bot id ascending (numeric), first appearance first inside one bot id: the consumer
+    ranks the bot ids of a persona by number as the sessions arrive, so a late lower bot id must not come after the
+    sessions of a higher one inside one upload.
 
     program_info / leader_info are {"id": ..., "name": ...}. Returns (events, skipped): events follow
     the contract in app/services/feedback_constants.py; skipped lists every session that failed a
@@ -290,7 +391,9 @@ def build_feedback_events(
     with ALL of its problems. Other sessions still produce events.
 
     Rules (see the plan, section 3 and the Sequence numbering paragraph):
-    - identity of a session = (submission_id, session); each id must map to exactly one of the other;
+    - identity of a session = (submission_id, session); each id must map to exactly one of the other. A row with a
+      blank submission_id (or session) belongs to the session its other token names, and that WHOLE session is
+      skipped (never accepted without that row);
     - opening row: when config["opening_row"]["mode"] is "auto" and the first CSV row (sequence 1) has a
       blank sender_id, stage and created_at, it is the bot's opening message: kept as the first bot row at
       stored sequence 1 (no message time), with the question_key of the next row's stage, and every other
@@ -298,7 +401,7 @@ def build_feedback_events(
       config["sequence_offset"] and the unlogged first question is synthesised at sequence 1 from
       config["questions"] (the entry whose key is the stage of the session's first CSV row), only when the
       CSV starts at sequence 1 (tail-only sessions are skipped);
-    - submissionDate = the first real message (not the opening row); questionnaireVersion = the version
+    - submissionDate = the first real message with a valid created_at (not the opening row); questionnaireVersion = the version
       of config["questionnaire_versions"] in force at that instant; sessionType must equal
       config["session_type"]; botId is required (one per session, a positive integer in digits) and decides the
       STORED questionnaire version through its rank in the persona (the version stamped here from the windows stays
@@ -318,6 +421,9 @@ def build_feedback_events(
         raise ValueError("Feedback CSV is missing required column(s): " + ", ".join(missing))
 
     fallback_tz = _resolve_timezone(config.get("datetime", {}).get("fallback_timezone", "UTC"))
+    day_first_formats = _datetime_formats(config)
+    placeholder = _empty_message_placeholder(config)
+    counts = {"rows_without_message_time": 0, "respondent_rows_without_text": 0, "cells_with_control_characters": 0}
     published = published_at if published_at is not None else _format_utc(datetime.now(timezone.utc))
 
     def column(name: str) -> List[str]:
@@ -339,16 +445,31 @@ def build_feedback_events(
     stages = [v.strip() for v in column("stage")]
     senders = [v.strip() for v in column("sender_id")]
     created = column("created_at")
+    # The control characters of a cell are replaced before anything reads it: a cell that holds only control
+    # characters is then blank, and the emptiness check below sees the same text that is stored. The count is made per
+    # cell of the two text columns (a column the message_map reads under another name is cleaned when it is read).
+    cells_cleaned = 0
+
+    def text_column(name: str) -> List[str]:
+        nonlocal cells_cleaned
+        cleaned: List[str] = []
+        for cell in column(name):
+            fixed = _clean_text(cell)
+            if fixed != cell:
+                cells_cleaned += 1
+            cleaned.append(fixed)
+        return cleaned
+
     csv_text = {
-        "message": column("message"),
-        "translated_message": column("translated_message"),
+        "message": text_column("message"),
+        "translated_message": text_column("translated_message"),
     }
     # message_map names CSV columns; resolve each to the extracted list (any other column is read ad hoc)
     mapped_columns: Dict[str, List[str]] = {}
 
     def mapped(name: str) -> List[str]:
         if name not in mapped_columns:
-            mapped_columns[name] = csv_text[name] if name in csv_text else column(name)
+            mapped_columns[name] = csv_text[name] if name in csv_text else text_column(name)
         return mapped_columns[name]
 
     # Group row positions by session identity, in file order.
@@ -362,12 +483,24 @@ def build_feedback_events(
         if sub != "" and sess != "":
             sessions_of_submission.setdefault(sub, []).append(sess)
             submissions_of_session.setdefault(sess, []).append(sub)
+    # Rows that lack ONE of the two ids but carry the other form their own group, apart from the rows of the same
+    # session that carry both. Left alone, the complete rows would be accepted and the incomplete ones reported
+    # separately, so one answer would vanish from an accepted session. The rows are counted per token here, and the
+    # session that has both ids is the one that is skipped (and reported).
+    blank_sub_rows_of_session: Dict[str, int] = {}
+    blank_sess_rows_of_submission: Dict[str, int] = {}
+    for (sub, sess), idx in groups.items():
+        if sub == "" and sess != "":
+            blank_sub_rows_of_session[sess] = len(idx)
+        elif sess == "" and sub != "":
+            blank_sess_rows_of_submission[sub] = len(idx)
 
     opening_mode = config.get("opening_row", {}).get("mode", "none")
     versions = parse_versions(config)
     expected_session_type = str(config["session_type"]).strip()
     bot_sender_ids = {str(s).strip() for s in config["bot_sender_ids"]}
     completion_map = resolve_completion_map(config)
+    folded_completion = _folded_completion_map(completion_map)
     closing_keys = set(config.get("closing_keys", []))
     offset = int(config["sequence_offset"])
     catalog = {q["key"]: q for q in config["questions"]}
@@ -384,10 +517,19 @@ def build_feedback_events(
         sess_id = sess if sess != "" else None
 
         # ---- identity ----
+        # Rows with one blank id whose session has other rows with both ids are reported by that session (below).
+        if sub == "" and sess != "" and sess in submissions_of_session:
+            continue
+        if sess == "" and sub != "" and sub in sessions_of_submission:
+            continue
         if sub == "":
             problems.append(f"submission_id is blank in {len(idx)} row(s)")
         if sess == "":
             problems.append(f"session is blank in {len(idx)} row(s)")
+        if sub != "" and sess != "" and sess in blank_sub_rows_of_session:
+            problems.append(f"submission_id is blank in {blank_sub_rows_of_session[sess]} row(s)")
+        if sub != "" and sess != "" and sub in blank_sess_rows_of_submission:
+            problems.append(f"session is blank in {blank_sess_rows_of_submission[sub]} row(s)")
         if sub != "" and len(sessions_of_submission.get(sub, [])) > 1:
             problems.append(f"submission_id maps to {len(sessions_of_submission[sub])} different sessions")
         if sess != "" and len(submissions_of_session.get(sess, [])) > 1:
@@ -460,8 +602,13 @@ def build_feedback_events(
                 opening_pos = at_one[0]
 
         # ---- text ----
+        # A respondent row without any text (a voice note without a transcript) is kept with the placeholder: the
+        # answer exists, only its text does not, and dropping the row, or the session with it, would lose the rest.
+        # An empty BOT row (or an opening row) is a broken export and stays a session problem.
         empty_rows = [i for i in idx
                       if _is_blank(csv_text["message"][i]) and _is_blank(csv_text["translated_message"][i])]
+        placeholder_rows = {i for i in empty_rows if senders[i] != "" and senders[i] not in bot_sender_ids}
+        empty_rows = [i for i in empty_rows if i not in placeholder_rows]
         if len(empty_rows) > 0:
             problems.append(
                 f"message and translated_message are both empty in {len(empty_rows)} row(s) ({_rows(empty_rows)})"
@@ -473,10 +620,11 @@ def build_feedback_events(
             problems.append(f"sender_id is blank in {blank_senders} row(s)")
 
         # ---- constant-within-session columns ----
-        status_values = _distinct([statuses[i] for i in idx])
+        # Matched ignoring case and surrounding spaces ('completed' is COMPLETED); an exact key of the map wins.
+        status_values = _distinct([statuses[i].lower() for i in idx])
         if len(status_values) > 1:
             problems.append(f"session_status differs within the session ({len(status_values)} distinct values)")
-        invalid_status = [v for v in status_values if v not in completion_map]
+        invalid_status = [v for v in status_values if v not in folded_completion]
         if len(invalid_status) > 0:
             problems.append(
                 f"session_status has {len(invalid_status)} value(s) that are not in the config's completion_map "
@@ -513,12 +661,15 @@ def build_feedback_events(
         for i in idx:
             if i == opening_pos:
                 continue  # the opening row has no time by design
-            dt = _parse_datetime(created[i], fallback_tz)
+            dt = _parse_datetime(created[i], fallback_tz, day_first_formats)
             if dt is None:
                 bad_dates.append(i)
             else:
                 parsed_at[i] = dt
-        if len(bad_dates) > 0:
+        # One bad time must not cost the session its other answers: such a row gets messageAt null and is counted as
+        # a warning. Only a session in which NO row has a time is skipped (submissionDate and the questionnaire
+        # version need one), with the problem text this check always had.
+        if len(bad_dates) > 0 and len(parsed_at) == 0:
             problems.append(f"created_at is missing or unparsable in {len(bad_dates)} row(s) ({_rows(bad_dates)})")
 
         if len(problems) > 0:
@@ -539,10 +690,12 @@ def build_feedback_events(
 
         language = languages[first]
         is_english = language.lower() in english_languages
-        completion_status = completion_map[statuses[first]]
+        completion_status = folded_completion[statuses[first].lower()]
 
         def row_texts(i: int, is_bot: bool) -> Tuple[str, Optional[str]]:
             """(text in the conversation language, English text) of a row; bot rows swap the CSV columns."""
+            if i in placeholder_rows:
+                return placeholder, placeholder
             text_map = bot_map if is_bot else respondent_map
             conversation_text = mapped(text_map["message"])[i]
             english_text = mapped(text_map["translated_message"])[i]
@@ -563,7 +716,7 @@ def build_feedback_events(
                     "problems": ["the session has only the opening row (no real message)"],
                 })
                 continue
-            session_start = parsed_at[rows[0]]
+            session_start = parsed_at[next(i for i in rows if i in parsed_at)]
             opening_key = stages[rows[0]] if stages[rows[0]] != "" else None
             opening_text, opening_english = row_texts(opening_pos, True)
             messages.append({
@@ -589,7 +742,8 @@ def build_feedback_events(
                                  f"(expected one of: {', '.join(sorted(catalog))})"],
                 })
                 continue
-            session_start = parsed_at[first]
+            # the first row's own time when it has one, else the earliest-sequence row that has one
+            session_start = parsed_at[next(i for i in ordered if i in parsed_at)]
             synth_text = question["text"]
             synth_seq = SYNTHESISED_FIRST_QUESTION_SEQUENCE
             messages.append({
@@ -598,7 +752,7 @@ def build_feedback_events(
                 "isFollowUp": False,
                 "message": synth_text,
                 "translatedMessage": synth_text,
-                "messageAt": _format_utc(session_start),
+                "messageAt": _format_utc(parsed_at[first]) if first in parsed_at else None,
                 "parentSequence": None,
             })
             rows = ordered
@@ -612,6 +766,10 @@ def build_feedback_events(
             key = stages[i] if stages[i] != "" else None
             is_bot = senders[i] in bot_sender_ids
             conversation_text, english_text = row_texts(i, is_bot)
+            if i not in parsed_at:
+                counts["rows_without_message_time"] += 1
+            if i in placeholder_rows:
+                counts["respondent_rows_without_text"] += 1
 
             if is_bot:
                 parent: Optional[int] = None
@@ -631,7 +789,7 @@ def build_feedback_events(
                 "isFollowUp": follow_up,
                 "message": conversation_text,
                 "translatedMessage": english_text,
-                "messageAt": _format_utc(parsed_at[i]),
+                "messageAt": _format_utc(parsed_at[i]) if i in parsed_at else None,
                 "parentSequence": parent,
             })
 
@@ -666,6 +824,12 @@ def build_feedback_events(
             },
         })
 
+    # Bot id ascending (numeric; a valid bot id has no leading zero, so length then text is the numeric order), first
+    # appearance first inside one bot id (sort is stable). See the docstring for why.
+    events.sort(key=lambda event: (len(event["data"]["botId"]), event["data"]["botId"]))
+    counts["cells_with_control_characters"] = cells_cleaned
+    if report is not None:
+        report.update(counts)
     return events, skipped
 
 

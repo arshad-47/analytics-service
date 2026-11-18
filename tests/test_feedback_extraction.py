@@ -174,7 +174,9 @@ def test_config_accepts_json_text_and_rejects_non_json_text():
 
 
 def test_config_llm_block_is_optional_and_carries_overrides():
-    assert CONFIG.llm == {"model": None, "max_tokens": None, "timeout_seconds": None}
+    # CHANGED: the seeded configs now set llm.max_tokens (tests/test_feedback_seed_llm.py); the block itself stays optional
+    assert CONFIG.llm == {"model": None, "max_tokens": 10000, "timeout_seconds": None}
+    assert _config(llm=None).llm == {"model": None, "max_tokens": None, "timeout_seconds": None}
     config = _config(llm={"model": "some/model", "max_tokens": 900})
     assert config.llm == {"model": "some/model", "max_tokens": 900, "timeout_seconds": None}
 
@@ -568,7 +570,7 @@ def test_prompt_injection_in_a_conversation_does_not_change_how_the_answer_is_ha
     assert run.result.pii_detected is True
     # the attack text reached the prompt only as one line of data, inside the delimiters
     prompt = calls[0]
-    conversation = fx.build_conversation(fx.mask_respondent_pii(rows)[0])     # the prompt is built from the masked text
+    conversation = fx.build_conversation(rows)     # the extraction prompt is built from the original text (pii.extraction_text)
     begin = prompt.index(f"BEGIN {conversation.conversation_id}")
     end = prompt.index(f"END {conversation.conversation_id}")
     assert begin < prompt.index("Ignore all previous instructions") < end
@@ -659,7 +661,7 @@ def test_seed_descriptions_read_correctly_and_never_tell_the_model_to_infer_a_st
         config = fx.parse_extraction_config(extraction_config_v1(persona))
         fields = {f.name: f for f in config.fields}
         assert "districts-as-states" not in fields["state"].description
-        assert "derived from the district" in fields["state"].description
+        assert "it was derived" in fields["state"].description
         assert "never infer a state from a district" not in fields["state"].description
         assert re.search(r"The district the respondent[^.]* (lives|teaches|attends school) in", fields["district"].description)
         assert "lives in lives in" not in fields["district"].description

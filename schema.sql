@@ -690,6 +690,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_config_version_active ON config_version (co
 -- Databases created before this existed: the column is added here at every startup.
 -- ---------------------------------------------------------------------------------------------------------------
 ALTER TABLE feedback_submissions ADD COLUMN IF NOT EXISTS pii_detected BOOLEAN;
+-- TRUE when the model-based masking found abusive language in an answer (the severities are in meta_data -> extraction ->
+-- masking); NULL when that step did not run for the session. Abuse is NOT a PII flag: filter on this column to leave it out.
+ALTER TABLE feedback_submissions ADD COLUMN IF NOT EXISTS abusive_language BOOLEAN;
 
 -- config.config_source is a free label validated in code ([a-z0-9_]{1,40}; 'any' is the reserved value of the
 -- extraction config), so it has no CHECK. Databases created before this change have one (any name, any list of

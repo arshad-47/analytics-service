@@ -43,6 +43,8 @@ from app.services.feedback_extraction_constants import (
     FIELD_KINDS as _CONSTANT_FIELD_KINDS,
     KIND_CATEGORY,
     KIND_FREE_TEXT,
+    EXTRACTION_TEXTS,
+    EXTRACTION_TEXT_ORIGINAL,
     LABEL_INVALID,
     LABEL_NOT_ANSWERED,
     LABEL_NOT_APPLICABLE,
@@ -70,11 +72,13 @@ from app.services.feedback_extraction_constants import (
     PII_TYPES,
     EXCLUSIVE_LABELS,
     MULTI_VALUE_SEPARATOR,
+    NON_GEOGRAPHY_LABELS,
     STATUS_EXTRACTED,
     STATUS_NOT_APPLICABLE,
     UNMAPPED_LABELS,
     STATUS_NOT_PROVIDED,
     STATUS_UNMAPPED,
+    SUBMISSION_GEOGRAPHY_COLUMNS,
     YEAR_MAX,
     YEAR_MIN,
 )
@@ -130,6 +134,7 @@ class PiiPolicy:
     url_tlds: Tuple[str, ...] = DEFAULT_PII_URL_TLDS
     mask_before_call: bool = True   # mask what the check finds BEFORE the text goes to the model (see `mask_respondent_pii`)
     masking_prompt_name: Optional[str] = None   # exact prompts.name of the model-based masking call; None = no such call
+    extraction_text: str = EXTRACTION_TEXT_ORIGINAL   # what the extraction call reads: 'original' or 'masked' (see EXTRACTION_TEXTS)
 
 
 DEFAULT_LIMITS = Limits()
@@ -192,6 +197,7 @@ class ExtractionConfig:
     pii_policy: PiiPolicy = DEFAULT_PII_POLICY
     placeholders: FrozenSet[str] = DEFAULT_PLACEHOLDER_KEYS    # normalised keys (see _placeholder_key)
     prompt_variables: Mapping[str, str] = field(default_factory=dict)        # extra {{variables}} of the prompt
+    submission_columns: Mapping[str, str] = field(default_factory=dict)      # submissions column -> extracted field copied there
 
     def field_names(self) -> Tuple[str, ...]:
         return tuple(f.name for f in self.fields)
@@ -203,11 +209,12 @@ class ExtractionConfig:
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _TOP_KEYS = {"schema_version", "persona", "session_type", "source_note", "fields", "pii", "llm", "prompt_name",
-             "prompt_variables", "limits", "placeholders"}
+             "prompt_variables", "limits", "placeholders", "copy_to_submission"}
 _FIELD_KEYS = {"name", "kind", "description", "categories", "guidance", "provisional", "min", "max", "sensitive",
                "store_raw", "multi", "aliases", "bands", "versions", "applies_when"}
 _LLM_KEYS = {"model", "max_tokens", "timeout_seconds"}
-_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds", "mask_before_call", "masking_prompt_name"}
+_PII_KEYS = {"types", "min_digit_run", "min_digit_run_short_groups", "url_tlds", "mask_before_call", "masking_prompt_name",
+             "extraction_text"}
 # The variables the engine itself fills; a config's prompt_variables may not shadow them.
 RESERVED_PROMPT_VARIABLES = frozenset({
     "persona", "fields", "field_names", "pii_types", "output_format", "conversation_id", "conversation"})
@@ -297,7 +304,12 @@ def _parse_pii(pii_raw: Any) -> Tuple[Tuple[str, ...], Dict[str, str], PiiPolicy
             raise ExtractionConfigError(
                 "pii.masking_prompt_name must be null (no model-based masking) or the exact name of a prompts row "
                 "of analysis_type feedback_pii_and_abusive_language_detection, without surrounding spaces")
-    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds, mask_before_call, masking_prompt_name)
+    extraction_text = EXTRACTION_TEXT_ORIGINAL
+    if "extraction_text" in pii_raw:
+        extraction_text = pii_raw["extraction_text"]
+        if extraction_text not in EXTRACTION_TEXTS:
+            raise ExtractionConfigError(f"pii.extraction_text must be one of {list(EXTRACTION_TEXTS)}")
+    return pii_types, descriptions, PiiPolicy(min_run, min_short, tlds, mask_before_call, masking_prompt_name, extraction_text)
 
 
 def _parse_limits(limits_raw: Any) -> Limits:
@@ -318,6 +330,53 @@ def _parse_limits(limits_raw: Any) -> Limits:
     if limits.max_respondent_message_chars > limits.max_conversation_chars:
         raise ExtractionConfigError("limits.max_respondent_message_chars must not be larger than limits.max_conversation_chars")
     return limits
+
+
+def _parse_copy_to_submission(raw: Any, fields: Sequence[FieldSpec]) -> Dict[str, str]:
+    """
+    `copy_to_submission`: {submissions column: field name}. Only the columns in SUBMISSION_GEOGRAPHY_COLUMNS, each fed
+    by one single-value category or free_text field of this config. Validated here (at the boundary) so the copy step
+    never has to guard against a bad mapping.
+    """
+    if not isinstance(raw, dict) or len(raw) == 0:
+        raise ExtractionConfigError("copy_to_submission must be a non-empty object {submissions column: field name}")
+    by_name = {f.name: f for f in fields}
+    parsed: Dict[str, str] = {}
+    for column, name in raw.items():
+        if column not in SUBMISSION_GEOGRAPHY_COLUMNS:
+            raise ExtractionConfigError(f"copy_to_submission: column {column!r} is not one of {list(SUBMISSION_GEOGRAPHY_COLUMNS)}")
+        if not isinstance(name, str) or name not in by_name:
+            raise ExtractionConfigError(f"copy_to_submission.{column} must name a field of this config")
+        spec = by_name[name]
+        if spec.kind not in (KIND_CATEGORY, KIND_FREE_TEXT) or spec.multi:
+            raise ExtractionConfigError(f"copy_to_submission.{column}: field {name!r} must be a single-value category or free_text field")
+        parsed[column] = name
+    if "district" in parsed and "state" not in parsed:
+        raise ExtractionConfigError("copy_to_submission: a district is only copied together with a state")
+    return parsed
+
+
+def submission_geography(config: ExtractionConfig, result: "ExtractionResult") -> Dict[str, Optional[str]]:
+    """
+    What to write to submissions.state / district for this result: {column: value or None} for every column the config
+    maps (None = clear the column). A value is written only when its field was `extracted` and is a place (not one of the
+    NON_GEOGRAPHY_LABELS nor, for a free_text field, one of its own special answers); a district only when the state is valid too.
+    """
+    by_name = {f.field_name: f for f in result.fields}
+    specs = {f.name: f for f in config.fields}
+    out: Dict[str, Optional[str]] = {}
+    for column in SUBMISSION_GEOGRAPHY_COLUMNS:
+        if column not in config.submission_columns:
+            continue
+        name = config.submission_columns[column]
+        found = by_name.get(name)
+        valid = found is not None and found.status == STATUS_EXTRACTED and found.value is not None \
+            and found.value not in NON_GEOGRAPHY_LABELS \
+            and not (specs[name].kind == KIND_FREE_TEXT and found.value in specs[name].categories)
+        out[column] = found.value if valid else None
+    if "district" in out and out.get("state") is None:
+        out["district"] = None
+    return out
 
 
 def _parse_placeholders(raw: Any) -> FrozenSet[str]:
@@ -579,8 +638,10 @@ def parse_extraction_config(raw: Any) -> ExtractionConfig:
         for key in _LLM_KEYS:
             if key in llm_raw:
                 llm[key] = llm_raw[key]
+    submission_columns = _parse_copy_to_submission(raw["copy_to_submission"], fields) \
+        if raw.get("copy_to_submission") is not None else {}
     return ExtractionConfig(persona.strip(), session_type.strip(), tuple(fields), pii_types, llm, prompt_name,
-                            pii_descriptions, limits, pii_policy, placeholders, prompt_variables)
+                            pii_descriptions, limits, pii_policy, placeholders, prompt_variables, submission_columns)
 
 
 # ------------------------------------------------------------------------------------------------ conversation
@@ -835,6 +896,11 @@ def _number_span(text: str, start: int, end: int) -> _Span:
     return (start, end, MASK_NUMBER)
 
 
+# A spreadsheet formula typed as an answer ('=HYPERLINK("http://x.org","a")', '@SUM(1+1)'): a function call after = + - @. It is
+# not a handle or a link and must not flag the session; its digits are still checked.
+_FORMULA_CALL_RE = re.compile(r"^\s*[=+\-@]\s*[A-Za-z_][A-Za-z0-9_.]*\(")
+
+
 def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple[List[str], List[_Span], List[Tuple[List[str], int, int]]]:
     """
     One pre-check text (see `_precheck_text`): the kinds found, the spans to mask and the digit runs (the caller
@@ -847,6 +913,8 @@ def _scan_text(text: str, policy: PiiPolicy, url_re: "re.Pattern[str]") -> Tuple
         if _run_is_number(groups, policy):
             kinds.append(PII_KIND_NUMBER)
             spans.append(_number_span(text, start, end))
+    if _FORMULA_CALL_RE.match(text) is not None:
+        return kinds, spans, runs
     scanned = text
     if "@" in text:
         # E-mail addresses and handles: the whole space-delimited token is masked. The URL check below does not see
@@ -1153,9 +1221,14 @@ def oversized_result(config: ExtractionConfig) -> ExtractionResult:
     limits.max_conversation_chars) is not sent to the model (it would have to be cut, and PII after the cut would be
     lost). The session is flagged pii_detected TRUE with type 'other', so it is
     excluded from the export and a person can look at it. The respondent did answer, so the fields are 'unmapped'.
+    Their value is 'Not answered' (nothing was extracted).
     """
+    # Nothing was extracted, so no field may carry a real category (an 'Others' gender would be a false statement): every
+    # value is 'Not answered', the status `unmapped` keeps the session on the review list, and the justification says why.
     return ExtractionResult(
-        tuple(with_label(f, FieldResult(f.name, None, None, STATUS_UNMAPPED, None)) for f in config.fields),
+        tuple(FieldResult(f.name, LABEL_NOT_ANSWERED, None, STATUS_UNMAPPED, None,
+                          "Not read: a respondent message is longer than the size limit", (LABEL_NOT_ANSWERED,))
+              for f in config.fields),
         True, ("other",))
 
 
@@ -1386,7 +1459,7 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
         return _map_integer(spec, integer_text, raw, confidence, config)
 
     if spec.multi:
-        return _map_multi(spec, multi_items, raw, confidence, limits)
+        return _map_multi(spec, multi_items, raw, confidence, limits, placeholders)
 
     if value is None:
         if raw is None:
@@ -1400,6 +1473,10 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
         canonical = _canonical(spec, value)
         if canonical is not None:
             return _labelled(spec, canonical, raw if raw is not None else value, confidence)
+        if _is_placeholder(value, placeholders):
+            # 'skip', 'idk', 'none', 'NA' ... that is not one of the field's own categories ('Not sure', "Don't know" are):
+            # the respondent did not answer, whatever word the model copied into value.
+            return FieldResult(spec.name, None, None, STATUS_NOT_PROVIDED, confidence)
         return FieldResult(spec.name, None, raw if raw is not None else value[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
 
@@ -1446,7 +1523,7 @@ def fallback_label(spec: FieldSpec) -> str:
 
 
 def _map_multi(spec: FieldSpec, items: Optional[List[str]], raw: Optional[str], confidence: Optional[float],
-               limits: Limits) -> FieldResult:
+               limits: Limits, placeholders: FrozenSet[str] = DEFAULT_PLACEHOLDER_KEYS) -> FieldResult:
     """
     A multi-value field: every item is matched to a category (aliases included); the answer is the distinct matches in
     the CONFIG's category order (so one combination is always the same text), joined by ', ' as `value`, with the
@@ -1463,15 +1540,21 @@ def _map_multi(spec: FieldSpec, items: Optional[List[str]], raw: Optional[str], 
         return FieldResult(spec.name, None, raw, STATUS_NOT_PROVIDED, confidence)
     matched: List[str] = []
     off_list = False
+    only_placeholders = True
     for item in items:
         if _norm(item) in _NO_ANSWER_KEYS:
             continue
         canonical = _canonical(spec, item)
+        if canonical is None and _is_placeholder(item, placeholders):
+            continue                                 # 'skip', 'idk' ...: no answer, not an off-list value
+        only_placeholders = False
         if canonical is None:
             off_list = True
             canonical = next((c for c in spec.categories if _norm(c) == _norm(LABEL_OTHERS)), None)
         if canonical is not None and canonical not in matched:
             matched.append(canonical)
+    if only_placeholders:
+        return FieldResult(spec.name, None, raw, STATUS_NOT_PROVIDED, confidence)
     if len(matched) == 0:
         return FieldResult(spec.name, None, raw if raw is not None else MULTI_VALUE_SEPARATOR.join(items)[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
@@ -1636,8 +1719,10 @@ def extract(
 
     `masking` (a MaskingStep, when the config names `pii.masking_prompt_name`) adds a second call between the local
     check and the extraction call: the model masks personal data and abusive language in every respondent answer
-    (question and answer JSON in, masked answers out), the extraction prompt receives the masked answers, and
-    pii_detected is also TRUE when that call found personal data. The masked answers come back in the run's `masking`.
+    (question and answer JSON in, masked answers out; it reads the LOCALLY masked text), and pii_detected is also TRUE
+    when that call found personal data. The masked answers come back in the run's `masking` (the copy that may be
+    shared). `pii.extraction_text` decides what the extraction call reads: 'original' (the default: the respondent's own
+    words, so raw_value and the justification can be analysed before anything is shared) or 'masked' (the masked copy).
 
     `progress(stage, status, usage)` (optional) is told when a call starts ('running') and how it ended ('success' with
     the call's usage, or 'failed'), for STAGE_PII_MASKING and STAGE_METADATA_EXTRACTION. It runs on the calling thread,
@@ -1666,10 +1751,11 @@ def extract(
     if conversation.too_long:
         return ExtractionRun(done(oversized_result(config)), {}, False, len(conversation.turns), SKIP_TOO_LONG)
     kinds: Tuple[str, ...] = ()
+    original = conversation                       # the conversation exactly as stored
     if config.pii_policy.mask_before_call:
         masked_rows, kinds = mask_respondent_pii(rows, config.pii_policy)
         if len(kinds) > 0:
-            conversation = build_conversation(masked_rows, closing_keys, config.limits)
+            conversation = build_conversation(masked_rows, closing_keys, config.limits)   # the locally masked copy
     masking_result = None
     if masking is not None:
         # Optional model-based masking (config pii.masking_prompt_name), AFTER the local check above and BEFORE the
@@ -1696,12 +1782,17 @@ def extract(
             note(STAGE_PII_MASKING, "failed", masking_usage)
             raise
         note(STAGE_PII_MASKING, "success", masking_usage)
+        from app.services.feedback_pii_masking import scrub_findings
+        findings = scrub_findings(findings, pairs, masked)     # no justification may repeat what was masked out
         masking_result = MaskingResult(
             {key: {"question": pairs[key]["question"], "answer": masked[key]} for key in pairs},
             masked_types, abusive, severities, masking_usage, findings,
             masking_answer if isinstance(masking_answer, str) else None)
         conversation = apply_masked_answers(conversation, masked)
-    prompt = render_prompt(system_template, user_template, config, conversation)
+    # `conversation` is now the MASKED copy (local check, then the model); the extraction call reads the original unless
+    # the config says 'masked'. The masked copy is what the masking step stores for sharing, never what is analysed first.
+    extraction_conversation = original if config.pii_policy.extraction_text == EXTRACTION_TEXT_ORIGINAL else conversation
+    prompt = render_prompt(system_template, user_template, config, extraction_conversation)
     try:
         note(STAGE_METADATA_EXTRACTION, "running")
         try:

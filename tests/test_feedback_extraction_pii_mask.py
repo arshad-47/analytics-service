@@ -20,10 +20,11 @@ LEAKS = ("98765", "43210", "asha@gmail.com", "@asha_k", "www.x.in/asha", "asha_k
 
 
 def _config(**pii):
+    """These tests are about what the MODEL receives once the deterministic check has run, so they read the masked
+    text: `pii.extraction_text` is 'masked' here (the default, 'original', is covered by tests/test_feedback_original_text.py)."""
     raw = {"schema_version": 1, "persona": "Parent", "session_type": "Parent_Voice", "prompt_name": "Some Prompt",
-           "fields": [{"name": "district", "kind": "free_text", "description": "The district."}]}
-    if len(pii) > 0:
-        raw["pii"] = pii
+           "fields": [{"name": "district", "kind": "free_text", "description": "The district."}],
+           "pii": {"extraction_text": "masked", **pii}}
     return fx.parse_extraction_config(raw)
 
 

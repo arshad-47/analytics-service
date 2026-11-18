@@ -12,7 +12,7 @@ import pytest
 
 import pg_support
 from app.database.feedback_extraction_operations import (
-    StaleExtractionError, extract_submission, load_submission_inputs, persona_identity, save_extraction)
+    StaleExtractionError, asked_fields, extract_submission, load_submission_inputs, persona_identity, save_extraction)
 from app.services import feedback_extraction as fx
 from seed_support import extraction_config_id
 from test_feedback_pii_masking_pg import Fake, _meta, _run, _session
@@ -148,7 +148,7 @@ def test_a_relabelled_questionnaire_version_during_the_call_makes_the_write_stal
         await _use_config(conn, sid, "V1")
         async with pool.acquire() as c:
             inputs = await load_submission_inputs(c, sid, "mitra")
-        assert inputs["identity"][3] == "V1"
+        assert inputs["identity"][3] == asked_fields(inputs["config_row"]["config"], "V1")     # the fields V1 asks
         await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V2' WHERE submission_id = $1", sid)
         config = inputs["config_row"]["config"]
         async with pool.acquire() as c:
@@ -157,12 +157,36 @@ def test_a_relabelled_questionnaire_version_during_the_call_makes_the_write_stal
                     c, submission_id=sid, tenant_code="mitra", input_fingerprint=inputs["fingerprint"],
                     result=fx.empty_result(config), config_version_id=inputs["config_row"]["id"],
                     prompt_version_id=inputs["config_row"]["id"], run_at=inputs["loaded_at"],
-                    input_identity=inputs["identity"])
+                    input_identity=inputs["identity"], config=config)
         assert await _rows(conn, sid) == {}
         assert (await _meta(conn, sid))[0] is None
     _run(body)
 
 
-def test_the_identity_of_a_session_includes_its_questionnaire_version():
-    assert persona_identity("Youth_Voice", "mitra", "P1", "V1") != persona_identity("Youth_Voice", "mitra", "P1", "V2")
-    assert persona_identity("Youth_Voice", "mitra", "P1") == ("Youth_Voice", "mitra", "P1", None)
+def test_a_relabel_that_asks_the_same_fields_does_not_make_the_write_stale():
+    """General Public asks the same five fields in every version: a relabel (a lower bot id arrived) must not discard a finished call."""
+    async def body(conn, pool):
+        sid = await _session(conn, masking=None)
+        raw = {"schema_version": 1, "persona": "Youth", "session_type": "Youth_Voice", "prompt_name": "Feedback Metadata Extraction",
+               "fields": [f for f in FIELDS if "versions" not in f and "applies_when" not in f]}
+        await conn.execute("UPDATE config_version SET config = $2::jsonb WHERE config_id = $1::uuid",
+                           extraction_config_id("Youth_Voice"), json.dumps(raw))
+        await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V1' WHERE submission_id = $1", sid)
+        async with pool.acquire() as c:
+            inputs = await load_submission_inputs(c, sid, "mitra")
+        await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V2' WHERE submission_id = $1", sid)
+        config = inputs["config_row"]["config"]
+        async with pool.acquire() as c:
+            await save_extraction(
+                c, submission_id=sid, tenant_code="mitra", input_fingerprint=inputs["fingerprint"],
+                result=fx.empty_result(config), config_version_id=inputs["config_row"]["id"],
+                prompt_version_id=await conn.fetchval("SELECT id FROM prompt_version LIMIT 1"), run_at=inputs["loaded_at"],
+                input_identity=inputs["identity"], config=config)
+        assert len(await _rows(conn, sid)) == len(config.fields)                  # written, not discarded
+    _run(body)
+
+
+def test_the_identity_of_a_session_includes_the_fields_its_questionnaire_version_asks():
+    assert persona_identity("Youth_Voice", "mitra", "P1", ("a", "b")) != persona_identity("Youth_Voice", "mitra", "P1", ("a",))
+    assert persona_identity("Youth_Voice", "mitra", "P1", ("a",)) == persona_identity("Youth_Voice", "mitra", "P1", ("a",))
+    assert persona_identity("Youth_Voice", "mitra", "P1") == ("Youth_Voice", "mitra", "P1", ())
