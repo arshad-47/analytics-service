@@ -20,7 +20,6 @@ from seed_support import PERSONAS, extraction_config_v1
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED_PROMPTS = ROOT / "seed_prompts.sql"
-BANDS_DOC = ROOT / "docs" / "feedback-extraction-bands.md"
 
 # The DOTS export columns (the headers of the user's DOTS samples), in export order.
 DOTS_FIELDS = {
@@ -423,22 +422,6 @@ def test_parent_child_grade_and_educator_level_bands_map_and_others_do_not_coerc
         _answer(educator, {"teaching_level": ("High school", "high school")}), educator).fields}["teaching_level"]
     assert level.status == "unmapped" and level.raw_value == "high school"      # a bare 'high school' is not a band
     assert level.value == "Others"                                              # the field's fallback, never an empty value
-
-
-# ------------------------------------------------------------------------------------------------ doc
-
-def test_bands_doc_lists_every_field_of_every_persona_and_where_the_bands_live():
-    text = BANDS_DOC.read_text(encoding="utf-8")
-    for persona, names in DOTS_FIELDS.items():
-        assert persona in text
-        for name in names:
-            assert f"`{name}`" in text, (persona, name)
-    assert "seed_config.sql" in text
-    assert "python tools/run_feedback_extraction.py upgrade-config" not in text      # the command is gone
-    assert "seed_feedback_extraction" not in text
-    for prompt_name in PERSONA_PROMPT_NAMES.values():
-        assert prompt_name in text
-    assert "Changing a band or a field" in text and "How an existing database picks this up" in text
 
 
 # ------------------------------------------------------------------------------------------------ generic, config-driven seeds

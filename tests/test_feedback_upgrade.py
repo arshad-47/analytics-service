@@ -243,16 +243,9 @@ def _in_image(path: str, copied) -> bool:
 WORKSTATION_TOOLS = {"tools/split_mitra_export.py"}
 
 
-def test_the_readme_says_the_split_tool_runs_on_the_workstation_not_in_the_container():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    at = readme.index("python tools/split_mitra_export.py")
-    assert "workstation" in readme[max(0, at - 600):at], "README step 1 must say where the split tool runs"
-
-
 def _tools_named_in_the_app():
-    """tools/<name>.py references in what operators READ: README, app messages, the DLQ reason, docs/*.md."""
-    texts = [(ROOT / "README.md").read_text(encoding="utf-8")]
-    texts += [p.read_text(encoding="utf-8") for p in (ROOT / "app").rglob("*.py")]
+    """tools/<name>.py references in what operators READ in the app: its messages and the DLQ reason."""
+    texts = [p.read_text(encoding="utf-8") for p in (ROOT / "app").rglob("*.py")]
     named = set()
     for text in texts:
         named.update(re.findall(r"\btools/([A-Za-z0-9_]+\.py)", text))

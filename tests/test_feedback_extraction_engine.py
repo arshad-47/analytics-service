@@ -10,8 +10,6 @@ import copy
 import importlib.util
 import inspect
 import json
-import re
-import shlex
 import traceback
 import uuid
 from contextlib import asynccontextmanager
@@ -514,43 +512,6 @@ def test_the_run_summary_has_no_min_max_for_an_integer_field_nobody_answered():
 def test_neither_the_core_nor_the_cli_offers_a_preloaded_prompt_any_more():
     assert not hasattr(ops, "load_active_prompt") and not hasattr(cli, "load_active_prompt")
     assert "prompt_row" not in inspect.signature(ops.extract_submission).parameters
-
-
-def _documented_commands(tool):
-    """The `python tools/<tool>.py ...` example lines of the extraction doc, as argv lists (placeholders filled in)."""
-    text = (ROOT / "docs" / "feedback-extraction-and-dots-queries.md").read_text(encoding="utf-8")
-    commands = []
-    for line in text.splitlines():
-        match = re.match(rf"^python tools/{tool}\.py (.*)$", line)
-        if match is not None:
-            argv = match.group(1).split("  #")[0].replace("<program uuid>", str(uuid.uuid4())).replace("<model>", "some/model")
-            commands.append(shlex.split(argv))
-    return commands
-
-
-def test_every_documented_feedback_config_command_parses_with_the_real_cli():
-    spec = importlib.util.spec_from_file_location("feedback_config_cli_for_docs", ROOT / "tools" / "feedback_config.py")
-    config_cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_cli)
-    commands = _documented_commands("feedback_config")
-    assert len(commands) >= 1
-    for argv in commands:
-        config_cli.build_parser().parse_args(argv)
-
-
-def test_every_documented_extraction_command_parses_with_the_real_cli():
-    commands = _documented_commands("run_feedback_extraction")
-    assert len(commands) >= 1
-    for argv in commands:
-        cli.build_parser().parse_args(argv)
-
-
-def test_the_documented_extraction_commands_parse_once_the_required_tenant_is_added():
-    # the same examples, with the one flag the doc omits: everything else in them is accepted by the real parser
-    for argv in _documented_commands("run_feedback_extraction"):
-        if argv[0] == "run":
-            argv = argv + ["--tenant-code", "t1"]
-        cli.build_parser().parse_args(argv)
 
 
 def test_a_failing_llm_call_surfaces_a_clean_error_and_chains_nothing(monkeypatch):

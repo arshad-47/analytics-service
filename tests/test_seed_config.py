@@ -234,5 +234,6 @@ def test_every_extraction_config_is_accepted_by_the_extraction_parser(block):
     parsed = fx.parse_extraction_config(block["config"])
     assert parsed.session_type == block["session_type"]
     assert parsed.prompt_name.startswith("Feedback Metadata Extraction - ")
-    assert block["config"]["llm"] == {} and block["config"]["pii"]["types"][-1]["name"] == "other"
+    # CHANGED: the seeded configs set llm.max_tokens (see tests/test_feedback_seed_llm.py)
+    assert block["config"]["llm"] == {"max_tokens": 10000} and block["config"]["pii"]["types"][-1]["name"] == "other"
     assert block["change_note"].startswith("Initial extraction config")

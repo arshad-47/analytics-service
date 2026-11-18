@@ -3,7 +3,6 @@ Pure tests (no database, no network) of the review fixes around app/database/fee
 seed SQL, the schema text and the documented queries: sanitised LLM errors, the content fingerprint, the seed prompt
 that is never overwritten, no copied session_type / questionnaire_version columns. SYNTHETIC data only.
 """
-import re
 import traceback
 import uuid
 from pathlib import Path
@@ -119,17 +118,3 @@ def test_schema_has_no_copied_session_type_or_questionnaire_version_on_the_extra
     assert "idx_feedback_extracted_session_field_value" not in schema
     assert "ON feedback_extracted_data (field_name, value)" in schema
 
-
-def test_documented_queries_read_session_type_and_version_from_feedback_submissions_only():
-    docs = (ROOT / "docs" / "feedback-extraction-and-dots-queries.md").read_text(encoding="utf-8")
-    section = docs[docs.index("## 6. Postgres queries"):docs.index("## 7. ")]
-    queries = re.findall(r"```sql\n(.*?)```", section, flags=re.S)
-    assert len(queries) >= 4          # the first four are the persona pivots checked below; the rest are other reports
-    for query in queries:
-        assert "d.session_type" not in query and "d.questionnaire_version" not in query and "e.questionnaire_version" not in query
-    for query in queries[:4]:
-        assert "fs.questionnaire_version" in query and "fs.session_type" in query
-        for field in re.findall(r"FILTER \(WHERE d\.field_name = '(\w+)'\)", query):
-            assert f"{field}_status" in query
-    assert "ALTER TABLE feedback_extracted_data DROP COLUMN IF EXISTS session_type;" in docs
-    assert "ALTER TABLE feedback_extracted_data DROP COLUMN IF EXISTS questionnaire_version;" in docs

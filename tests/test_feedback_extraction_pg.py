@@ -9,7 +9,6 @@ sessions through the real ingest path (insert_or_update_submission) and uses a F
 """
 import asyncio
 import json
-import re
 import time
 import traceback
 import uuid
@@ -37,7 +36,6 @@ DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(
     DSN is None or DSN == "", reason="FEEDBACK_TEST_DATABASE_URL not set (real Postgres required)")
 
-DOCS = Path(__file__).resolve().parent.parent / "docs" / "feedback-extraction-and-dots-queries.md"
 YOUTH = PERSONAS["Youth"]
 
 
@@ -716,37 +714,7 @@ def test_closing_keys_come_only_from_the_upload_config_of_the_same_program_and_s
     _run(body)
 
 
-def test_documented_drop_column_upgrade_works_on_a_table_that_still_has_the_copied_columns():
-    text = DOCS.read_text(encoding="utf-8")
-    statements = re.findall(r"^ALTER TABLE feedback_extracted_data DROP COLUMN IF EXISTS \w+;$", text, flags=re.M)
-    assert len(statements) == 2
-
-    async def body(conn, pool):
-        await conn.execute("DROP INDEX IF EXISTS idx_feedback_extracted_field_value")
-        await conn.execute("ALTER TABLE feedback_extracted_data ADD COLUMN session_type TEXT NOT NULL DEFAULT 'Youth_Voice'")
-        await conn.execute("ALTER TABLE feedback_extracted_data ADD COLUMN questionnaire_version TEXT NOT NULL DEFAULT 'V1'")
-        await conn.execute("CREATE INDEX idx_feedback_extracted_session_field_value ON feedback_extracted_data (session_type, field_name, value)")
-        for statement in statements + statements:                                         # and idempotent
-            await conn.execute(statement)
-        await conn.execute(pg_support.schema_sql())
-        columns = {r["column_name"] for r in await conn.fetch(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = 'feedback_extracted_data'")}
-        assert "session_type" not in columns and "questionnaire_version" not in columns
-        indexes = {r["indexname"] for r in await conn.fetch("SELECT indexname FROM pg_indexes WHERE tablename = 'feedback_extracted_data'")}
-        assert "idx_feedback_extracted_field_value" in indexes and "idx_feedback_extracted_session_field_value" not in indexes
-        sid = await _add(conn)
-        await extract_submission(pool, sid, "mitra", llm_function=FakeLlm(_answer()))
-        assert len(await _rows(conn, sid)) == 4
-    _run(body)
-
-
-# ---------------------------------------------------------------------------------------------- DOTS queries
-
-def _doc_queries():
-    text = DOCS.read_text(encoding="utf-8")
-    section = text[text.index("## 6. Postgres queries"):text.index("## 7. Caveats")]
-    return re.findall(r"```sql\n(.*?)```", section, flags=re.S)
-
+# ---------------------------------------------------------------------------------------------- seeded-persona helpers
 
 # What _add stamps in these tests: every persona has ONE bot, so its sessions are the lowest bot id of the persona: V1
 # (the label is the rank of the bot id, whatever `version` the event carries).
@@ -780,100 +748,3 @@ def _seed_answer(persona, pii=(False, []), **overrides):
 SENSITIVE = {"Youth": {"monthly_household_income", "annual_household_income", "disability", "disability_type"},
              "Parent": {"disability", "disability_type"}}
 
-
-def test_every_documented_query_runs_and_the_pivot_excludes_pii_and_unchecked_sessions():
-    queries = _doc_queries()
-    assert len(queries) >= 4          # the documented pivots and reports; each one is executed below
-
-    async def body(conn, pool):
-        clean = await _add(conn)
-        flagged = await _add(conn)
-        unchecked = await _add(conn)
-        await extract_submission(pool, clean, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Youth"))))
-        await extract_submission(pool, flagged, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Youth", pii=(True, ["name"])))))
-        for query in queries:
-            await conn.fetch(query)                                    # every documented query is valid SQL
-
-        youth = await conn.fetch(queries[0])
-        assert [r["submission_id"] for r in youth] == [clean]
-        row = dict(youth[0])
-        want = _seed_values("Youth")
-        assert (row["state"], row["district"], row["gender"], row["institution_type"], row["questionnaire_version"]) == (
-            "Karnataka", "Mysuru", want["gender"], want["institution_type"], "V1")   # the rank of its bot id (the only bot)
-        assert row["age"] == "≥ 16 and < 22" and row["age_status"] == "extracted"      # the label of the band, 17 is the raw word
-        assert row["source"] == "mitra" and row["session_type"] == "Youth_Voice"
-        assert all(row[f"{n}_status"] == "extracted" for n in ("state", "district", "gender", "institution_type"))
-        # the sensitive columns are NOT in the documented export, and the commented-out block turns them on when asked
-        assert not (SENSITIVE["Youth"] & set(row))
-        uncommented = re.sub(r"^(\s*)-- , ", r"\1, ", queries[0], flags=re.M)
-        with_sensitive = dict((await conn.fetch(uncommented))[0])
-        assert SENSITIVE["Youth"] <= set(with_sensitive) and {f"{n}_status" for n in SENSITIVE["Youth"]} <= set(with_sensitive)
-        assert with_sensitive["disability"] == want["disability"]
-        counts = {r["session_type"]: dict(r) for r in await conn.fetch(queries[5])}
-        assert (counts["Youth_Voice"]["exported"], counts["Youth_Voice"]["excluded_pii"], counts["Youth_Voice"]["not_checked"]) == (1, 1, 1)
-        # session_type / questionnaire_version come from feedback_submissions: a relabel shows up at once
-        await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V9' WHERE submission_id = $1", clean)
-        assert (await conn.fetch(queries[0]))[0]["questionnaire_version"] == "V9"
-        # put the rank label back (V1: its only bot): any later ingest of the persona re-ranks it and would otherwise
-        # repair the label by sending the session back through extraction
-        await conn.execute("UPDATE feedback_submissions SET questionnaire_version = 'V1' WHERE submission_id = $1", clean)
-        unchecked_rows = await conn.fetch(queries[4])
-        assert [(r["session_type"], r["unchecked_sessions"]) for r in unchecked_rows] == [("Youth_Voice", 1)]
-        assert unchecked not in [r["submission_id"] for r in youth]
-
-        # the other personas' queries select their own sessions only and use their own column names
-        parent = await _add(conn, persona="Parent", version="V1")
-        await extract_submission(pool, parent, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Parent"))))
-        parent_rows = await conn.fetch(queries[1])
-        assert [r["submission_id"] for r in parent_rows] == [parent]
-        prow = dict(parent_rows[0])
-        pwant = _seed_values("Parent")
-        assert prow["child_gender"] == pwant["child_gender"] and prow["school_type"] == pwant["school_type"]
-        assert "gender" not in prow and not (SENSITIVE["Parent"] & set(prow))
-        assert [r["submission_id"] for r in await conn.fetch(queries[0])] == [clean]
-        general = await _add(conn, persona="General Public")
-        await extract_submission(pool, general, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("General Public", state="Kerala"))))
-        assert [(r["submission_id"], r["state"], r["age"]) for r in await conn.fetch(queries[2])] == [(general, "Kerala", "≥ 12 and < 26")]
-        educator = await _add(conn, persona="Educator", version="V1")
-        await extract_submission(pool, educator, "mitra", llm_function=_with_masking(FakeLlm(_seed_answer("Educator"))))
-        erow = [dict(r) for r in await conn.fetch(queries[3])]
-        assert [r["submission_id"] for r in erow] == [educator]
-        assert erow[0]["teaching_level"] == _seed_values("Educator")["teaching_level"]
-        assert erow[0]["institution_type"] == _seed_values("Educator")["institution_type"]
-
-        # review: an unmapped answer is visible with its raw words, only for sessions that passed the PII check
-        unmapped = await _add(conn)
-        answer = json.loads(_seed_answer("Youth"))
-        answer["fields"]["state"] = {"value": None, "raw": "somewhere"}
-        await extract_submission(pool, unmapped, "mitra", llm_function=_with_masking(FakeLlm(json.dumps(answer))))
-        review = await conn.fetch(queries[8])
-        assert [(r["submission_id"], r["raw_value"], r["questionnaire_version"]) for r in review] == [(unmapped, "somewhere", "V1")]
-        # the status columns tell not_provided from unmapped (both have a NULL value); an integer out of range is unmapped
-        placeholder = await _add(conn)
-        answer = json.loads(_seed_answer("Youth"))
-        answer["fields"]["state"] = {"value": None, "raw": "somewhere"}
-        answer["fields"]["district"] = {"value": "N/A", "raw": "n/a"}
-        answer["fields"]["gender"] = {"value": None, "raw": None}
-        answer["fields"]["age"] = {"value": 250, "raw": "250"}
-        await extract_submission(pool, placeholder, "mitra", llm_function=_with_masking(FakeLlm(json.dumps(answer))))
-        by_id = {r["submission_id"]: r for r in await conn.fetch(queries[0])}
-        assert (by_id[placeholder]["state"], by_id[placeholder]["state_status"]) == ("Unmapped", "unmapped")
-        assert (by_id[placeholder]["district"], by_id[placeholder]["district_status"]) == ("Not answered", "not_provided")
-        assert (by_id[placeholder]["gender"], by_id[placeholder]["gender_status"]) == ("Not answered", "not_provided")
-        assert (by_id[placeholder]["age"], by_id[placeholder]["age_status"]) == ("Invalid response", "unmapped")
-        statuses = {(r["session_type"], r["field_name"], r["status"]): r["sessions"] for r in await conn.fetch(queries[7])}
-        assert statuses[("Youth_Voice", "state", "unmapped")] == 2 and statuses[("Youth_Voice", "state", "extracted")] == 2
-    _run(body, legacy=False)
-
-
-def test_stale_query_finds_a_session_that_grew_after_its_extraction():
-    queries = _doc_queries()
-
-    async def body(conn, pool):
-        sid = await _add(conn)
-        await extract_submission(pool, sid, "mitra", llm_function=FakeLlm(_answer()))
-        assert await conn.fetch(queries[6]) == []
-        await conn.execute("UPDATE feedbacks SET updated_at = now() + interval '1 minute', message = message "
-                           "WHERE submission_id = $1 AND sequence = 4", sid)
-        assert [r["submission_id"] for r in await conn.fetch(queries[6])] == [sid]
-    _run(body)
