@@ -1172,7 +1172,11 @@ For each field return an object with:
 ## Rules for this persona
 
 - No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
+- Invalid response: when a field lists Invalid response as an allowed category, any reply that is completely irrelevant, nonsensical, or unrelated to what was asked (such as naming a language, an object, greetings, numbers, or gibberish) MUST return "Invalid response" as "value" (with the respondent''s words in "raw"). Do NOT return null for "value" when the respondent gave an answer that is irrelevant or nonsense.
 - state and district: where the respondent teaches. Follow the field text for "Delhi/NCR" and a named district.
+  * If the answer has nothing to do with geography (such as naming a language like Hindi or English, an object, a person, greetings, or gibberish), return "Invalid response" as "value" with the raw text. Never return null.
+  * If the answer is a geographic location or direction that does not identify a specific state or district (for example "North India", "near mountains"), return "Unmapped".
+  * If the place is outside India, return "Outside India".
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - institution_type: the kind of institution the respondent teaches at. If they say "other" and then name a kind (for example a trust school), the value is Others and the kind goes in raw. An aided school is Others. An answer about a college is Invalid response (the question is about schools).
 - teaching_level: the bot asks "primary, middle, high school or college". Primary is Primary (classes 1-5), middle is Middle (classes 6-8), "high school" is High school (classes 9-12); "college" alone is Undergraduate, and Postgraduate only when they say they teach a master''s level. Several levels (for example classes 6 to 10): every band that applies, once each, as a JSON list. Vocational training or other settings are Others.
