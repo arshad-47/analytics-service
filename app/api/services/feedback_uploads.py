@@ -472,7 +472,6 @@ def build_feedback_events(
     closing_keys = set(config.get("closing_keys", []))
     offset = int(config["sequence_offset"])
     catalog = {q["key"]: q for q in config["questions"]}
-    english_languages = {str(x).lower() for x in config.get("english_languages", ["en"])}
     bot_map = config["message_map"]["bot"]
     respondent_map = config["message_map"]["respondent"]
 
@@ -657,7 +656,6 @@ def build_feedback_events(
             continue
 
         language = languages[first]
-        is_english = language.lower() in english_languages
         completion_status = folded_completion[statuses[first].lower()]
 
         def row_texts(i: int, is_bot: bool) -> Tuple[str, Optional[str]]:
@@ -670,7 +668,7 @@ def build_feedback_events(
             if _is_blank(conversation_text):
                 conversation_text = english_text
             if _is_blank(english_text):
-                english_text = conversation_text if is_english else None
+                english_text = None   # the CSV gave no English text: stored as NULL, never a copy of the message
             return conversation_text, english_text
 
         messages: List[Dict[str, Any]] = []
