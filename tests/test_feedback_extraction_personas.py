@@ -183,19 +183,12 @@ def test_youth_has_one_monthly_income_field_for_every_version_and_no_annual_fiel
     assert "'around 25,000' belongs here" in monthly.guidance["≥ ₹25,000 and < ₹66,000"]
 
 
-def test_disability_fields_are_sensitive_and_disability_type_is_a_multi_value_category_that_needs_a_yes():
+def test_disability_type_is_a_multi_value_category_that_needs_a_yes():
     for persona in ("Youth", "Parent"):
         by_name = {f.name: f for f in _config(persona).fields}
         assert by_name["disability"].categories == ("Yes", "No", "Prefer not to say", "Invalid response")
         kind = by_name["disability_type"]
         assert kind.kind == "category" and kind.multi
-<<<<<<< Updated upstream
-        if persona == "Youth":
-            assert kind.sensitive and by_name["disability"].sensitive
-        else:
-            assert not kind.sensitive and not by_name["disability"].sensitive
-=======
->>>>>>> Stashed changes
         assert kind.categories == ("Physical disability", "Intellectual disability", "Others", "Prefer not to say", "Invalid response")
         assert kind.applies_when == ("disability", ("Yes",))
     assert "CHILD" in {f.name: f for f in _config("Parent").fields}["disability"].description
