@@ -49,7 +49,9 @@ def _four_field_raw(persona="Youth"):
     raw = extraction_config_v1(persona)
     by_name = {f["name"]: f for f in raw["fields"]}
     gender = by_name["gender"] if "gender" in by_name else by_name["child_gender"]
-    raw["fields"] = [by_name["state"], by_name["district"], dict(gender, name="gender")]
+    gender_field = dict(gender, name="gender")
+    gender_field.pop("versions", None)
+    raw["fields"] = [by_name["state"], by_name["district"], gender_field]
     for school_name in ("institution_type", "school_type"):     # General Public has none
         if school_name in by_name:
             raw["fields"].append(dict(by_name[school_name], name="school_type"))

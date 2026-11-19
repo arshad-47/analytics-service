@@ -33,7 +33,7 @@ DOTS_FIELDS = {
 SENSITIVE = {
     "Youth": {"monthly_household_income", "annual_household_income", "disability", "disability_type"},
     "General Public": set(),
-    "Parent": {"disability", "disability_type"},
+    "Parent": set(),
     "Educator": set(),
 }
 KNOWN_VARIABLES = {"persona", "fields", "field_names", "pii_types", "output_format", "conversation_id", "conversation"}
@@ -191,7 +191,11 @@ def test_disability_fields_are_sensitive_and_disability_type_is_a_multi_value_ca
         by_name = {f.name: f for f in _config(persona).fields}
         assert by_name["disability"].categories == ("Yes", "No", "Prefer not to say", "Invalid response")
         kind = by_name["disability_type"]
-        assert kind.kind == "category" and kind.sensitive and kind.multi
+        assert kind.kind == "category" and kind.multi
+        if persona == "Youth":
+            assert kind.sensitive and by_name["disability"].sensitive
+        else:
+            assert not kind.sensitive and not by_name["disability"].sensitive
         assert kind.categories == ("Physical disability", "Intellectual disability", "Others", "Prefer not to say", "Invalid response")
         assert kind.applies_when == ("disability", ("Yes",))
     assert "CHILD" in {f.name: f for f in _config("Parent").fields}["disability"].description

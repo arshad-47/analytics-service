@@ -2074,7 +2074,10 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
         "Unsure / don't know": "the respondent says they are unsure of their gender identity or do not know which option to choose"
       },
-      "multi": true
+      "multi": true,
+      "versions": [
+        "V2"
+      ]
     },
     {
       "name": "disability",
@@ -2092,7 +2095,9 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "sensitive": true
+      "versions": [
+        "V2"
+      ]
     },
     {
       "name": "disability_type",
@@ -2112,7 +2117,6 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "sensitive": true,
       "multi": true,
       "applies_when": {
         "field": "disability",
