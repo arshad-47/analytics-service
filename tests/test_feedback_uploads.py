@@ -395,14 +395,20 @@ def test_bot_rows_swap_columns_and_respondent_rows_copy(config):
     assert m[2]["message"] == "[hi] state answer" and m[2]["translatedMessage"] == "state answer one"
 
 
-def test_english_session_holds_same_text_on_both_sides(config):
+# CHANGED: a respondent row whose CSV English column is empty keeps translatedMessage None (it used to get a copy of
+# the message in an English session); a bot row still carries the English text because the CSV supplied it
+def test_english_session_does_not_copy_message_into_translated(config):
     events, _ = build(read_fixture("feedback_valid_mitra.csv"), config)
     en = [e for e in events if e["data"]["language"] == "en"][0]
     for msg in en["data"]["messages"]:
-        assert msg["message"] == msg["translatedMessage"] and msg["message"] != ""
+        assert msg["message"] != ""
+        if msg["parentSequence"] is None:
+            assert msg["translatedMessage"] == msg["message"]
+        else:
+            assert msg["translatedMessage"] is None
     m = by_sequence(en)
-    assert m[3]["message"] == "English district question"     # bot row, translated column was empty
-    assert m[2]["message"] == "english state answer"          # respondent row, translated column was empty
+    assert m[3]["message"] == "English district question" and m[3]["translatedMessage"] == "English district question"
+    assert m[2]["message"] == "english state answer" and m[2]["translatedMessage"] is None
 
 
 def test_empty_conversation_side_falls_back_to_english(config):
@@ -434,7 +440,7 @@ def test_translated_message_column_may_be_absent(config):
     df = df.drop(columns=["translated_message"])
     events, skipped = build(df, config)
     assert skipped == []
-    assert by_sequence(events[0])[2]["translatedMessage"] == "english answer"
+    assert by_sequence(events[0])[2]["translatedMessage"] is None      # CHANGED: no copy of the message
 
 
 # ---------------------------------------------------------------------------------- completion, dates
@@ -866,8 +872,9 @@ def test_opening_v1_fixture(config):
     assert msgs(hi)[0]["message"] == "[hi] hello welcome which state"
     assert msgs(hi)[0]["translatedMessage"] == "Hello, welcome. Which state do you stay in?"
     assert en["data"]["completionStatus"] == "IN_PROGRESS" and len(msgs(en)) == 4
-    for m in msgs(en):
-        assert m["message"] == m["translatedMessage"] and m["message"] != ""
+    for m in msgs(en):     # CHANGED: an answer with no English column in the CSV has translatedMessage None
+        assert m["message"] != ""
+        assert m["translatedMessage"] == (m["message"] if m["parentSequence"] is None else None)
     assert hi["data"]["questionnaireVersion"] == en["data"]["questionnaireVersion"] == "V1"
 
 

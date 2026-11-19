@@ -532,10 +532,11 @@ class TestEvents:
         assert messages[1]["message"] == "22"
         assert messages[-1]["message"] == "Prices"
 
-    def test_english_answers_carry_translated_message(self, config):
+    # CHANGED: an English answer used to be copied into translatedMessage; a form carries no translation, so it is None
+    def test_english_answers_have_no_translated_message(self, config):
         events, _ = build(self.responses(config), config)
         answers = [m for m in events[0]["data"]["messages"] if m["parentSequence"] is not None]
-        assert all(m["translatedMessage"] == m["message"] for m in answers)
+        assert len(answers) > 0 and all(m["translatedMessage"] is None and m["message"] != "" for m in answers)
 
     def test_kannada_response_has_no_translated_message_on_answers(self, config):
         responses = self.responses(config, [("10/2/2026 10:09:20", "22", "Female", "Goa", "ಕಲಿಕೆ", "Prices")])
@@ -548,13 +549,14 @@ class TestEvents:
         assert all(m["translatedMessage"] == m["message"] for m in questions)    # English question text
         assert any(m["message"] == "ಕಲಿಕೆ" for m in answers)
 
-    def test_translated_rule_follows_the_configured_default_language(self, config):
+    # CHANGED: the default language no longer decides translatedMessage (it is None for every answer)
+    def test_default_language_does_not_fill_translated_message(self, config):
         config["language"]["default"] = "hi"
         responses = prepare(general_frame([ROW]), config)[0]
         assert responses[0]["language"] == "hi"
         events, _ = build(responses, config)
         answers = [m for m in events[0]["data"]["messages"] if m["parentSequence"] is not None]
-        assert all(m["translatedMessage"] == m["message"] for m in answers)
+        assert len(answers) > 0 and all(m["translatedMessage"] is None for m in answers)
 
     def test_known_refs_are_skipped_and_counted(self, config):
         responses = self.responses(config, [ROW, ROW[:5] + ("Taxes",), ROW[:5] + ("Rent",)])

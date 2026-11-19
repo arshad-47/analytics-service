@@ -451,9 +451,8 @@ def build_gforms_events(
     submissionId = sessionId = id_factory() (a uuid4 string by default), drawn only for new responses.
     Messages are numbered 1..n: per answer a question row (odd; parentSequence null) then its answer
     row (even; parentSequence = the question's sequence); messageAt = the response's submission_date.
-    translatedMessage of an answer is the answer itself when the response language equals the config's
-    default language, else None (translation comes later). The question row carries the English text
-    in both message and translatedMessage.
+    translatedMessage of an answer is None (a Google Forms response carries no translation; one comes later).
+    The question row carries the English text in both message and translatedMessage.
 
     `config` (optional, keyword) supplies session_type, the forms' questionnaire_version, default_completion,
     language.default and the optional `location` block (state / district via aliases, same semantics as the Mitra builder). Without it
@@ -465,7 +464,6 @@ def build_gforms_events(
     # a form response is final: only COMPLETED is valid (validated; an IN_PROGRESS config fails loudly here)
     completion = (validate_default_completion(cfg["default_completion"]) if "default_completion" in cfg
                   else COMPLETION_COMPLETED)
-    default_language = _default_language(cfg)
     session_type = cfg.get("session_type")
     forms = cfg.get("forms", {})
 
@@ -479,7 +477,6 @@ def build_gforms_events(
 
         language = response["language"]
         submitted = response["submission_date"]
-        is_default_language = language == default_language
         # the questionnaire version is a property of the form the response came from
         questionnaire_version = forms.get(response.get("form_key"), {}).get("questionnaire_version")
 
@@ -500,7 +497,7 @@ def build_gforms_events(
                 "questionKey": answer["question_key"],
                 "isFollowUp": False,
                 "message": answer["answer"],
-                "translatedMessage": answer["answer"] if is_default_language else None,
+                "translatedMessage": None,
                 "messageAt": submitted,
                 "parentSequence": question_seq,
             })
