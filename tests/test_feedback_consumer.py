@@ -6,6 +6,7 @@ success-at-ingest rule, and that story/discussion paths are untouched. The real-
 """
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +17,7 @@ import pytest
 import app.kafka.consumer as consumer_module
 from app.database import operations
 from app.database.operations import FeedbackUpdateNotSupportedError, insert_or_update_submission
+from seed_support import FEEDBACK_PROGRAM_NAME, gforms_config_v1, mitra_config_v1
 from conftest import FakeConn, install_fake_db
 
 FIXTURES = Path(__file__).resolve().parent / "kafka_events"
@@ -31,10 +33,13 @@ def _feedback_event(event_type="create", **overrides):
     event = {
         "submissionId": "184884", "submissionType": "feedback", "sessionId": "s" * 32,
         "tenantCode": "mitra", "eventType": event_type, "eventPublishedAt": "2026-10-15T08:54:43.000Z",
-        "tags": {"programId": PROGRAM_ID, "programName": "1M Voice", "leaderCategoryId": LEADER_ID,
+        "tags": {"programId": PROGRAM_ID, "programName": FEEDBACK_PROGRAM_NAME, "leaderCategoryId": LEADER_ID,
                  "leaderCategoryName": "Youth", "state": None, "district": None, "source": "mitra"},
         "data": {
-            "source": "mitra", "language": "hi", "completionStatus": "IN_PROGRESS",
+            "source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice",
+            "questionnaireVersion": "V2",
+            "botId": "101", "botName": "Mitra Youth Test Bot",
+            "language": "hi", "completionStatus": "IN_PROGRESS",
             "submissionDate": "2026-10-15T08:54:43.000Z",
             "messages": [
                 {"sequence": 1, "questionKey": "AGE_IDENTIFICATION", "isFollowUp": False, "message": "Age?",
@@ -50,8 +55,29 @@ def _feedback_event(event_type="create", **overrides):
 
 # consumer helpers -----------------------------------------------------------------------------
 
+def _active_config(source, config=None):
+    """What get_active_feedback_config returns for the Youth persona (the default: the seeded config)."""
+    if config is None:
+        config = mitra_config_v1("Youth") if source == "mitra" else gforms_config_v1("Youth")
+    return {"config_id": "c", "config_version_id": "v-1", "version": 1, "session_type": "Youth_Voice", "config": config}
+
+
+def _patch_active_config(monkeypatch, loader=None):
+    """The consumer reads the persona's upload config from the config tables; replaced by an in-memory fake."""
+    calls = []
+
+    async def fake(program_id, source, *, tenant_code=None, session_type=None):
+        calls.append((program_id, source, tenant_code, session_type))
+        return _active_config(source)
+
+    monkeypatch.setattr(consumer_module.feedback_operations, "get_active_feedback_config",
+                        loader if loader is not None else fake)
+    return calls
+
+
 def _consumer(monkeypatch, insert_result=None, mode="real-time"):
     consumer = consumer_module.IngestionConsumer()
+    _patch_active_config(monkeypatch)
     conn = install_fake_db(monkeypatch, consumer_module)
     conn.fetchval.return_value = 1  # "a submission with this id already exists"
     insert_mock = AsyncMock(return_value=insert_result or {"id": "u", "status": "pending", "changed": True})
@@ -173,16 +199,20 @@ def test_story_update_is_not_dlqd(monkeypatch):
 # success-at-ingest ----------------------------------------------------------------------------
 
 def _trigger_setup(monkeypatch, process_config):
-    """process_config is applied to every type via the real settings.get_process_config (JSON env fields)."""
+    """process_config is applied to story / discussion via the real settings.get_process_config (JSON env
+    fields) and to feedback via get_feedback_process_steps (the persona config's process_steps)."""
     consumer = consumer_module.IngestionConsumer()
     conn = install_fake_db(monkeypatch, consumer_module)
     consumer.temporal_client = MagicMock()
     consumer.temporal_client.start_workflow = AsyncMock()
     raw = json.dumps(process_config)
-    for field in ("PROCESS_CONFIG_STORY", "PROCESS_CONFIG_DISCUSSION", "PROCESS_CONFIG_FEEDBACK"):
+    for field in ("PROCESS_CONFIG_STORY", "PROCESS_CONFIG_DISCUSSION"):
         monkeypatch.setattr(consumer_module.settings, field, raw)
+    steps_mock = AsyncMock(return_value=process_config)
+    monkeypatch.setattr(consumer_module.feedback_operations, "get_feedback_process_steps", steps_mock)
     status_mock = AsyncMock()
     monkeypatch.setattr(consumer_module, "update_submission_status", status_mock)
+    consumer.steps_mock = steps_mock
     return consumer, conn, status_mock
 
 
@@ -212,26 +242,220 @@ def test_story_and_discussion_without_process_steps_still_left_pending(monkeypat
 def test_feedback_with_process_steps_starts_workflow_not_success(monkeypatch):
     async def run():
         steps = [{"name": "pii_and_abusive"}]
-        consumer, _, status_mock = _trigger_setup(monkeypatch, steps)
+        consumer, conn, status_mock = _trigger_setup(monkeypatch, steps)
         await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")
         consumer.temporal_client.start_workflow.assert_awaited_once()
-        # only the 'processing' transition, never a direct 'success'
-        assert [c.args[3] for c in status_mock.await_args_list] == ["processing"]
+        # never a direct 'success' through update_submission_status; the 'processing' transition is the consumer's own
+        # guarded UPDATE (upstream release-1.4.0: only a row that is still 'pending' moves, so a workflow that
+        # already finished or failed is not overwritten)
+        status_mock.assert_not_awaited()
+        conn.execute.assert_awaited_once()
+        sql, *params = conn.execute.await_args.args
+        assert "SET status = 'processing'" in sql and "status = 'pending'" in sql
+        assert params == ["184884", "mitra"]
+    asyncio.run(run())
+
+
+def test_feedback_steps_come_from_the_persona_config_story_from_settings(monkeypatch):
+    async def run():
+        steps = [{"name": "feedback_metadata_extraction"}]
+        consumer, conn, status_mock = _trigger_setup(monkeypatch, steps)
+        await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")
+        consumer.steps_mock.assert_awaited_once_with(conn, "184884", "mitra")
+        payload = consumer.temporal_client.start_workflow.await_args.args[1]
+        assert payload["process_steps"] == steps
+
+        consumer.steps_mock.reset_mock()
+        await consumer._trigger_realtime_workflow("1", "mitra", "story")
+        consumer.steps_mock.assert_not_awaited()  # story keeps PROCESS_CONFIG_STORY
+    asyncio.run(run())
+
+
+def test_feedback_steps_lookup_failure_is_not_read_as_no_steps(monkeypatch):
+    """A persona config without usable process_steps never means 'no steps' (never marked success): the stored row
+    is marked failed (see below, the real-time trigger tests), no workflow starts; a database error propagates."""
+    async def run():
+        consumer, _, status_mock = _trigger_setup(monkeypatch, [])
+        consumer.steps_mock.side_effect = ValueError("missing 'process_steps'")
+        monkeypatch.setattr(consumer_module.feedback_operations, "update_submission_status", AsyncMock())
+        await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")
+        assert "success" not in [c.args[3] for c in status_mock.await_args_list]
+        consumer.temporal_client.start_workflow.assert_not_awaited()
+    asyncio.run(run())
+
+
+# ingestion schema from the persona config + the consumer's config cache -----------------------------
+
+def test_feedback_event_is_validated_against_the_config_schema(monkeypatch):
+    async def run():
+        consumer, *_ = _consumer(monkeypatch)
+        await consumer.process_message(json.dumps(_feedback_event()))
+        validate = consumer_module.validate_ingestion_schema
+        validate.assert_called_once()
+        assert validate.call_args.kwargs["feedback_schema"] == mitra_config_v1("Youth")["ingestion_schema"]
+    asyncio.run(run())
+
+
+def test_story_event_is_validated_without_a_feedback_schema(monkeypatch):
+    async def run():
+        consumer, *_ = _consumer(monkeypatch)
+        await consumer.process_message(json.dumps(_fixture("create", "create_story.json")))
+        assert consumer_module.validate_ingestion_schema.call_args.kwargs["feedback_schema"] is None
+    asyncio.run(run())
+
+
+def test_burst_of_feedback_events_reads_the_config_once(monkeypatch):
+    async def run():
+        consumer, *_ = _consumer(monkeypatch)
+        calls = _patch_active_config(monkeypatch)
+        for n in range(25):
+            await consumer.process_message(json.dumps(_feedback_event(submissionId=str(1000 + n))))
+        assert calls == [(PROGRAM_ID, "mitra", "mitra", "Youth_Voice")]  # one query, keyed by the event's persona
+    asyncio.run(run())
+
+
+def test_cache_is_per_persona_and_source(monkeypatch):
+    async def run():
+        consumer, *_ = _consumer(monkeypatch)
+        calls = _patch_active_config(monkeypatch)
+        await consumer.process_message(json.dumps(_feedback_event()))
+        await consumer.process_message(json.dumps(_fixture("create", "create_feedback_gforms.json")))
+        other = _feedback_event()
+        other["data"]["sessionType"] = "Parent_Voice"
+        await consumer.process_message(json.dumps(other))
+        assert [(c[1], c[3]) for c in calls] == [("mitra", "Youth_Voice"), ("google_forms", "Youth_Voice"),
+                                                  ("mitra", "Parent_Voice")]
+    asyncio.run(run())
+
+
+def _real_validation(monkeypatch):
+    from app.services import ingestion_validation
+    monkeypatch.setattr(consumer_module, "validate_ingestion_schema", ingestion_validation.validate_ingestion_schema)
+
+
+def test_config_schema_decides_what_is_required(monkeypatch):
+    """A persona's config may require more: the same event passes under the seeded schema and is dead-lettered
+    under the stricter one, with the identifiers."""
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        _real_validation(monkeypatch)
+        event = _feedback_event()
+        await consumer.process_message(json.dumps(event))
+        insert_mock.assert_awaited_once()
+        dlq_mock.assert_not_awaited()
+
+        config = mitra_config_v1("Youth")
+        config["ingestion_schema"]["create"]["required"].append("data.botId")
+        _patch_active_config(monkeypatch, loader=AsyncMock(return_value=_active_config("mitra", config)))
+        consumer.feedback_config_cache.invalidate()
+        event["data"]["botId"] = None
+        insert_mock.reset_mock()
+        await consumer.process_message(json.dumps(event))
+        insert_mock.assert_not_awaited()
+        args = dlq_mock.await_args.args
+        assert "'data.botId' is null" in args[1]
+        assert args[2] == {"submissionId": "184884", "tenantCode": "mitra", "sessionId": "s" * 32}
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("config_change, needle", [
+    (lambda c: c.pop("ingestion_schema"), "missing 'ingestion_schema'"),
+    (lambda c: c.update(ingestion_schema={"create": {}}), "'create', 'update' and 'delete'"),
+    (lambda c: c.update(ingestion_schema={**c["ingestion_schema"], "create": {"required": ["submissionId"]}}),
+     "must include"),
+    (lambda c: c.pop("process_steps"), "missing 'process_steps'"),
+    (lambda c: c.update(process_steps=[{"columns": []}]), "non-empty string 'name'"),
+])
+def test_missing_or_invalid_schema_in_config_dead_letters_the_event(monkeypatch, config_change, needle):
+    async def run():
+        consumer, _, insert_mock, _, trigger_mock, dlq_mock = _consumer(monkeypatch)
+        config = mitra_config_v1("Youth")
+        config_change(config)
+        _patch_active_config(monkeypatch, loader=AsyncMock(return_value=_active_config("mitra", config)))
+        raw = json.dumps(_feedback_event())
+        await consumer.process_message(raw)
+        insert_mock.assert_not_awaited()
+        trigger_mock.assert_not_awaited()
+        args = dlq_mock.await_args.args
+        assert args[0] == raw and "Feedback upload config is invalid" in args[1] and needle in args[1]
+        assert args[2] == {"submissionId": "184884", "tenantCode": "mitra", "sessionId": "s" * 32}
+    asyncio.run(run())
+
+
+def test_persona_without_an_active_config_dead_letters_the_event(monkeypatch):
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        _patch_active_config(monkeypatch, loader=AsyncMock(return_value=None))
+        await consumer.process_message(json.dumps(_feedback_event()))
+        insert_mock.assert_not_awaited()
+        reason = dlq_mock.await_args.args[1]
+        assert "No active mitra feedback_upload config" in reason and "Youth_Voice" in reason
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mutate, missing", [
+    (lambda e: e["data"].pop("sessionType"), "data.sessionType"),
+    (lambda e: e["data"].update(source="  "), "data.source"),
+    (lambda e: e["tags"].pop("programId"), "tags.programId"),
+    (lambda e: e["tags"].update(programId=7), "tags.programId"),
+    (lambda e: e.pop("tenantCode"), "tenantCode"),
+])
+def test_event_that_cannot_select_a_persona_is_dead_lettered_without_a_config_query(monkeypatch, mutate, missing):
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        calls = _patch_active_config(monkeypatch)
+        event = _feedback_event()
+        mutate(event)
+        await consumer.process_message(json.dumps(event))
+        insert_mock.assert_not_awaited()
+        assert calls == []
+        assert f"'{missing}' is missing or not a non-empty string" in dlq_mock.await_args.args[1]
+    asyncio.run(run())
+
+
+def test_database_failure_while_loading_the_config_is_retried_not_dead_lettered(monkeypatch):
+    """An infrastructure error propagates (start() retries the message); it is not a verdict on the event."""
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        _patch_active_config(monkeypatch, loader=AsyncMock(side_effect=ConnectionError("db down")))
+        with pytest.raises(ConnectionError):
+            await consumer.process_message(json.dumps(_feedback_event()))
+        insert_mock.assert_not_awaited()
+        dlq_mock.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_feedback_delete_does_not_need_a_config(monkeypatch):
+    """A delete event carries no persona: it is checked against the envelope and never queries the config."""
+    async def run():
+        consumer, _, _, delete_mock, _, dlq_mock = _consumer(monkeypatch)
+        calls = _patch_active_config(monkeypatch)
+        _real_validation(monkeypatch)
+        await consumer.process_message(json.dumps(_fixture("delete", "delete_feedback.json")))
+        delete_mock.assert_awaited_once()
+        dlq_mock.assert_not_awaited()
+        assert calls == []
     asyncio.run(run())
 
 
 # insert_or_update_submission branch selection -------------------------------------------------
 
 def _ops_conn():
+    # A conversation_rows event also reads the persona's bot ids (to rank its bot id) before the writes and again after
+    # them (to relabel what the ranks moved): the bot-id lookups are the first and the last fetch, and the stored
+    # session lookup (none: a new session) is the first fetchrow.
     conn = FakeConn()
     conn.fetchrow = AsyncMock(side_effect=[
+        None,                                                                                # stored session: none
         {"id": "sub-uuid", "status": "pending", "session_id": "s" * 32, "inserted": True},  # submissions
         {"completion_status": "IN_PROGRESS", "inserted": True},                              # feedback_submissions
     ])
     conn.fetch = AsyncMock(side_effect=[
+        [],                                                                      # bot ids of the persona (rank)
         [{"sequence": 1, "inserted": True}, {"sequence": 2, "inserted": True}],  # feedbacks upsert
         [],                                                                      # unresolved parents
         [{"id": "child"}],                                                       # parent_id update
+        [],                                                                      # bot ids of the persona (relabel)
     ])
     return conn
 
@@ -251,7 +475,7 @@ def test_feedback_branch_runs_in_one_transaction_and_writes_feedback_tables():
         assert res["changed"] is True and res["status"] == "pending"
         assert res["messages_inserted"] == 2 and res["parents_set"] == 1
         # submissions row is typed 'feedback'; state/district stay NULL when the tags carry none
-        sub_args = conn.fetchrow.await_args_list[0].args
+        sub_args = next(c.args for c in conn.fetchrow.await_args_list if "INSERT INTO submissions" in c.args[0])
         assert sub_args[4] == "feedback" and sub_args[5] is None and sub_args[6] is None
     asyncio.run(run())
 
@@ -260,11 +484,17 @@ def test_feedback_nothing_written_reports_unchanged():
     async def run():
         conn = FakeConn()
         conn.fetchrow = AsyncMock(side_effect=[
+            {"session_type": "Youth_Voice", "source": "mitra", "questionnaire_version": "V1",
+             "program_id": None, "has_bot": True},  # the stored session (same bot, same rank)
             None,  # submissions upsert matched but changed nothing -> no RETURNING row
             {"id": "sub-uuid", "status": "success", "session_id": "s" * 32, "inserted": False},  # re-read
             None,  # feedback_submissions unchanged
         ])
-        conn.fetch = AsyncMock(side_effect=[[], [], []])
+        conn.fetch = AsyncMock(side_effect=[
+            [{"submission_id": "184884", "bot_id": "101", "questionnaire_version": "V1"}],  # bot ids (rank)
+            [], [], [],
+            [{"submission_id": "184884", "bot_id": "101", "questionnaire_version": "V1"}],  # bot ids (relabel)
+        ])
         res = await insert_or_update_submission(conn, _feedback_event())
         assert res["changed"] is False and res["status"] == "success"
         # no status reset when nothing changed
@@ -277,10 +507,11 @@ def test_feedback_content_change_resets_status_to_pending():
         conn = FakeConn()
         conn.fetchrow = AsyncMock(side_effect=[
             None,
+            None,
             {"id": "sub-uuid", "status": "success", "session_id": "s" * 32, "inserted": False},
             None,
         ])
-        conn.fetch = AsyncMock(side_effect=[[{"sequence": 2, "inserted": True}], [], []])
+        conn.fetch = AsyncMock(side_effect=[[], [{"sequence": 2, "inserted": True}], [], [], []])
         res = await insert_or_update_submission(conn, _feedback_event())
         assert res["changed"] is True and res["status"] == "pending"
         assert any("SET status = 'pending'" in c.args[0] for c in conn.execute.await_args_list)
@@ -306,8 +537,31 @@ def test_feedback_update_event_raises_before_any_write():
     (lambda e: e["data"]["messages"][1].update(parentSequence=2), "lower than its own sequence"),
     (lambda e: e["data"]["messages"][1].update(parentSequence="1"), "parentSequence must be an integer"),
     (lambda e: e["data"].update(completionStatus="DONE"), "completionStatus"),
-    (lambda e: e["data"].update(source="csv"), "data.source"),
+    (lambda e: e["data"].update(source="Bad Source"), "data.source"),
+    (lambda e: e["data"].pop("adapter"), "data.adapter"),
+    (lambda e: e["data"].update(adapter="excel"), "data.adapter"),
+    (lambda e: e["data"]["messages"][1].update(sequence=2147483648), "sequence must be an integer from 1 to 2147483647"),
+    (lambda e: e.update(submissionId="1\nFORGED"), "unsafe submissionId"),
     (lambda e: e.pop("sessionId"), "sessionId"),
+    (lambda e: e["data"].pop("sessionType"), "data.sessionType must be a non-empty string"),
+    (lambda e: e["data"].update(sessionType=None), "data.sessionType must be a non-empty string"),
+    (lambda e: e["data"].update(sessionType=""), "data.sessionType must be a non-empty string"),
+    (lambda e: e["data"].update(sessionType="   "), "data.sessionType must be a non-empty string"),
+    (lambda e: e["data"].update(sessionType=7), "data.sessionType must be a non-empty string"),
+    (lambda e: e["data"].pop("questionnaireVersion"), "data.questionnaireVersion must be a non-empty string"),
+    (lambda e: e["data"].update(questionnaireVersion=None), "data.questionnaireVersion must be a non-empty string"),
+    (lambda e: e["data"].update(questionnaireVersion=""), "data.questionnaireVersion must be a non-empty string"),
+    (lambda e: e["data"].update(questionnaireVersion="  "), "data.questionnaireVersion must be a non-empty string"),
+    (lambda e: e["data"].update(questionnaireVersion=2), "data.questionnaireVersion must be a non-empty string"),
+    # NEW: a conversation_rows session needs a bot id that is a positive integer written in digits
+    (lambda e: e["data"].pop("botId"), "data.botId is invalid for adapter conversation_rows .bot id is missing"),
+    (lambda e: e["data"].update(botId=None), "data.botId is invalid for adapter conversation_rows .bot id is missing"),
+    (lambda e: e["data"].update(botId="  "), "data.botId is invalid for adapter conversation_rows .bot id is blank"),
+    (lambda e: e["data"].update(botId="abc"), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId="0"), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId="089"), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId=" 101 "), "positive integer written in digits"),
+    (lambda e: e["data"].update(botId=101), "bot id must be a string"),
 ])
 def test_feedback_branch_rejects_malformed_events_before_writing(mutate, needle):
     async def run():
@@ -318,6 +572,113 @@ def test_feedback_branch_rejects_malformed_events_before_writing(mutate, needle)
             await insert_or_update_submission(conn, event)
         conn.execute.assert_not_awaited()
         conn.fetchrow.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_session_type_error_names_the_submission():
+    async def run():
+        conn = FakeConn()
+        event = _feedback_event()
+        event["data"]["sessionType"] = " "
+        with pytest.raises(ValueError, match=r"rejecting submission 184884 \(tenant mitra, session s+\)"):
+            await insert_or_update_submission(conn, event)
+    asyncio.run(run())
+
+
+def _fs_args(conn):
+    """The (sql, *params) of the INSERT INTO feedback_submissions call."""
+    for call in conn.fetchrow.await_args_list:
+        if "INSERT INTO feedback_submissions" in call.args[0]:
+            return call.args
+    raise AssertionError("no feedback_submissions insert")
+
+
+def test_feedback_write_passes_session_type_version_and_bot_meta():
+    async def run():
+        conn = _ops_conn()
+        await insert_or_update_submission(conn, _feedback_event())
+        args = _fs_args(conn)
+        sql = args[0]
+        assert "session_type" in sql and "questionnaire_version" in sql and "meta_data" in sql
+        # $8 = session_type, $9 = questionnaire_version, $10 = meta_data json
+        # CHANGED: the event says V2 (from the date windows) but the stored label of a bot session is the rank of its
+        # bot id among the bot ids of the persona: the only bot, so V1
+        assert args[8] == "Youth_Voice" and args[9] == "V1"
+        assert json.loads(args[10]) == {"bot_id": "101", "bot_name": "Mitra Youth Test Bot"}
+    asyncio.run(run())
+
+
+def test_feedback_write_trims_session_type_and_ranks_the_version():
+    async def run():
+        conn = _ops_conn()
+        event = _feedback_event()
+        event["data"].update(sessionType="  Parent_Voice ", questionnaireVersion=" V7 ")
+        await insert_or_update_submission(conn, event)
+        args = _fs_args(conn)
+        assert args[8] == "Parent_Voice" and args[9] == "V1"      # CHANGED: the event's version is not what is stored
+    asyncio.run(run())
+
+
+def test_feedback_write_ranks_the_incoming_bot_among_the_stored_ones(monkeypatch):
+    # CHANGED: a relabelled session is only reprocessed when the persona's active extraction config asks different
+    # fields for the old and the new label; the config lookup is faked here as "no config" (safe side: reprocess),
+    # the decision itself is tested in tests/test_feedback_relabel.py and tests/test_feedback_relabel_pg.py.
+    from app.database import feedback_bot_versions
+    monkeypatch.setattr(feedback_bot_versions, "_persona_extraction_config", AsyncMock(return_value=None))
+
+    async def run():
+        conn = _ops_conn()
+        conn.fetch = AsyncMock(side_effect=[
+            [{"submission_id": "other", "bot_id": "103", "questionnaire_version": "V1"}],   # bot ids (rank)
+            [{"sequence": 1, "inserted": True}, {"sequence": 2, "inserted": True}], [], [{"id": "child"}],
+            [{"submission_id": "other", "bot_id": "103", "questionnaire_version": "V1"},
+             {"submission_id": "184884", "bot_id": "101", "questionnaire_version": "V1"}],   # bot ids (relabel)
+            [], [],                                                                         # the two row-lock reads
+        ])
+        await insert_or_update_submission(conn, _feedback_event())
+        assert _fs_args(conn)[9] == "V1"           # 101 < 103
+        # 103 shifts to V2: its session is relabelled and sent back through processing
+        assert any("DELETE FROM feedback_extracted_data" in c.args[0] for c in conn.execute.await_args_list)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("bot_name, expected", [
+    (None, {"bot_id": "101"}),
+    ("  ", {"bot_id": "101"}),
+    ("", {"bot_id": "101"}),
+    (" Some Bot ", {"bot_id": "101", "bot_name": "Some Bot"}),
+])
+def test_feedback_write_bot_meta_keeps_only_non_blank_values(bot_name, expected):
+    # CHANGED: botId is required (was optional), so only botName can be blank now
+    async def run():
+        conn = _ops_conn()
+        event = _feedback_event()
+        event["data"].update(botName=bot_name)
+        await insert_or_update_submission(conn, event)
+        meta = _fs_args(conn)[10]
+        assert json.loads(meta) == expected
+    asyncio.run(run())
+
+
+def test_feedback_write_without_bot_name_has_only_the_bot_id_in_meta():
+    async def run():
+        conn = _ops_conn()
+        event = _feedback_event()
+        del event["data"]["botName"]
+        await insert_or_update_submission(conn, event)
+        assert json.loads(_fs_args(conn)[10]) == {"bot_id": "101"}
+    asyncio.run(run())
+
+
+def test_feedback_conflict_update_refreshes_session_type_and_version():
+    async def run():
+        conn = _ops_conn()
+        await insert_or_update_submission(conn, _feedback_event())
+        sql = _fs_args(conn)[0]
+        assert "session_type = EXCLUDED.session_type" in sql
+        assert "questionnaire_version = EXCLUDED.questionnaire_version" in sql
+        assert "feedback_submissions.session_type IS DISTINCT FROM EXCLUDED.session_type" in sql
+        assert "feedback_submissions.questionnaire_version IS DISTINCT FROM EXCLUDED.questionnaire_version" in sql
     asyncio.run(run())
 
 
@@ -353,7 +714,9 @@ STORED_ID = "0e9c8a77-1d2b-4c3d-8e4f-5a6b7c8d9e0f"
 def _gforms_event(**data_overrides):
     event = _feedback_event(submissionId=GF_ID, sessionId=GF_ID)
     event["tags"]["source"] = "google_forms"
-    event["data"].update(source="google_forms", language="en", completionStatus="COMPLETED", sourceRef=GF_REF)
+    event["data"].update(source="google_forms", adapter="wide_form", language="en", completionStatus="COMPLETED",
+                         sourceRef=GF_REF, questionnaireVersion="V1")
+    event["data"].pop("botId"), event["data"].pop("botName")  # Google Forms carries no Mitra bot
     event["data"].update(data_overrides)
     return event
 
@@ -390,9 +753,36 @@ def test_gforms_new_response_is_looked_up_then_stored_with_source_ref():
         assert conn.fetchrow.await_args_list[0].args[1:] == ("mitra", GF_REF)
         fs_args = conn.fetchrow.await_args_list[2].args
         assert "INSERT INTO feedback_submissions" in fs_args[0] and "source_ref" in fs_args[0]
-        assert fs_args[3] == "google_forms" and fs_args[-1] == GF_REF
+        assert fs_args[3] == "google_forms" and fs_args[7] == GF_REF
         assert res["changed"] is True and res["submission_id"] == GF_ID and res["messages_inserted"] == 2
         conn.transaction.assert_called_once()
+    asyncio.run(run())
+
+
+def test_gforms_event_stores_its_session_type_and_form_version():
+    async def run():
+        conn = _gforms_new_conn()
+        await insert_or_update_submission(conn, _gforms_event(sessionType="Parent_Voice", questionnaireVersion="V1"))
+        args = _fs_args(conn)
+        assert args[8] == "Parent_Voice" and args[9] == "V1"
+        assert args[10] is None  # no bot for Google Forms
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mutate, needle", [
+    (lambda e: e["data"].pop("sessionType"), "data.sessionType must be a non-empty string"),
+    (lambda e: e["data"].update(questionnaireVersion=""), "data.questionnaireVersion must be a non-empty string"),
+])
+def test_gforms_event_without_session_type_or_version_is_rejected_before_any_query(mutate, needle):
+    async def run():
+        conn = FakeConn()
+        event = _gforms_event()
+        mutate(event)
+        with pytest.raises(ValueError, match=needle):
+            await insert_or_update_submission(conn, event)
+        conn.fetchrow.assert_not_awaited()
+        conn.fetchval.assert_not_awaited()
+        conn.transaction.assert_not_called()
     asyncio.run(run())
 
 
@@ -400,9 +790,10 @@ def test_mitra_event_writes_null_source_ref():
     async def run():
         conn = _ops_conn()
         await insert_or_update_submission(conn, _feedback_event())
-        fs_args = conn.fetchrow.await_args_list[1].args
-        assert "INSERT INTO feedback_submissions" in fs_args[0] and fs_args[-1] is None
-        conn.fetchval.assert_not_awaited()  # no google_forms lookup for mitra
+        fs_args = _fs_args(conn)
+        assert fs_args[7] is None
+        # no google_forms lookup for mitra (the only fetchval calls are the persona pre-read of the write)
+        assert not any("source_ref" in c.args[0] for c in conn.fetchval.await_args_list)
     asyncio.run(run())
 
 
@@ -558,4 +949,79 @@ def test_consumer_already_stored_but_pending_gforms_response_is_processed_under_
             insert_result={"id": "u", "submission_id": STORED_ID, "status": "pending", "changed": False})
         await consumer.process_message(json.dumps(_gforms_event()))
         trigger_mock.assert_awaited_once_with(STORED_ID, "mitra", "feedback")  # not the event's fresh uuid
+    asyncio.run(run())
+
+
+# a bad persona config does not stall the real-time trigger; the DLQ reason; the programId check ------
+
+# real-time trigger: a bad config marks the row failed, a database error propagates -------------------
+
+def test_realtime_trigger_marks_the_stored_row_failed_when_the_config_is_bad(monkeypatch, caplog):
+    async def run():
+        consumer, conn, status_mock = _trigger_setup(monkeypatch, [])
+        consumer.steps_mock.side_effect = ValueError("missing 'process_steps'")
+        failed = AsyncMock(return_value=True)
+        monkeypatch.setattr(consumer_module, "mark_pending_submission_config_failed", failed)
+        with caplog.at_level(logging.ERROR):
+            await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")  # does not raise: no retry / DLQ
+        failed.assert_awaited_once()
+        # the shared helper that only writes while the row is still pending
+        assert failed.await_args.args[1:3] == ("184884", "mitra")
+        assert "missing 'process_steps'" in failed.await_args.args[3]
+        assert "184884" in caplog.text and "mitra" in caplog.text
+        status_mock.assert_not_awaited()
+        consumer.temporal_client.start_workflow.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_realtime_trigger_lets_a_database_error_propagate_for_the_retry(monkeypatch):
+    async def run():
+        consumer, _, _ = _trigger_setup(monkeypatch, [])
+        consumer.steps_mock.side_effect = ConnectionError("db down")
+        with pytest.raises(ConnectionError):
+            await consumer._trigger_realtime_workflow("184884", "mitra", "feedback")
+    asyncio.run(run())
+
+
+# DLQ reason: operator error, replayable after the migrate -----------------------------------------------
+
+@pytest.mark.parametrize("loader", [
+    AsyncMock(return_value=None),
+    AsyncMock(side_effect=ValueError("Feedback config of session_type 'Youth_Voice' (mitra) is missing 'ingestion_schema'")),
+])
+def test_dlq_reason_for_a_missing_or_invalid_config_says_it_can_be_replayed_after_migrate(monkeypatch, loader):
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        _patch_active_config(monkeypatch, loader=loader)
+        await consumer.process_message(json.dumps(_feedback_event()))
+        insert_mock.assert_not_awaited()
+        args = dlq_mock.await_args.args
+        assert "python tools/feedback_config.py migrate" in args[1] and "replay" in args[1]
+        assert args[2] == {"submissionId": "184884", "tenantCode": "mitra", "sessionId": "s" * 32}
+    asyncio.run(run())
+
+
+def test_a_genuinely_bad_event_does_not_get_the_operator_hint(monkeypatch):
+    async def run():
+        consumer, _, _, _, _, dlq_mock = _consumer(monkeypatch)
+        consumer_module.validate_ingestion_schema.return_value = ["'data.language' is missing"]
+        await consumer.process_message(json.dumps(_feedback_event()))
+        assert "feedback_config.py migrate" not in dlq_mock.await_args.args[1]
+    asyncio.run(run())
+
+
+# tags.programId must be a UUID ---------------------------------------------------------------------------
+
+def test_non_uuid_program_id_goes_straight_to_the_dlq_with_identifiers_and_no_config_query(monkeypatch):
+    async def run():
+        consumer, _, insert_mock, _, _, dlq_mock = _consumer(monkeypatch)
+        calls = _patch_active_config(monkeypatch)
+        event = _feedback_event()
+        event["tags"]["programId"] = "not-a-uuid"
+        await consumer.process_message(json.dumps(event))
+        assert calls == []  # the lookup (a uuid column: asyncpg.DataError) is never attempted
+        insert_mock.assert_not_awaited()
+        args = dlq_mock.await_args.args
+        assert "'tags.programId' must be a UUID" in args[1]
+        assert args[2] == {"submissionId": "184884", "tenantCode": "mitra", "sessionId": "s" * 32}
     asyncio.run(run())

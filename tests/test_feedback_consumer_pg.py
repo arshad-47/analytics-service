@@ -1,17 +1,19 @@
 """
 Real-Postgres tests for the feedback branch of insert_or_update_submission / delete_submission.
 
-Skipped unless FEEDBACK_TEST_DATABASE_URL is set to a DSN of a database that already has schema.sql
-applied (e.g. postgresql://postgres@localhost:54329/fb_d_x). The tests seed tenant 'mitra' plus a leader
-category / program themselves and use random submission ids, and clean up the rows they create.
-Synthetic data only.
+Skipped unless FEEDBACK_TEST_DATABASE_URL names a Postgres server (tests/pg_support.py creates a scratch database
+for this file and drops it afterwards). The file applies schema.sql itself
+(the way app/database/db.py does it, idempotent), seeds tenant 'mitra' plus a leader category / program, uses
+random submission ids and cleans up the rows it creates. Synthetic data only.
 """
 import asyncio
-import os
+import json
 import uuid
 
 import asyncpg
 import pytest
+from seed_support import FEEDBACK_PROGRAM_NAME
+import pg_support
 
 from app.database import operations
 from app.database.operations import (
@@ -20,19 +22,30 @@ from app.database.operations import (
     insert_or_update_submission,
 )
 
-DSN = os.environ.get("FEEDBACK_TEST_DATABASE_URL")
+DSN = pg_support.SERVER_URL
 pytestmark = pytest.mark.skipif(DSN is None, reason="FEEDBACK_TEST_DATABASE_URL not set")
 
 LEADER_ID = "0a0a0a0a-0000-4000-8000-00000000d001"
 PROGRAM_ID = "0a0a0a0a-0000-4000-8000-00000000d002"
 
 
+_SCHEMA_APPLIED = False
+
+
+async def _ensure_schema(conn):
+    global _SCHEMA_APPLIED
+    if not _SCHEMA_APPLIED:
+        await conn.execute(pg_support.schema_sql())
+        _SCHEMA_APPLIED = True
+
+
 def _run(body):
-    """Runs `body(conn)` on a fresh connection with tenant/leader/program seeded; cleans up afterwards."""
+    """Runs `body(conn, created)` on a fresh connection with tenant/leader/program seeded; cleans up afterwards."""
     async def main():
         conn = await asyncpg.connect(DSN)
         created = []
         try:
+            await _ensure_schema(conn)
             await conn.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn.execute(
                 "INSERT INTO leader_category (id, name, tenant_code) VALUES ($1, 'Youth', 'mitra') ON CONFLICT (id) DO NOTHING",
@@ -67,9 +80,9 @@ SIX = [
 ]
 
 
-def _event(submission_id, session_id, messages, completion="COMPLETED", **tags):
+def _event(submission_id, session_id, messages, completion="COMPLETED", data=None, **tags):
     base_tags = {
-        "programId": PROGRAM_ID, "programName": "1M Voice",
+        "programId": PROGRAM_ID, "programName": FEEDBACK_PROGRAM_NAME,
         "leaderCategoryId": LEADER_ID, "leaderCategoryName": "Youth",
         "state": "Karnataka", "district": None, "source": "mitra",
     }
@@ -78,8 +91,10 @@ def _event(submission_id, session_id, messages, completion="COMPLETED", **tags):
         "submissionId": submission_id, "submissionType": "feedback", "sessionId": session_id,
         "tenantCode": "mitra", "eventType": "create", "eventPublishedAt": "2026-10-15T09:00:00.000Z",
         "tags": base_tags,
-        "data": {"source": "mitra", "language": "en", "completionStatus": completion,
-                 "submissionDate": "2026-10-15T08:01:00.000Z", "messages": messages},
+        "data": {"source": "mitra", "adapter": "conversation_rows", "sessionType": "Youth_Voice",
+                 "questionnaireVersion": "V2", "botId": "101", "botName": "Mitra Youth Test Bot",
+                 "language": "en", "completionStatus": completion,
+                 "submissionDate": "2026-10-15T08:01:00.000Z", "messages": messages, **(data or {})},
     }
 
 
@@ -93,7 +108,8 @@ async def _snapshot(conn, sid):
         "SELECT id, status, state, district, submission_type, program_id, leader_id, session_id, updated_at "
         "FROM submissions WHERE submission_id = $1 AND tenant_code = 'mitra'", sid)
     fs = await conn.fetchrow(
-        "SELECT id, source, language, completion_status, source_ref, updated_at FROM feedback_submissions "
+        "SELECT id, source, session_type, questionnaire_version, meta_data::text AS meta_data, language, "
+        "completion_status, source_ref, updated_at FROM feedback_submissions "
         "WHERE submission_id = $1 AND tenant_code = 'mitra'", sid)
     fbs = await conn.fetch(
         "SELECT id, sequence, parent_id, message, updated_at, created_at FROM feedbacks "
@@ -113,6 +129,9 @@ def test_create_session_resolves_parents():
         assert str(sub["program_id"]) == PROGRAM_ID and str(sub["leader_id"]) == LEADER_ID
         assert sub["session_id"] == sess and sub["status"] == "pending"
         assert fs["source"] == "mitra" and fs["completion_status"] == "COMPLETED" and fs["source_ref"] is None
+        # CHANGED: the event says V2, the stored label of a bot session is the rank of its bot id (the only bot: V1)
+        assert fs["session_type"] == "Youth_Voice" and fs["questionnaire_version"] == "V1"
+        assert json.loads(fs["meta_data"]) == {"bot_id": "101", "bot_name": "Mitra Youth Test Bot"}
         by_seq = {r["sequence"]: r for r in fbs}
         assert sorted(by_seq) == [1, 2, 3, 4, 5, 6]
         assert by_seq[1]["parent_id"] is None and by_seq[3]["parent_id"] is None and by_seq[6]["parent_id"] is None
@@ -277,7 +296,8 @@ def _gf_ref():
 def _gf_event(source_ref, submission_id=None, messages=None):
     sid = submission_id or str(uuid.uuid4())
     event = _event(sid, sid, messages or GF_MESSAGES, source="google_forms")
-    event["data"].update(source="google_forms", sourceRef=source_ref)
+    event["data"].update(source="google_forms", adapter="wide_form", sourceRef=source_ref, questionnaireVersion="V1")
+    del event["data"]["botId"], event["data"]["botName"]  # Google Forms has no Mitra bot
     return event
 
 
@@ -299,6 +319,8 @@ def test_gforms_new_response_stored_with_source_ref():
         assert sub["session_id"] == sid and sub["submission_type"] == "feedback"
         assert fs["source"] == "google_forms" and fs["source_ref"] == ref
         assert fs["completion_status"] == "COMPLETED" and fs["language"] == "en"
+        assert fs["session_type"] == "Youth_Voice" and fs["questionnaire_version"] == "V1"
+        assert fs["meta_data"] is None  # no Mitra bot on a Google Forms response
         by_seq = {r["sequence"]: r for r in fbs}
         assert sorted(by_seq) == [1, 2, 3, 4, 5, 6]
         assert [by_seq[s]["parent_id"] for s in (1, 3, 5)] == [None, None, None]
@@ -375,8 +397,9 @@ def test_gforms_response_already_stored_by_another_connection_is_a_clean_noop():
                 "INSERT INTO submissions (session_id, submission_id, tenant_code, submission_type, status) "
                 "VALUES ($1, $1, 'mitra', 'feedback', 'success')", stored_id)
             await other.execute(
-                "INSERT INTO feedback_submissions (submission_id, tenant_code, source, completion_status, source_ref) "
-                "VALUES ($1, 'mitra', 'google_forms', 'COMPLETED', $2)", stored_id, ref)
+                "INSERT INTO feedback_submissions (submission_id, tenant_code, source, session_type, "
+                "questionnaire_version, completion_status, source_ref) "
+                "VALUES ($1, 'mitra', 'google_forms', 'Youth_Voice', 'V1', 'COMPLETED', $2)", stored_id, ref)
         finally:
             await other.close()
         event = _gf_event(ref)
@@ -398,8 +421,9 @@ def test_gforms_race_after_precheck_hits_unique_violation_and_is_a_clean_noop(mo
             "INSERT INTO submissions (session_id, submission_id, tenant_code, submission_type, status) "
             "VALUES ($1, $1, 'mitra', 'feedback', 'success')", stored_id)
         await conn.execute(
-            "INSERT INTO feedback_submissions (submission_id, tenant_code, source, completion_status, source_ref) "
-            "VALUES ($1, 'mitra', 'google_forms', 'COMPLETED', $2)", stored_id, ref)
+            "INSERT INTO feedback_submissions (submission_id, tenant_code, source, session_type, "
+            "questionnaire_version, completion_status, source_ref) "
+            "VALUES ($1, 'mitra', 'google_forms', 'Youth_Voice', 'V1', 'COMPLETED', $2)", stored_id, ref)
         real_lookup = operations._find_stored_gforms_response
         calls = []
 
@@ -428,6 +452,7 @@ def test_gforms_true_concurrent_writers_store_the_response_once():
         conn1 = await asyncpg.connect(DSN)
         conn2 = await asyncpg.connect(DSN)
         try:
+            await _ensure_schema(conn1)
             await conn1.execute("INSERT INTO tenant (name, code) VALUES ('Mitra', 'mitra') ON CONFLICT (code) DO NOTHING")
             await conn1.execute(
                 "INSERT INTO leader_category (id, name, tenant_code) VALUES ($1, 'Youth', 'mitra') ON CONFLICT (id) DO NOTHING",
@@ -441,8 +466,9 @@ def test_gforms_true_concurrent_writers_store_the_response_once():
                 "INSERT INTO submissions (session_id, submission_id, tenant_code, submission_type, status) "
                 "VALUES ($1, $1, 'mitra', 'feedback', 'success')", writer1_id)
             await conn1.execute(
-                "INSERT INTO feedback_submissions (submission_id, tenant_code, source, completion_status, source_ref) "
-                "VALUES ($1, 'mitra', 'google_forms', 'COMPLETED', $2)", writer1_id, ref)
+                "INSERT INTO feedback_submissions (submission_id, tenant_code, source, session_type, "
+                "questionnaire_version, completion_status, source_ref) "
+                "VALUES ($1, 'mitra', 'google_forms', 'Youth_Voice', 'V1', 'COMPLETED', $2)", writer1_id, ref)
             task = asyncio.ensure_future(insert_or_update_submission(conn2, event2))
             await asyncio.sleep(1.0)
             assert not task.done()  # blocked on the uncommitted unique key
@@ -515,4 +541,187 @@ def test_mitra_events_still_store_null_source_ref():
         await insert_or_update_submission(conn, _event(sid2, sess2, SIX))  # two mitra rows: NULLs never collide
         for s in (sid, sid2):
             assert (await _snapshot(conn, s))[1]["source_ref"] is None
+    _run(body)
+
+
+# ------------------------------------------------ session type / questionnaire version / bot meta
+
+async def _fs(conn, sid):
+    row = await conn.fetchrow(
+        "SELECT session_type, questionnaire_version, meta_data::text AS meta, completion_status, updated_at "
+        "FROM feedback_submissions WHERE submission_id = $1 AND tenant_code = 'mitra'", sid)
+    return dict(row) if row else None
+
+
+def test_create_writes_session_type_version_and_bot_meta():
+    async def body(conn, created):
+        sid, sess = _ids()
+        created.append(sid)
+        await insert_or_update_submission(
+            conn, _event(sid, sess, SIX, data={"sessionType": "Parent_Voice", "questionnaireVersion": "V1"}))
+        fs = await _fs(conn, sid)
+        assert fs["session_type"] == "Parent_Voice" and fs["questionnaire_version"] == "V1"
+        assert json.loads(fs["meta"]) == {"bot_id": "101", "bot_name": "Mitra Youth Test Bot"}
+    _run(body)
+
+
+def test_create_with_a_blank_bot_name_omits_it_and_a_missing_bot_id_is_rejected():
+    # CHANGED: botId is required for conversation_rows (it was optional); only botName can be blank now
+    async def body(conn, created):
+        sid, sess = _ids()
+        sid2, sess2 = _ids()
+        sid3, sess3 = _ids()
+        created.extend([sid, sid2, sid3])
+        await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"botId": "205", "botName": "  "}))
+        for bad in ({"botId": None, "botName": ""}, {"botId": ""}):
+            with pytest.raises(ValueError, match="data.botId is invalid"):
+                await insert_or_update_submission(conn, _event(sid2, sess2, SIX, data=bad))
+        event3 = _event(sid3, sess3, SIX)
+        del event3["data"]["botId"], event3["data"]["botName"]
+        with pytest.raises(ValueError, match="data.botId is invalid"):
+            await insert_or_update_submission(conn, event3)
+        assert json.loads((await _fs(conn, sid))["meta"]) == {"bot_id": "205"}
+        assert await _fs(conn, sid2) is None and await _fs(conn, sid3) is None      # nothing written
+    _run(body)
+
+
+def test_redelivery_with_another_event_version_keeps_the_rank_label_and_changes_nothing():
+    # CHANGED (was: "..._changed_version_refreshes_it_and_resends_to_processing"): the version of the event no longer
+    # decides what is stored for a bot session, so a redelivery that only changes it is an identical event
+    async def body(conn, created):
+        sid, sess = _ids()
+        created.append(sid)
+        await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"questionnaireVersion": "V1"}))
+        await conn.execute("UPDATE submissions SET status = 'success' WHERE submission_id = $1", sid)
+        before = await _snapshot(conn, sid)
+        res = await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"questionnaireVersion": "V2"}))
+        assert res["changed"] is False and res["messages_inserted"] == 0
+        assert (await _fs(conn, sid))["questionnaire_version"] == "V1"
+        assert await _snapshot(conn, sid) == before
+    _run(body)
+
+
+def test_redelivery_with_changed_session_type_refreshes_it():
+    async def body(conn, created):
+        sid, sess = _ids()
+        created.append(sid)
+        await insert_or_update_submission(conn, _event(sid, sess, SIX))
+        res = await insert_or_update_submission(
+            conn, _event(sid, sess, SIX, data={"sessionType": "General_Public_Voice"}))
+        assert res["changed"] is True
+        assert (await _fs(conn, sid))["session_type"] == "General_Public_Voice"
+    _run(body)
+
+
+def test_redelivery_with_new_bot_merges_meta_data():
+    async def body(conn, created):
+        sid, sess = _ids()
+        created.append(sid)
+        await insert_or_update_submission(conn, _event(sid, sess, SIX, data={"botId": "101", "botName": None}))
+        assert json.loads((await _fs(conn, sid))["meta"]) == {"bot_id": "101"}
+        # a second delivery adds the bot name and replaces the id; keys it does not carry are kept
+        res = await insert_or_update_submission(
+            conn, _event(sid, sess, SIX, data={"botId": "110", "botName": "Educator Test Bot"}))
+        assert res["changed"] is True
+        assert json.loads((await _fs(conn, sid))["meta"]) == {"bot_id": "110", "bot_name": "Educator Test Bot"}
+        # a later delivery with a blank name (and the same bot) leaves the stored meta_data alone and changes nothing
+        await conn.execute("UPDATE submissions SET status = 'success' WHERE submission_id = $1", sid)
+        before = await _snapshot(conn, sid)
+        later = _event(sid, sess, SIX, data={"botId": "110", "botName": ""})
+        res = await insert_or_update_submission(conn, later)
+        assert res["changed"] is False
+        assert await _snapshot(conn, sid) == before
+        assert json.loads((await _fs(conn, sid))["meta"]) == {"bot_id": "110", "bot_name": "Educator Test Bot"}
+    _run(body)
+
+
+def test_identical_redelivery_leaves_session_type_version_and_meta_untouched():
+    async def body(conn, created):
+        sid, sess = _ids()
+        created.append(sid)
+        await insert_or_update_submission(conn, _event(sid, sess, SIX))
+        await conn.execute("UPDATE submissions SET status = 'success' WHERE submission_id = $1", sid)
+        before = await _snapshot(conn, sid)
+        fs_before = await _fs(conn, sid)
+        res = await insert_or_update_submission(conn, _event(sid, sess, SIX))
+        assert res["changed"] is False and res["status"] == "success"
+        assert await _snapshot(conn, sid) == before
+        assert await _fs(conn, sid) == fs_before  # including updated_at
+    _run(body)
+
+
+def test_gforms_event_stores_session_type_and_form_version():
+    async def body(conn, created):
+        event = _gf_event(_gf_ref())
+        event["data"].update(sessionType="Parent_Voice", questionnaireVersion="V1")
+        created.append(event["submissionId"])
+        await insert_or_update_submission(conn, event)
+        fs = await _fs(conn, event["submissionId"])
+        assert fs["session_type"] == "Parent_Voice" and fs["questionnaire_version"] == "V1"
+        assert fs["meta"] is None
+    _run(body)
+
+
+def test_gforms_redelivery_never_changes_stored_session_type_or_version():
+    async def body(conn, created):
+        ref = _gf_ref()
+        event = _gf_event(ref)
+        created.append(event["submissionId"])
+        await insert_or_update_submission(conn, event)
+        again = _gf_event(ref)
+        again["data"].update(sessionType="Parent_Voice", questionnaireVersion="V9")
+        res = await insert_or_update_submission(conn, again)
+        assert res["changed"] is False
+        fs = await _fs(conn, event["submissionId"])
+        assert fs["session_type"] == "Youth_Voice" and fs["questionnaire_version"] == "V1"
+    _run(body)
+
+
+def test_event_without_session_type_or_version_is_rejected_and_writes_nothing():
+    async def body(conn, created):
+        for field in ("sessionType", "questionnaireVersion"):
+            for bad in (None, "", "  "):
+                sid, sess = _ids()
+                created.append(sid)
+                with pytest.raises(ValueError, match=f"data.{field} must be a non-empty string"):
+                    await insert_or_update_submission(conn, _event(sid, sess, SIX, data={field: bad}))
+                assert await _snapshot(conn, sid) == (None, None, [])
+        sid, sess = _ids()
+        created.append(sid)
+        event = _event(sid, sess, SIX)
+        del event["data"]["sessionType"]
+        with pytest.raises(ValueError, match="data.sessionType"):
+            await insert_or_update_submission(conn, event)
+        assert await _snapshot(conn, sid) == (None, None, [])
+    _run(body)
+
+
+def test_null_session_type_or_version_cannot_be_inserted_directly():
+    async def body(conn, created):
+        for column_list, values in (
+            ("session_type, questionnaire_version", "NULL, 'V1'"),
+            ("session_type, questionnaire_version", "'Youth_Voice', NULL"),
+            ("questionnaire_version", "'V1'"),   # session_type omitted
+            ("session_type", "'Youth_Voice'"),   # questionnaire_version omitted
+        ):
+            sid, sess = _ids()
+            created.append(sid)
+            await conn.execute(
+                "INSERT INTO submissions (session_id, submission_id, tenant_code, submission_type) "
+                "VALUES ($1, $2, 'mitra', 'feedback')", sess, sid)
+            with pytest.raises(asyncpg.exceptions.NotNullViolationError):
+                await conn.execute(
+                    f"INSERT INTO feedback_submissions (submission_id, tenant_code, source, completion_status, "
+                    f"{column_list}) VALUES ($1, 'mitra', 'mitra', 'COMPLETED', {values})", sid)
+        # a complete row is accepted
+        sid, sess = _ids()
+        created.append(sid)
+        await conn.execute(
+            "INSERT INTO submissions (session_id, submission_id, tenant_code, submission_type) "
+            "VALUES ($1, $2, 'mitra', 'feedback')", sess, sid)
+        await conn.execute(
+            "INSERT INTO feedback_submissions (submission_id, tenant_code, source, session_type, "
+            "questionnaire_version, completion_status) VALUES ($1, 'mitra', 'mitra', 'Youth_Voice', 'V1', 'COMPLETED')",
+            sid)
+        assert (await _fs(conn, sid))["session_type"] == "Youth_Voice"
     _run(body)

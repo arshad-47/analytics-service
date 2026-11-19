@@ -32,8 +32,10 @@ def openrouter_chat_completion(
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY environment variable is not set")
 
-    # Log the raw prompt to the terminal console under DEBUG level to avoid cluttering standard logs
-    logger.debug(f"\n=================== [LLM CALL] RAW PROMPT SENT TO MODEL '{model}' ===================\n{prompt}\n=================================================================================")
+    # Never the prompt by default: it can hold respondents' words. Model and size only; the full text is an opt-in.
+    logger.debug("OpenRouter call: model=%s prompt_chars=%d max_tokens=%s", model, len(prompt), max_tokens)
+    if settings.LLM_LOG_PAYLOADS:
+        logger.debug("[LLM CALL] RAW PROMPT SENT TO MODEL '%s' (LLM_LOG_PAYLOADS is on):\n%s", model, prompt)
 
     request_body = {
         "model": model,
@@ -65,19 +67,24 @@ def openrouter_chat_completion(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             response_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        logger.error(f"OpenRouter HTTP Error {e.code}: {error_body}")
-        raise RuntimeError(f"OpenRouter request failed with HTTP {e.code}: {error_body}") from e
+        # Status, model and size only: the provider's error body can echo the prompt (moderation errors quote the
+        # flagged input), so it is neither logged nor put in the exception unless LLM_LOG_PAYLOADS is on.
+        logger.error("OpenRouter HTTP error: status=%s model=%s prompt_chars=%d", e.code, model, len(prompt))
+        if settings.LLM_LOG_PAYLOADS:
+            logger.error("OpenRouter error body (LLM_LOG_PAYLOADS is on): %s", e.read().decode("utf-8", errors="replace"))
+        raise RuntimeError(f"OpenRouter request failed with HTTP {e.code}") from None
     except Exception as e:
-        logger.error(f"OpenRouter Connection Error: {e}")
-        raise RuntimeError(f"Failed to connect to OpenRouter: {e}") from e
+        logger.error("OpenRouter connection error: %s model=%s", type(e).__name__, model)
+        raise RuntimeError(f"Failed to connect to OpenRouter: {type(e).__name__}") from None
 
     try:
         choice = response_data["choices"][0]
         message = choice["message"]
         content = message.get("content")
     except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Unexpected OpenRouter response shape: {response_data}") from e
+        # The answer can hold the respondents' words: report its shape, not its content.
+        shape = sorted(response_data) if isinstance(response_data, dict) else type(response_data).__name__
+        raise RuntimeError(f"Unexpected OpenRouter response shape (top-level keys: {shape})") from None
 
     if isinstance(content, list):
         content = "\n".join(str(part.get("text", part)) for part in content)

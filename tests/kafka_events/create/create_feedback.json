@@ -16,6 +16,11 @@
   },
   "data": {
     "source": "mitra",
+    "adapter": "conversation_rows",
+    "sessionType": "Youth_Voice",
+    "questionnaireVersion": "V2",
+    "botId": "101",
+    "botName": "Mitra Youth Test Bot",
     "language": "hi",
     "completionStatus": "COMPLETED",
     "submissionDate": "2026-10-15T08:54:43.000Z",

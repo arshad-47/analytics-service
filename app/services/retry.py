@@ -4,20 +4,23 @@ Shared retry orchestration service used by both:
   - app/temporal/activities.py (trigger_bulk_retry_activity → Temporal cron schedule)
 """
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from app.config import settings
 from app.database.db import db
+from app.database.feedback_operations import get_process_steps
 from app.database.operations import (
     claim_submission_for_retry,
     fetch_retryable_submissions,
+    is_feedback_type,
     reconcile_completed_submission,
     rollback_submission_claim,
 )
@@ -34,9 +37,11 @@ logger = logging.getLogger("analytics_service.services.retry")
 class RetryOutcome:
     """Result of attempting to retry or reconcile a single submission."""
 
-    status: str  # "started" | "reconciled" | "already_running" | "already_started" | "no_steps"
+    # "started" | "reconciled" | "already_running" | "already_started" | "claim_rejected" | "no_steps" | "config_error"
+    status: str
     workflow_id: str
     active_wf: Optional[str] = None
+    error: Optional[str] = None  # the reason, for "config_error" (the persona / settings config cannot give steps)
 
 
 def _parse_process_status(raw: Any) -> Dict[str, Any]:
@@ -50,15 +55,40 @@ def _parse_process_status(raw: Any) -> Dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+async def resolve_process_steps(
+    row: Dict[str, Any],
+    *,
+    conn: Any = None,
+    memo: Optional[Dict[Any, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    The process steps of a submission row. A feedback submission's steps live in its persona's upload config (config
+    tables, read through `conn`, or through a connection acquired just for the lookup when none is given; `memo`
+    remembers each persona so a sweep reads it once); story / discussion read settings and need no connection, an
+    unknown type has none. Raises ValueError when the config cannot give steps (an operator error, never "no steps").
+    """
+    sub_type = row["submission_type"]
+    if is_feedback_type(sub_type):
+        if conn is not None:
+            return await get_process_steps(conn, sub_type, row["submission_id"], row["tenant_code"], memo)
+        async with db.pool.acquire() as own_conn:
+            return await get_process_steps(own_conn, sub_type, row["submission_id"], row["tenant_code"], memo)
+    return settings.get_process_config(sub_type)
+
+
 async def retry_single_submission(
     client: Any,
     row: Dict[str, Any],
     *,
     liveness_sem: Optional[asyncio.Semaphore] = None,
+    process_steps: Optional[List[Dict[str, Any]]] = None,
 ) -> RetryOutcome:
     """
     Shared single-submission retry orchestration:
-      1. Validate configured process steps for submission_type.
+      1. Resolve the process steps of the submission (resolve_process_steps; a sweep passes `process_steps` it
+         already resolved). A feedback persona may legitimately have NO steps (ingestion alone is the whole job):
+         the empty-step workflow marks the submission 'success', which is how a failed one recovers; any other type
+         without steps is unsupported ("no_steps"); a config that cannot give steps is a "config_error".
       2. If status == 'processing', check Temporal liveness (skip if RUNNING).
       3. Atomically claim retry_attempt in PostgreSQL.
       4. Start ConfigDrivenProcessingWorkflow with deterministic ID 'step-retry-{id}-{tenant}'.
@@ -70,8 +100,12 @@ async def retry_single_submission(
     sub_type = row["submission_type"]
     workflow_id = f"step-retry-{sub_id}-{tenant_code}"
 
-    process_steps = settings.get_process_config(sub_type)
-    if not process_steps:
+    if process_steps is None:
+        try:
+            process_steps = await resolve_process_steps(row)
+        except ValueError as exc:
+            return RetryOutcome(status="config_error", workflow_id=workflow_id, error=str(exc))
+    if len(process_steps) == 0 and not is_feedback_type(sub_type):
         return RetryOutcome(status="no_steps", workflow_id=workflow_id)
 
     process_status = _parse_process_status(row.get("process_status"))
@@ -150,6 +184,7 @@ async def dispatch_all_retry_workflows(
     cursor_updated_at = None
     cursor_submission_id = None
     sem = asyncio.Semaphore(10)
+    persona_memo: Dict[Any, Any] = {}  # persona lookups of feedback rows, remembered for the whole sweep
 
     while True:
         async with db.pool.acquire() as conn:
@@ -170,10 +205,36 @@ async def dispatch_all_retry_workflows(
         cursor_submission_id = rows[-1]["submission_id"]
         page += 1
 
+        # Resolve the steps of the page one row at a time before the concurrent dispatch: one connection per page,
+        # taken only when a feedback row needs the config tables, and each persona is read once. A row whose config
+        # cannot give steps is skipped (it stays failed, looked at again by the next sweep). The cursor above already
+        # moved past the whole scanned page, so skipped rows never shorten a page or end the sweep early.
+        # Keyed by (tenant_code, submission_id): a submission_id is only unique per tenant, and an all-tenant page can
+        # hold the same id twice (two tenants), each with its own persona config.
+        steps_by_key: Dict[Any, Any] = {}
+        async with contextlib.AsyncExitStack() as page_resources:
+            steps_conn = None
+            for row in rows:
+                try:
+                    if is_feedback_type(row["submission_type"]) and steps_conn is None:
+                        steps_conn = await page_resources.enter_async_context(db.pool.acquire())
+                    steps_by_key[(row["tenant_code"], row["submission_id"])] = await resolve_process_steps(
+                        row, conn=steps_conn, memo=persona_memo
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        f"[{sweep_id}] Skipping submission '{row['submission_id']}' (tenant '{row['tenant_code']}') — "
+                        f"cannot resolve its process steps: {exc}"
+                    )
+                    steps_by_key[(row["tenant_code"], row["submission_id"])] = exc
+
         async def _process_row(row: Dict[str, Any]) -> str:
             sub_id = row["submission_id"]
+            resolved = steps_by_key[(row["tenant_code"], sub_id)]
+            if isinstance(resolved, Exception):
+                return "skipped"
             try:
-                outcome = await retry_single_submission(client, row, liveness_sem=sem)
+                outcome = await retry_single_submission(client, row, liveness_sem=sem, process_steps=resolved)
             except Exception as e:
                 logger.warning(f"[{sweep_id}] Failed retry orchestration for '{sub_id}': {e}")
                 return "failed"

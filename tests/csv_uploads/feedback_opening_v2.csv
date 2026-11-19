@@ -1,0 +1,12 @@
+bot_id,bot_name,session_type,session_status,session,submission_id,language,sequence,conversation_row_id,message,translated_message,created_at,updated_at,stage,receiver_id,sender_id,audio_file,file_url,other_params
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,1,9510,"Hello, welcome. Shall we begin?",[hi] hello welcome shall we begin,,,,,,,,
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,2,9511,[hi] yes,yes,2026-11-05T08:00:02.123456+05:30,2026-11-05T08:00:02.123456+05:30,OPENING,1,120,,,
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,3,9512,Which state do you stay in?,[hi] which state,2026-11-05T08:00:03.123456+05:30,2026-11-05T08:00:03.123456+05:30,STATE_IDENTIFICATION,120,1,,,
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,4,9513,[hi] state answer,state answer,2026-11-05T08:00:04.123456+05:30,2026-11-05T08:00:04.123456+05:30,STATE_IDENTIFICATION,1,120,,,
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,5,9514,Could you say that again?,[hi] say again,2026-11-05T08:00:05.123456+05:30,2026-11-05T08:00:05.123456+05:30,STATE_IDENTIFICATION,120,1,,,
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,6,9515,[hi] state answer again,state answer again,2026-11-05T08:00:06.123456+05:30,2026-11-05T08:00:06.123456+05:30,STATE_IDENTIFICATION,1,120,,,
+99,Synthetic Parent Bot V2,Parent_Voice,COMPLETED,c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1,910021,hi,7,9516,Thank you,[hi] thank you,2026-11-05T08:00:07.123456+05:30,2026-11-05T08:00:07.123456+05:30,THANK_YOU,120,1,,,
+99,Synthetic Parent Bot V2,Parent_Voice,IN_PROGRESS,d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1,910022,en,1,9517,"Hello, welcome. Shall we begin?",,,,,,,,,
+99,Synthetic Parent Bot V2,Parent_Voice,IN_PROGRESS,d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1,910022,en,2,9518,yes,,2026-11-05T08:00:02.123456+05:30,2026-11-05T08:00:02.123456+05:30,OPENING,1,120,,,
+99,Synthetic Parent Bot V2,Parent_Voice,IN_PROGRESS,d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1,910022,en,3,9519,Which state do you stay in?,,2026-11-05T08:00:03.123456+05:30,2026-11-05T08:00:03.123456+05:30,STATE_IDENTIFICATION,120,1,,,
+99,Synthetic Parent Bot V2,Parent_Voice,IN_PROGRESS,d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1,910022,en,4,9520,english state answer,,2026-11-05T08:00:04.123456+05:30,2026-11-05T08:00:04.123456+05:30,STATE_IDENTIFICATION,1,120,,,

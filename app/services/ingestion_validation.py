@@ -1,13 +1,17 @@
 import uuid
+from typing import Optional
 
 from app.config import settings
+from app.services.feedback_adapter_config import is_safe_code, is_safe_id, shown, source_label_problem
+from app.services.feedback_versions import BOT_ID_RULE, is_valid_bot_id
 from app.services.feedback_constants import (
+    ADAPTERS,
     COMPLETION_COMPLETED,
     COMPLETION_STATUSES,
+    DEFAULT_INGESTION_SCHEMA,
     FEEDBACK_REPORT_TYPE,
-    FEEDBACK_SOURCES,
-    SOURCE_GOOGLE_FORMS,
-    SOURCE_MITRA,
+    MAX_SEQUENCE,
+    NATURAL_KEY_ADAPTERS,
 )
 
 
@@ -68,9 +72,11 @@ def _validate_feedback_messages(messages) -> list:
         if "sequence" not in row:
             problems.append(f"'{label}.sequence' is missing")
         elif not _is_int(row["sequence"]):
-            problems.append(f"'{label}.sequence' must be an integer, got {row['sequence']!r}")
+            problems.append(f"'{label}.sequence' must be an integer, got {type(row['sequence']).__name__}")
         elif row["sequence"] < 1:
-            problems.append(f"'{label}.sequence' must be >= 1, got {row['sequence']!r}")
+            problems.append(f"'{label}.sequence' must be >= 1, got {shown(row['sequence'])}")
+        elif row["sequence"] > MAX_SEQUENCE:
+            problems.append(f"'{label}.sequence' must be <= {MAX_SEQUENCE} (a 32-bit integer)")
         else:
             sequences[row["sequence"]] = sequences.get(row["sequence"], 0) + 1
 
@@ -82,10 +88,12 @@ def _validate_feedback_messages(messages) -> list:
             problems.append(f"'{label}.message' must be a string, got {type(row['message']).__name__}")
 
         if "isFollowUp" in row and not isinstance(row["isFollowUp"], bool):
-            problems.append(f"'{label}.isFollowUp' must be a boolean, got {row['isFollowUp']!r}")
+            problems.append(f"'{label}.isFollowUp' must be a boolean, got {type(row['isFollowUp']).__name__}")
 
         if "parentSequence" in row and row["parentSequence"] is not None and not _is_int(row["parentSequence"]):
-            problems.append(f"'{label}.parentSequence' must be null or an integer, got {row['parentSequence']!r}")
+            problems.append(
+                f"'{label}.parentSequence' must be null or an integer, got {type(row['parentSequence']).__name__}"
+            )
 
         # translatedMessage and messageAt are optional (null allowed); only a wrong type is a problem.
         for optional_text in ("translatedMessage", "messageAt"):
@@ -118,7 +126,7 @@ def _validate_feedback_messages(messages) -> list:
     return problems
 
 
-def _is_uuid(value) -> bool:
+def is_uuid(value) -> bool:
     """True for a string that parses as a UUID."""
     if not isinstance(value, str):
         return False
@@ -129,40 +137,91 @@ def _is_uuid(value) -> bool:
     return True
 
 
-def _validate_feedback_source_rules(event: dict, source, completion) -> list:
-    """Rules that depend on data.source (only called when data.source is a known source):
-    sourceRef is required for google_forms and absent / null for mitra; a google_forms event carries
-    one generated UUID as submissionId and sessionId and is always COMPLETED."""
+def _id_text(value):
+    """The text of a submission / session id (a string, or an integer that the consumer turns into one), else None."""
+    if isinstance(value, str):
+        return value
+    if _is_int(value):
+        return str(value)
+    return None
+
+
+def feedback_identifier_problems(event: dict, *, create: bool) -> list:
+    """
+    Boundary check of the identifiers a feedback event carries, BEFORE they are used as a config-cache key, in an SQL
+    parameter or in a log line: submissionId / sessionId (1..128 characters of [A-Za-z0-9._:-]), tenantCode and
+    data.sessionType (1..64 of [A-Za-z0-9._-]), data.source (a source label), tags.programId (a UUID). Only fields
+    that are present and non-empty are checked (the required-path check reports the missing ones). A value is never
+    echoed unless it is a short safe token, so a bad identifier can not forge a log line or reach the DLQ reason.
+    """
+    problems = []
+    for path in ("submissionId", "sessionId"):
+        value, found = _get_nested(event, path)
+        if found and not _is_empty(value) and not is_safe_id(_id_text(value)):
+            problems.append(
+                f"'{path}' must be 1 to 128 characters of letters, digits, '.', '_', ':', ',' and '-' (no spaces or control "
+                f"characters)"
+            )
+    tenant, found = _get_nested(event, "tenantCode")
+    if found and not _is_empty(tenant) and not is_safe_code(tenant):
+        problems.append("'tenantCode' must be 1 to 64 characters of letters, digits, '.', '_' and '-'")
+    if not create:
+        return problems
+    session_type, found = _get_nested(event, "data.sessionType")
+    if found and not _is_empty(session_type) and isinstance(session_type, str) and not is_safe_code(session_type):
+        problems.append("'data.sessionType' must be 1 to 64 characters of letters, digits, '.', '_' and '-'")
+    source, found = _get_nested(event, "data.source")
+    if found and not _is_empty(source):
+        source_problem = source_label_problem(source)
+        if source_problem is not None:
+            problems.append(f"'data.source' is invalid: {source_problem}")
+    # tags.programId selects the persona's config (a uuid column): a non-UUID must be rejected here, with
+    # identifiers, instead of failing as a database error on every retry.
+    program_id, found = _get_nested(event, "tags.programId")
+    if found and not _is_empty(program_id) and not is_uuid(program_id):
+        problems.append("'tags.programId' must be a UUID")
+    return problems
+
+
+def _validate_feedback_adapter_rules(event: dict, adapter: str, completion) -> list:
+    """Rules that depend on data.adapter (the identity semantics of the source, chosen by its config, never by the
+    source name): a natural-key adapter (wide_form) requires sourceRef, a generated UUID as submissionId AND
+    sessionId (equal) and COMPLETED; every other adapter (conversation_rows) takes sourceRef absent / null."""
     problems = []
     source_ref, ref_found = _get_nested(event, "data.sourceRef")
 
-    if source == SOURCE_GOOGLE_FORMS:
+    if adapter in NATURAL_KEY_ADAPTERS:
         if not ref_found:
             problems.append("'data.sourceRef' is missing")
         elif _is_empty(source_ref):
             problems.append(f"'data.sourceRef' is {_emptiness_label(source_ref)}")
         elif not isinstance(source_ref, str):
             problems.append(f"'data.sourceRef' must be a string, got {type(source_ref).__name__}")
-        elif len(source_ref.strip()) == 0:
-            problems.append("'data.sourceRef' is blank")
 
         submission_id = event.get("submissionId")
         session_id = event.get("sessionId")
-        if "submissionId" in event and not _is_empty(submission_id) and not _is_uuid(submission_id):
-            problems.append(f"'submissionId' must be a UUID for source {SOURCE_GOOGLE_FORMS}, got {submission_id!r}")
-        if "sessionId" in event and not _is_empty(session_id) and not _is_uuid(session_id):
-            problems.append(f"'sessionId' must be a UUID for source {SOURCE_GOOGLE_FORMS}, got {session_id!r}")
-        if (_is_uuid(submission_id) and _is_uuid(session_id)) and submission_id != session_id:
-            problems.append(
-                f"'sessionId' must equal 'submissionId' for source {SOURCE_GOOGLE_FORMS}, "
-                f"got {session_id!r} and {submission_id!r}"
-            )
+        if "submissionId" in event and not _is_empty(submission_id) and not is_uuid(submission_id):
+            problems.append(f"'submissionId' must be a UUID for adapter {adapter}")
+        if "sessionId" in event and not _is_empty(session_id) and not is_uuid(session_id):
+            problems.append(f"'sessionId' must be a UUID for adapter {adapter}")
+        if (is_uuid(submission_id) and is_uuid(session_id)) and submission_id != session_id:
+            problems.append(f"'sessionId' must equal 'submissionId' for adapter {adapter}")
 
         if completion in COMPLETION_STATUSES and completion != COMPLETION_COMPLETED:
-            problems.append(f"'data.completionStatus' must be {COMPLETION_COMPLETED} for source {SOURCE_GOOGLE_FORMS}, got {completion!r}")
-    elif source == SOURCE_MITRA:
+            problems.append(f"'data.completionStatus' must be {COMPLETION_COMPLETED} for adapter {adapter}, got {shown(completion)}")
+    else:
         if ref_found and source_ref is not None:
-            problems.append(f"'data.sourceRef' must be absent or null for source {SOURCE_MITRA}, got {source_ref!r}")
+            problems.append(f"'data.sourceRef' must be absent or null for adapter {adapter}")
+        # A Mitra bot session gets its questionnaire version from the rank of its bot id inside the persona (see
+        # app/services/feedback_versions.py), so the bot id is required here whatever the persona's configured
+        # schema lists, and it must be a positive integer written in digits (the value is never echoed).
+        bot_id, bot_found = _get_nested(event, "data.botId")
+        if not bot_found:
+            problems.append(f"'data.botId' is missing (required for adapter {adapter})")
+        elif _is_empty(bot_id):
+            problems.append(f"'data.botId' is {_emptiness_label(bot_id)} (required for adapter {adapter})")
+        elif isinstance(bot_id, str) and not is_valid_bot_id(bot_id):
+            problems.append(f"'data.botId' must be {BOT_ID_RULE}")
 
     return problems
 
@@ -177,14 +236,37 @@ def _validate_feedback_create(event: dict) -> list:
     completion, found = _get_nested(event, "data.completionStatus")
     if found and not _is_empty(completion) and completion not in COMPLETION_STATUSES:
         problems.append(
-            f"'data.completionStatus' must be one of {', '.join(COMPLETION_STATUSES)}, got {completion!r}"
+            f"'data.completionStatus' must be one of {', '.join(COMPLETION_STATUSES)}, got {shown(completion)}"
         )
 
-    source, found = _get_nested(event, "data.source")
-    if found and not _is_empty(source) and source not in FEEDBACK_SOURCES:
-        problems.append(f"'data.source' must be one of {', '.join(FEEDBACK_SOURCES)}, got {source!r}")
-    elif found and source in FEEDBACK_SOURCES:
-        problems.extend(_validate_feedback_source_rules(event, source, completion))
+    # The source is a free label (valid when it has an active upload config: the consumer resolves that before it
+    # gets here); the identity rules come from the adapter of that config, which the event carries and the consumer
+    # cross-checks against the config.
+    problems.extend(feedback_identifier_problems(event, create=True))
+    adapter, found = _get_nested(event, "data.adapter")
+    if not found:
+        problems.append("'data.adapter' is missing")
+    elif _is_empty(adapter):
+        problems.append(f"'data.adapter' is {_emptiness_label(adapter)}")
+    elif not isinstance(adapter, str) or adapter not in ADAPTERS:
+        problems.append(f"'data.adapter' must be one of {', '.join(ADAPTERS)}, got {shown(adapter)}")
+    else:
+        problems.extend(_validate_feedback_adapter_rules(event, adapter, completion))
+
+    # sessionType (the persona key) and questionnaireVersion are required (presence and emptiness come from the
+    # configured schema); here only their type, which the generic mechanism cannot express.
+    for path in ("data.sessionType", "data.questionnaireVersion"):
+        value, found = _get_nested(event, path)
+        if found and not _is_empty(value) and not isinstance(value, str):
+            problems.append(f"'{path}' must be a string, got {type(value).__name__}")
+    # botName is informational (a string or null). botId is a string; for adapter conversation_rows it is also
+    # required and a positive integer in digits (_validate_feedback_adapter_rules); wide_form carries none.
+    value, found = _get_nested(event, "data.botName")
+    if found and value is not None and not isinstance(value, str):
+        problems.append(f"'data.botName' must be a string or null, got {type(value).__name__}")
+    value, found = _get_nested(event, "data.botId")
+    if found and value is not None and not isinstance(value, str):
+        problems.append(f"'data.botId' must be a string, got {type(value).__name__}")
 
     messages, found = _get_nested(event, "data.messages")
     if found:
@@ -193,11 +275,22 @@ def _validate_feedback_create(event: dict) -> list:
     return problems
 
 
-def validate_ingestion_schema(event: dict, submission_type: str, event_type: str) -> list:
+def validate_ingestion_schema(
+    event: dict,
+    submission_type: str,
+    event_type: str,
+    feedback_schema: Optional[dict] = None,
+) -> list:
     """
     Validates a Kafka event against the configured required-fields schema for its
     (submissionType, eventType) combination. Returns a list of problem descriptions;
     an empty list means the event is valid.
+
+    Story / discussion schemas come from settings. A feedback schema is NOT in settings: it is the
+    `ingestion_schema` of the persona's upload config and the caller passes it in as `feedback_schema`
+    (the upload service loads it once per upload, the consumer caches it); no database is read here. A
+    feedback create without a schema is a problem, never a silent default. A feedback delete event carries
+    no persona, so without a schema it is checked against the fixed envelope fields only.
 
     Shared between app/kafka/consumer.py (validates events arriving off the Kafka
     topic) and app/api/services/uploads.py (validates each CSV-derived
@@ -211,10 +304,22 @@ def validate_ingestion_schema(event: dict, submission_type: str, event_type: str
     if is_feedback and event_type == "update":
         return ["feedback does not support update events in this release"]
 
-    try:
-        schema = settings.get_kafka_ingestion_schema(submission_type)
-    except ValueError as e:
-        return [str(e)]
+    if is_feedback:
+        if feedback_schema is not None:
+            schema = feedback_schema
+        elif event_type == "delete":
+            schema = {"delete": {"required": DEFAULT_INGESTION_SCHEMA["delete"]["required"]}}
+        elif event_type == "create":
+            return ["No feedback ingestion schema was supplied: it comes from the 'ingestion_schema' of the "
+                    "persona's feedback_upload config"]
+        else:
+            # any other eventType: the persona's schema is not needed to tell it has no section
+            schema = {}
+    else:
+        try:
+            schema = settings.get_kafka_ingestion_schema(submission_type)
+        except ValueError as e:
+            return [str(e)]
 
     event_schema = schema.get(event_type)
     if event_schema is None:
@@ -237,5 +342,7 @@ def validate_ingestion_schema(event: dict, submission_type: str, event_type: str
 
     if is_feedback and event_type == "create":
         problems.extend(_validate_feedback_create(event))
+    elif is_feedback and event_type == "delete":
+        problems.extend(feedback_identifier_problems(event, create=False))
 
     return problems

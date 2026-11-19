@@ -16,6 +16,11 @@
   },
   "data": {
     "source": "mitra",
+    "adapter": "conversation_rows",
+    "sessionType": "Parent_Voice",
+    "questionnaireVersion": "V1",
+    "botId": "102",
+    "botName": null,
     "language": "kn",
     "completionStatus": "IN_PROGRESS",
     "submissionDate": "2026-10-16T10:12:05.000Z",

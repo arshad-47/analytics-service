@@ -92,11 +92,9 @@ class Settings(BaseSettings):
     AUTH_TOKEN: str = Field(description="Bearer token for API authentication. Must be set via environment variable.")
 
     # CSV Upload / Processing Configuration
-    MAX_CSV_UPLOAD_BYTES: int = Field(default=10485760)  # 10MB (story / discussion)
-    # Feedback (Mitra conversation export) has its own, higher cap: one persona file is uploaded
-    # whole and the Parent file alone is ~43MB. The value is still to be confirmed; it must stay
-    # above the Parent file with headroom for growth.
-    FEEDBACK_MAX_CSV_UPLOAD_BYTES: int = Field(default=104857600)  # 100MB
+    # story / discussion only. The feedback cap lives in the persona's upload config (config key
+    # max_csv_upload_bytes), not here.
+    MAX_CSV_UPLOAD_BYTES: int = Field(default=10485760)  # 10MB
     CSV_BLOB_UPLOADS: str = Field(default="mitra_dashboard_api_output")
     # Expected CSV column headers per report type (JSON arrays of column names,
     # matched case-insensitively against the uploaded file's header row).
@@ -119,6 +117,9 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.0)
     LLM_MAX_TOKENS: int = Field(default=2048)
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
+    # Opt-in debugging only: write the full prompt (DEBUG) and the provider's error body (ERROR) to the logs. The
+    # prompt can hold respondents' words and the provider's error body can echo it, so this stays False in production.
+    LLM_LOG_PAYLOADS: bool = Field(default=False)
 
     # SetFit Statement Categorization
     SETFIT_MODEL_ID: str = Field(default="")
@@ -153,8 +154,7 @@ class Settings(BaseSettings):
     PROCESS_CONFIG_DISCUSSION: str = Field(
         default='[{"name": "pii_and_abusive_language_detection", "columns": ["challenges"]}, {"name": "thematic_classification", "columns": ["challenges"]}]'
     )
-    # Feedback has no processing steps in Phase 1 (empty list: the submission is marked success at ingestion).
-    PROCESS_CONFIG_FEEDBACK: str = Field(default="[]")
+    # Feedback process steps live in the persona's upload config (config key process_steps), not here.
 
     # Kafka ingestion-time field validation schema (JSON strings loaded from env).
     # One entry per (create/update/delete) event type: "required" is a list of
@@ -168,12 +168,7 @@ class Settings(BaseSettings):
         default='{"create": {"required": ["submissionId", "submissionType", "sessionId", "tenantCode", "eventType", "eventPublishedAt", "tags.state", "tags.district", "tags.organization", "tags.programId", "tags.programName", "tags.leaderCategoryId", "tags.leaderCategoryName", "data.title", "data.designation", "data.submissionDate", "data.discussionDate", "data.pdfUrls.original", "data.pdfUrls.masked", "data.transcriptLink", "data.challenges", "data.solutions", "data.participantsData", "data.pri_member_information", "data.school_representative_information"], "optional": ["data.author", "data.language", "data.imageUrls"]}, "update": {"required": ["submissionId", "submissionType", "sessionId", "tenantCode", "eventType", "eventPublishedAt"], "newValuesNoEmpty": true}, "delete": {"required": ["submissionId", "submissionType", "sessionId", "tenantCode", "eventType", "eventPublishedAt"]}}'
     )
 
-    # Feedback: array elements of data.messages are validated separately in
-    # app/services/ingestion_validation.py; "update" is not supported for feedback in this release.
-    # tags.state / tags.district are optional (respondents skip them).
-    FEEDBACK_KAFKA_SCHEMA: str = Field(
-        default='{"create": {"required": ["submissionId", "submissionType", "sessionId", "tenantCode", "eventType", "eventPublishedAt", "tags.programId", "tags.leaderCategoryId", "data.source", "data.language", "data.completionStatus", "data.submissionDate", "data.messages"], "optional": ["tags.state", "tags.district", "tags.programName", "tags.leaderCategoryName", "tags.source"]}, "update": {"required": ["submissionId", "submissionType", "sessionId", "tenantCode", "eventType", "eventPublishedAt"], "newValuesNoEmpty": true}, "delete": {"required": ["submissionId", "submissionType", "sessionId", "tenantCode", "eventType", "eventPublishedAt"]}}'
-    )
+    # Feedback's ingestion schema lives in the persona's upload config (config key ingestion_schema), not here.
 
     # Thematic Classification Configuration
     MINIMUM_THEME_WORD_COUNT: int = Field(default=5)
@@ -263,7 +258,7 @@ class Settings(BaseSettings):
             )
         return self
 
-    @field_validator("PROCESS_CONFIG_STORY", "PROCESS_CONFIG_DISCUSSION", "PROCESS_CONFIG_FEEDBACK")
+    @field_validator("PROCESS_CONFIG_STORY", "PROCESS_CONFIG_DISCUSSION")
     @classmethod
     def validate_process_config_json(cls, v: str, info) -> str:
         try:
@@ -363,7 +358,7 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid JSON configuration for DISCUSSION_PARTICIPANTS_MAP: {e}") from e
         return v
 
-    @field_validator("STORY_KAFKA_SCHEMA", "DISCUSSION_KAFKA_SCHEMA", "FEEDBACK_KAFKA_SCHEMA")
+    @field_validator("STORY_KAFKA_SCHEMA", "DISCUSSION_KAFKA_SCHEMA")
     @classmethod
     def validate_kafka_ingestion_schema_json(cls, v: str, info) -> str:
         try:
@@ -481,7 +476,8 @@ class Settings(BaseSettings):
     def get_process_config(self, submission_type: str) -> List[Dict[str, Any]]:
         """
         Dynamically returns the process list configuration based on submission type.
-        Raises ValueError if JSON parsing fails or if config is not a list.
+        Raises ValueError if JSON parsing fails or if config is not a list, and for a feedback type: feedback
+        process steps live in the persona's upload config (use feedback_operations.get_feedback_process_steps).
         """
         normalized_type = submission_type.lower().strip()
         if "story" in normalized_type:
@@ -489,7 +485,11 @@ class Settings(BaseSettings):
         elif "discussion" in normalized_type:
             raw_config = self.PROCESS_CONFIG_DISCUSSION
         elif "feedback" in normalized_type:
-            raw_config = self.PROCESS_CONFIG_FEEDBACK
+            raise ValueError(
+                f"Process steps for submission type {submission_type!r} are not in settings: feedback settings "
+                "live in the config tables (config_version.config.process_steps of the persona's feedback_upload "
+                "config); use app.database.feedback_operations.get_feedback_process_steps"
+            )
         else:
             # Fallback/Default config for unknown submission type
             return []
@@ -510,7 +510,9 @@ class Settings(BaseSettings):
         """
         Dynamically returns the ingestion-time required-fields schema for the given
         submission type. Raises ValueError if JSON parsing fails, if the config is
-        not a dict, or if the submission type doesn't match 'story', 'discussion' or 'feedback'.
+        not a dict, or if the submission type doesn't match 'story' or 'discussion'. A feedback type also raises:
+        feedback's schema lives in the persona's upload config (config key ingestion_schema) and is passed to
+        validate_ingestion_schema by the caller.
         """
         normalized_type = submission_type.lower().strip() if isinstance(submission_type, str) else ""
         if "story" in normalized_type:
@@ -518,7 +520,11 @@ class Settings(BaseSettings):
         elif "discussion" in normalized_type:
             raw_schema = self.DISCUSSION_KAFKA_SCHEMA
         elif "feedback" in normalized_type:
-            raw_schema = self.FEEDBACK_KAFKA_SCHEMA
+            raise ValueError(
+                f"Kafka ingestion schema for submission type {submission_type!r} is not in settings: feedback "
+                "settings live in the config tables (config_version.config.ingestion_schema of the persona's "
+                "feedback_upload config)"
+            )
         else:
             raise ValueError(f"No Kafka ingestion schema defined for submission type {submission_type!r}")
 

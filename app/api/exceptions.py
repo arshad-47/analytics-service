@@ -63,6 +63,15 @@ class InvalidFeedbackSource(Exception):
     pass
 
 
+class AmbiguousFeedbackTarget(Exception):
+    """
+    Raised when a feedback upload's program / persona / source matches more than one program or config row, so the
+    service cannot tell which one the file is for (an operator must disambiguate the configuration). The message
+    carries no config content.
+    """
+    pass
+
+
 class FeedbackProgramNotFound(Exception):
     """
     Raised when program_name + leader_category do not match seeded rows for the tenant. Feedback
@@ -119,6 +128,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(InvalidFeedbackSource)
     async def invalid_feedback_source_handler(request: Request, exc: InvalidFeedbackSource):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(AmbiguousFeedbackTarget)
+    async def ambiguous_feedback_target_handler(request: Request, exc: AmbiguousFeedbackTarget):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(FeedbackProgramNotFound)
     async def feedback_program_not_found_handler(request: Request, exc: FeedbackProgramNotFound):

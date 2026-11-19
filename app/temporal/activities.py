@@ -7,7 +7,13 @@ from temporalio import activity
 
 from app.config import settings
 from app.database.db import db
-from app.database.operations import insert_llm_log, get_submission_type_and_payload
+from app.database.feedback_operations import get_process_steps
+from app.database.operations import (
+    insert_llm_log,
+    get_submission_type_and_payload,
+    mark_pending_submission_config_failed,
+)
+from app.services.feedback_constants import FEEDBACK_REPORT_TYPE
 from app.services.retry import dispatch_all_retry_workflows
 
 logger = logging.getLogger("analytics_service.temporal.activities")
@@ -43,28 +49,68 @@ async def fetch_pending_submissions_activity(params: Optional[Dict[str, Any]] = 
     and attaches their config-driven process steps. Bounded by `limit` (default
     settings.BATCH_SIZE) so a large pending queue is never loaded into memory in one
     go — BatchProcessingWorkflow calls this repeatedly in chunks instead.
+
+    A feedback submission whose persona config cannot give its steps (no active config, or process_steps
+    missing / invalid) must not stop the sweep, or one misconfigured persona would starve the story / discussion
+    rows behind it: it is logged with its identifiers, marked 'failed' with the reason in its process_status
+    (so it leaves the pending queue and the bulk retry picks it up once the config is fixed) and left out of the
+    returned list. A database error is not caught: the activity fails and Temporal retries it. The persona
+    lookup is memoized for the call.
     """
-    limit = (params or {}).get("limit") or settings.BATCH_SIZE
+    requested_limit = (params or {}).get("limit")
+    limit = settings.BATCH_SIZE if requested_limit is None else requested_limit
+    persona_memo: Dict[Any, Any] = {}
 
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT submission_id, tenant_code, submission_type FROM submissions "
-            "WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1",
-            limit
-        )
         results = []
-        for row in rows:
-            sub_id = row["submission_id"]
-            tenant = row["tenant_code"]
-            sub_type = row["submission_type"]
-            # Load process steps dynamically from settings based on type
-            process_steps = settings.get_process_config(sub_type)
-            results.append({
-                "submission_id": sub_id,
-                "tenant_code": tenant,
-                "submission_type": sub_type,
-                "process_steps": process_steps
-            })
+        # BatchProcessingWorkflow treats a page shorter than `limit` as "the queue is drained", so a feedback row
+        # that is marked failed here must not shorten the page (or empty it while later rows are still pending):
+        # the page is refilled from the rows behind it. Every refill asks for exactly `limit` rows, however many
+        # rows were rejected so far: a row marked failed leaves the pending queue (it is no longer selected), and a
+        # row already returned stays pending but takes at most `limit` - len(results) places in the oldest-first
+        # order, so the next `limit` pending rows always hold every row still to be looked at. `handled` skips the
+        # returned rows by identity. (Asking for `limit` plus the rows handled so far made a backlog of invalid
+        # configs fetch 2x, 3x, ... the page size.)
+        handled = set()
+        while True:
+            asked = limit
+            rows = await conn.fetch(
+                "SELECT submission_id, tenant_code, submission_type FROM submissions "
+                "WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1",
+                asked
+            )
+            fresh = [row for row in rows if (row["tenant_code"], row["submission_id"]) not in handled]
+            for row in fresh:
+                if len(results) >= limit:
+                    break
+                sub_id = row["submission_id"]
+                tenant = row["tenant_code"]
+                sub_type = row["submission_type"]
+                handled.add((tenant, sub_id))
+                # Process steps: story/discussion from settings, feedback from its persona's upload config (config tables).
+                try:
+                    process_steps = await get_process_steps(conn, sub_type, sub_id, tenant, persona_memo)
+                except ValueError as exc:
+                    if FEEDBACK_REPORT_TYPE not in str(sub_type).lower():
+                        raise
+                    logger.error(
+                        "Cannot resolve the process steps of submission '%s' (tenant '%s', type '%s'); marking it failed: %s",
+                        sub_id, tenant, sub_type, exc,
+                    )
+                    if not await mark_pending_submission_config_failed(conn, sub_id, tenant, str(exc)):
+                        logger.warning(
+                            "Submission '%s' (tenant '%s') is no longer pending; its failure was not written.",
+                            sub_id, tenant,
+                        )
+                    continue
+                results.append({
+                    "submission_id": sub_id,
+                    "tenant_code": tenant,
+                    "submission_type": sub_type,
+                    "process_steps": process_steps
+                })
+            if len(results) >= limit or len(rows) < asked or len(fresh) == 0:
+                break
         return results
 
 
@@ -80,7 +126,6 @@ async def trigger_bulk_retry_activity(params: Optional[Dict[str, Any]] = None) -
     result = await dispatch_all_retry_workflows(tenant_code, on_page=activity.heartbeat)
     logger.info("Cron bulk retry sweep complete: sweep_id=%s", result.get("sweep_id"))
     return result
-
 
 
 

@@ -1,0 +1,10 @@
+bot_id,bot_name,session_type,session_status,session,submission_id,language,sequence,conversation_row_id,message,translated_message,created_at,updated_at,stage,receiver_id,sender_id,audio_file,file_url,other_params
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1,910011,hi,1,9501,"Hello, welcome. Which state do you stay in?",[hi] hello welcome which state,,,,,,,,
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1,910011,hi,2,9502,[hi] state answer,state answer,2026-10-15T08:00:02.123456+05:30,2026-10-15T08:00:02.123456+05:30,STATE_IDENTIFICATION,1,120,,,
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1,910011,hi,3,9503,Which district do you stay in?,[hi] which district,2026-10-15T08:00:03.123456+05:30,2026-10-15T08:00:03.123456+05:30,DISTRICT_IDENTIFICATION,120,1,,,
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1,910011,hi,4,9504,[hi] district answer,district answer,2026-10-15T08:00:04.123456+05:30,2026-10-15T08:00:04.123456+05:30,DISTRICT_IDENTIFICATION,1,120,,,
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1,910011,hi,5,9505,Thank you,[hi] thank you,2026-10-15T08:00:05.123456+05:30,2026-10-15T08:00:05.123456+05:30,THANK_YOU,120,1,,,
+88,Synthetic Parent Bot,Parent_Voice,IN_PROGRESS,b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1,910012,en,1,9506,"Hello, welcome. Which state do you stay in?",,,,,,,,,
+88,Synthetic Parent Bot,Parent_Voice,IN_PROGRESS,b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1,910012,en,2,9507,english state answer,,2026-10-15T08:00:02.123456+05:30,2026-10-15T08:00:02.123456+05:30,STATE_IDENTIFICATION,1,120,,,
+88,Synthetic Parent Bot,Parent_Voice,IN_PROGRESS,b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1,910012,en,3,9508,English district question,,2026-10-15T08:00:03.123456+05:30,2026-10-15T08:00:03.123456+05:30,DISTRICT_IDENTIFICATION,120,1,,,
+88,Synthetic Parent Bot,Parent_Voice,IN_PROGRESS,b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1,910012,en,4,9509,english district answer,,2026-10-15T08:00:04.123456+05:30,2026-10-15T08:00:04.123456+05:30,DISTRICT_IDENTIFICATION,1,120,,,

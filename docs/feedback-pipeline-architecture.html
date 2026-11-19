@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feedback Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one wide sequence diagram first, then plain stage notes, a settings table, and two smaller diagrams. */
+:root {
+  --bg: #F3F7F8; --surface: #FFFFFF; --surface2: #EAF1F3; --fg: #14212B; --muted: #55656F; --line: #C5D2D8;
+  --ink: #14212B; --config: #A84D00; --llm: #6A2FD0; --accent: #0B6B63;
+  --display: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0D1A20; --surface: #14252D; --surface2: #1B303A; --fg: #E3EDF1; --muted: #92A5AF; --line: #2D4450;
+  --ink: #E3EDF1; --config: #F4B565; --llm: #B79CFF; --accent: #4FD1C0; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0D1A20; --surface: #14252D; --surface2: #1B303A; --fg: #E3EDF1; --muted: #92A5AF; --line: #2D4450;
+  --ink: #E3EDF1; --config: #F4B565; --llm: #B79CFF; --accent: #4FD1C0; color-scheme: dark; }
+* { box-sizing: border-box; }
+html { color-scheme: light; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans);
+  padding-block: 32px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+h1, h2, h3 { font-family: var(--display); letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+h1 { font-size: 34px; line-height: 1.1; }
+h2 { font-size: 22px; margin-bottom: 6px; }
+h3 { font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); }
+h3.nocase { text-transform: none; letter-spacing: 0; font-size: 16px; }
+p { margin: 0; }
+.lede { color: var(--muted); max-width: 70ch; margin-top: 10px; }
+code, .mono { font-family: var(--mono); font-size: 0.9em; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 18px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend svg { width: 38px; height: 10px; }
+section { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+figure { margin: 0; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+figcaption { color: var(--muted); font-size: 13.5px; max-width: 80ch; }
+.scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.dg { display: block; width: 100%; height: auto; min-width: 980px; }
+.dg2 { min-width: 900px; } .dg3 { min-width: 900px; }
+/* diagram parts */
+.life { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
+.lane-box { fill: var(--surface2); stroke: var(--line); }
+.lane-t { fill: var(--fg); font: 600 13px var(--sans); } .lane-s { fill: var(--muted); font: 11px var(--sans); }
+.sep { stroke: var(--line); stroke-width: 1; } .tag { fill: var(--muted); font: 600 10px var(--sans); letter-spacing: 0.12em; }
+.a-flow { stroke: var(--ink); stroke-width: 1.6; fill: none; }
+.a-conf { stroke: var(--config); stroke-width: 1.7; stroke-dasharray: 6 4; fill: none; }
+.a-llm { stroke: var(--llm); stroke-width: 2; fill: none; }
+.a-llmr { stroke: var(--llm); stroke-width: 1.8; stroke-dasharray: 2 4; fill: none; }
+.mk-flow { fill: var(--ink); } .mk-conf { fill: var(--config); } .mk-llm { fill: var(--llm); }
+.c-flow { fill: var(--ink); } .c-conf { fill: var(--config); } .c-llm { fill: var(--llm); }
+.num { fill: var(--surface); font: 700 10px var(--sans); }
+.lbl { fill: var(--fg); font: 12px var(--sans); } .lbl-conf { fill: var(--config); } .lbl-llm { fill: var(--llm); } .lbl2 { opacity: .8; }
+.box { fill: var(--surface); stroke: var(--line); stroke-width: 1.2; } .box-conf { fill: var(--surface); stroke: var(--config); stroke-width: 1.4; stroke-dasharray: 5 3; }
+.chip { fill: var(--surface2); stroke: var(--line); }
+.bt { fill: var(--fg); font: 700 13px var(--display); } .bl { fill: var(--fg); font: 12px var(--sans); } .bm { fill: var(--fg); font: 12px var(--mono); }
+/* stage notes */
+.stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.stage { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.stage ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+.reads { font-size: 13px; color: var(--config); border-top: 1px dashed var(--line); padding-top: 9px; }
+.reads b { font-weight: 600; }
+.steps { color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0.04em; }
+/* tables */
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 760px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 600 12px var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); background: var(--surface2); }
+tr:last-child td { border-bottom: 0; }
+td.num { font-variant-numeric: tabular-nums; }
+.st-ok { color: var(--accent); font-weight: 600; } .st-warn { color: var(--config); font-weight: 600; } .st-no { color: var(--muted); font-weight: 600; }
+.note { font-size: 13px; color: var(--muted); }
+.edge { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.edge div { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; font-size: 14px; }
+.edge b { display: block; margin-bottom: 2px; font-family: var(--display); }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Feedback pipeline</h1>
+  <p class="lede">One persona from start to finish: a Youth CSV exported from Mitra, uploaded through the API, stored, and turned into DOTS metadata fields by one LLM call per session. Everything drawn in amber is read from the database when it runs. It is not in code.</p>
+  <div class="legend" aria-label="Legend">
+    <span><svg viewBox="0 0 38 10"><line class="a-flow" x1="0" y1="5" x2="38" y2="5"/></svg>data moves</span>
+    <span><svg viewBox="0 0 38 10"><line class="a-conf" x1="0" y1="5" x2="38" y2="5"/></svg>config read from Postgres</span>
+    <span><svg viewBox="0 0 38 10"><line class="a-llm" x1="0" y1="5" x2="38" y2="5"/></svg>LLM call</span>
+  </div>
+</header>
+
+<section>
+  <h2>The whole path</h2>
+  <figure>
+    <div class="scroll"><svg class="dg" viewBox="0 0 1200 804" role="img" aria-label="Sequence of one Youth CSV upload from the operator through the API, Kafka, the consumer, Postgres, Temporal and the LLM, ending in a manual SQL export. Amber dashed arrows are config reads.">
+<defs><marker id="mf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-flow" d="M0 0L10 5L0 10z"/></marker><marker id="mc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-conf" d="M0 0L10 5L0 10z"/></marker><marker id="ml" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-llm" d="M0 0L10 5L0 10z"/></marker></defs>
+<line class="life" x1="85" y1="60" x2="85" y2="794"/>
+<rect class="lane-box" x="23" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="85" y="31" text-anchor="middle">Operator</text>
+<text class="lane-s" x="85" y="48" text-anchor="middle">curl or UI</text>
+<line class="life" x1="230" y1="60" x2="230" y2="794"/>
+<rect class="lane-box" x="168" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="230" y="31" text-anchor="middle">API</text>
+<text class="lane-s" x="230" y="48" text-anchor="middle">FastAPI</text>
+<line class="life" x1="375" y1="60" x2="375" y2="794"/>
+<rect class="lane-box" x="313" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="375" y="31" text-anchor="middle">Object storage</text>
+<text class="lane-s" x="375" y="48" text-anchor="middle">GCS bucket</text>
+<line class="life" x1="520" y1="60" x2="520" y2="794"/>
+<rect class="lane-box" x="458" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="520" y="31" text-anchor="middle">Kafka</text>
+<text class="lane-s" x="520" y="48" text-anchor="middle">raw + DLQ topics</text>
+<line class="life" x1="665" y1="60" x2="665" y2="794"/>
+<rect class="lane-box" x="603" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="665" y="31" text-anchor="middle">Consumer</text>
+<text class="lane-s" x="665" y="48" text-anchor="middle">Kafka to Postgres</text>
+<line class="life" x1="810" y1="60" x2="810" y2="794"/>
+<rect class="lane-box" x="748" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="810" y="31" text-anchor="middle">Postgres</text>
+<text class="lane-s" x="810" y="48" text-anchor="middle">analytics_db</text>
+<line class="life" x1="955" y1="60" x2="955" y2="794"/>
+<rect class="lane-box" x="893" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="955" y="31" text-anchor="middle">Temporal worker</text>
+<text class="lane-s" x="955" y="48" text-anchor="middle">activities</text>
+<line class="life" x1="1100" y1="60" x2="1100" y2="794"/>
+<rect class="lane-box" x="1038" y="12" width="124" height="46" rx="6"/>
+<text class="lane-t" x="1100" y="31" text-anchor="middle">OpenRouter</text>
+<text class="lane-s" x="1100" y="48" text-anchor="middle">LLM</text>
+<line class="sep" x1="10" y1="311" x2="1190" y2="311"/>
+<line class="sep" x1="10" y1="495" x2="1190" y2="495"/>
+<line class="sep" x1="10" y1="541" x2="1190" y2="541"/>
+<line class="sep" x1="10" y1="725" x2="1190" y2="725"/>
+<text class="tag" x="1192" y="92" text-anchor="end">UPLOAD</text>
+<text class="tag" x="1192" y="322" text-anchor="end">INGEST</text>
+<text class="tag" x="1192" y="506" text-anchor="end">TRIGGER</text>
+<text class="tag" x="1192" y="552" text-anchor="end">EXTRACT</text>
+<text class="tag" x="1192" y="736" text-anchor="end">EXPORT</text>
+<line class="a-flow" x1="95" y1="104" x2="226" y2="104" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="85" cy="104" r="9"/>
+<text class="num" x="85" y="107.5" text-anchor="middle">1</text>
+<text class="lbl" x="157.5" y="96" text-anchor="middle">POST /v1/upload</text>
+<text class="lbl lbl2" x="157.5" y="120" text-anchor="middle">CSV · Youth · mitra</text>
+<line class="a-conf" x1="240" y1="150" x2="806" y2="150" marker-end="url(#mc)"/>
+<circle class="c-conf" cx="230" cy="150" r="9"/>
+<text class="num" x="230" y="153.5" text-anchor="middle">2</text>
+<text class="lbl lbl-conf" x="520.0" y="142" text-anchor="middle">read config: size cap, columns, ingestion_schema</text>
+<line class="a-flow" x1="240" y1="196" x2="371" y2="196" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="230" cy="196" r="9"/>
+<text class="num" x="230" y="199.5" text-anchor="middle">3</text>
+<text class="lbl" x="302.5" y="188" text-anchor="middle">store CSV</text>
+<line class="a-flow" x1="240" y1="242" x2="806" y2="242" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="230" cy="242" r="9"/>
+<text class="num" x="230" y="245.5" text-anchor="middle">4</text>
+<text class="lbl" x="520.0" y="234" text-anchor="middle">csv_uploads row + delta check</text>
+<line class="a-flow" x1="240" y1="288" x2="516" y2="288" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="230" cy="288" r="9"/>
+<text class="num" x="230" y="291.5" text-anchor="middle">5</text>
+<text class="lbl" x="375.0" y="280" text-anchor="middle">1 event per new or grown session</text>
+<text class="lbl lbl2" x="375.0" y="304" text-anchor="middle">bad session → DLQ topic</text>
+<line class="a-flow" x1="530" y1="334" x2="661" y2="334" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="520" cy="334" r="9"/>
+<text class="num" x="520" y="337.5" text-anchor="middle">6</text>
+<text class="lbl" x="592.5" y="326" text-anchor="middle">consume</text>
+<line class="a-conf" x1="675" y1="380" x2="806" y2="380" marker-end="url(#mc)"/>
+<circle class="c-conf" cx="665" cy="380" r="9"/>
+<text class="num" x="665" y="383.5" text-anchor="middle">7</text>
+<text class="lbl lbl-conf" x="737.5" y="372" text-anchor="middle">ingestion_schema</text>
+<line class="a-flow" x1="675" y1="426" x2="806" y2="426" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="665" cy="426" r="9"/>
+<text class="num" x="665" y="429.5" text-anchor="middle">8</text>
+<text class="lbl" x="737.5" y="418" text-anchor="middle">upsert 3 tables</text>
+<line class="a-conf" x1="675" y1="472" x2="806" y2="472" marker-end="url(#mc)"/>
+<circle class="c-conf" cx="665" cy="472" r="9"/>
+<text class="num" x="665" y="475.5" text-anchor="middle">9</text>
+<text class="lbl lbl-conf" x="737.5" y="464" text-anchor="middle">process_steps</text>
+<line class="a-flow" x1="675" y1="518" x2="951" y2="518" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="665" cy="518" r="9"/>
+<text class="num" x="665" y="521.5" text-anchor="middle">10</text>
+<text class="lbl" x="810.0" y="510" text-anchor="middle">start processing workflow</text>
+<line class="a-conf" x1="945" y1="564" x2="814" y2="564" marker-end="url(#mc)"/>
+<circle class="c-conf" cx="955" cy="564" r="9"/>
+<text class="num" x="955" y="567.5" text-anchor="middle">11</text>
+<text class="lbl lbl-conf" x="882.5" y="556" text-anchor="middle">load conversation</text>
+<text class="lbl lbl-conf lbl2" x="882.5" y="580" text-anchor="middle">+ config + prompt</text>
+<line class="a-llm" x1="965" y1="610" x2="1096" y2="610" marker-end="url(#ml)"/>
+<circle class="c-llm" cx="955" cy="610" r="9"/>
+<text class="num" x="955" y="613.5" text-anchor="middle">12</text>
+<text class="lbl lbl-llm" x="1027.5" y="602" text-anchor="middle">1 call: prompt +</text>
+<text class="lbl lbl-llm lbl2" x="1027.5" y="626" text-anchor="middle">full conversation</text>
+<line class="a-llmr" x1="1090" y1="656" x2="959" y2="656" marker-end="url(#ml)"/>
+<circle class="c-llm" cx="1100" cy="656" r="9"/>
+<text class="num" x="1100" y="659.5" text-anchor="middle">13</text>
+<text class="lbl lbl-llm" x="1027.5" y="648" text-anchor="middle">JSON: fields + pii</text>
+<line class="a-flow" x1="945" y1="702" x2="814" y2="702" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="955" cy="702" r="9"/>
+<text class="num" x="955" y="705.5" text-anchor="middle">14</text>
+<text class="lbl" x="882.5" y="694" text-anchor="middle">write rows + pii flag</text>
+<text class="lbl lbl2" x="882.5" y="718" text-anchor="middle">+ llm_logs, status</text>
+<line class="a-flow" x1="95" y1="748" x2="806" y2="748" marker-end="url(#mf)"/>
+<circle class="c-flow" cx="85" cy="748" r="9"/>
+<text class="num" x="85" y="751.5" text-anchor="middle">15</text>
+<text class="lbl" x="447.5" y="740" text-anchor="middle">manual SQL pivot, excludes PII = TRUE</text>
+</svg></div>
+    <figcaption>Fifteen steps in five stages. Steps 2, 7, 9 and 11 are config reads, and step 12 is the only model call. Operator and Postgres talk twice: the CSV goes in at step 1 and the export comes out at step 15.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>What happens in each stage</h2>
+  <div class="stages">
+    <div class="stage">
+      <h3>Upload</h3><div class="steps">STEPS 1 TO 5</div>
+      <ul>
+        <li>The operator posts the CSV with <code>report_type=feedback</code>, <code>leader_category=Youth</code>, <code>source=mitra</code>. One upload is one persona.</li>
+        <li>The API finds the program and persona and loads the active upload config once. Before anything is stored it checks the file size, the required columns, and that every row has <code>session_type = Youth_Voice</code>.</li>
+        <li>The CSV goes to object storage and a <code>csv_uploads</code> row is written. A delta check against stored sessions sorts each one into new, grown (re-sent in full) or unchanged. Unchanged ones are skipped.</li>
+        <li>One Kafka event per new or grown session, checked against the config's <code>ingestion_schema</code>. A bad session goes to the DLQ topic with its identifiers and never blocks the others. Each event carries the persona, the bot id (required, a positive integer; a file without it is rejected) and the questionnaire version for the session's start date; for a Mitra bot session the version that is STORED is the rank of its bot id inside the persona (lowest bot id = V1), see below.</li>
+      </ul>
+      <p class="reads"><b>Reads:</b> <code>columns</code>, <code>opening_row</code>, <code>closing_keys</code>, <code>bot_sender_ids</code>, <code>max_csv_upload_bytes</code>, <code>ingestion_schema</code>, <code>questionnaire_versions</code></p>
+    </div>
+    <div class="stage">
+      <h3>Ingest</h3><div class="steps">STEPS 6 TO 9</div>
+      <ul>
+        <li>The consumer checks the event again against <code>ingestion_schema</code> (cached for 60 seconds, so a burst does not query per event).</li>
+        <li>It writes <code>submissions</code>, <code>feedback_submissions</code> and <code>feedbacks</code> in one transaction. A session that grew gets its <code>pii_detected</code> reset to NULL and goes back to pending.</li>
+        <li>It reads <code>process_steps</code>. An empty list marks the session <code>success</code> right away. The seed lists the extraction step for every persona, so on a new database each ingested session starts the workflow; an existing database keeps the list it has.</li>
+      </ul>
+      <p class="reads"><b>Reads:</b> <code>ingestion_schema</code>, <code>process_steps</code></p>
+    </div>
+    <div class="stage">
+      <h3>Trigger</h3><div class="steps">STEP 10</div>
+      <ul>
+        <li>The consumer starts <code>ConfigDrivenProcessingWorkflow</code> with the id <code>realtime-&lt;submission&gt;-&lt;tenant&gt;</code> on the Temporal task queue. In batch mode a scheduled sweep starts it for pending sessions instead.</li>
+        <li>The workflow sets the status to processing and runs each listed step by name, with up to 3 attempts per activity.</li>
+      </ul>
+    </div>
+    <div class="stage">
+      <h3>Extract</h3><div class="steps">STEPS 11 TO 14</div>
+      <ul>
+        <li>The activity loads the whole conversation in order, the Youth extraction config, and the prompt named in that config.</li>
+        <li>Before the call, code looks in the respondent's text for numbers, emails, @handles and links and replaces each with a placeholder such as <code>[number removed]</code>, so none of them is sent to OpenRouter. One call to OpenRouter then returns JSON with the persona's fields and a PII flag. Code validates it strictly: values must fit the configured bands or the integer range, placeholders such as "N/A" become not provided, anything else is stored as unmapped with the raw words kept.</li>
+        <li>Optional, switched on by <code>pii.masking_prompt_name</code> (seeded for the four personas): a second call, before the extraction call, sends the questions and answers as one JSON keyed by the answer's sequence number to the feedback PII and abusive-language prompt. The extraction call reads the <strong>original</strong> conversation (<code>pii.extraction_text</code>, default <code>original</code>), so <code>raw_value</code> holds the respondent's own words and is internal only; <code>pii_detected</code> follows what the masking call found, and the masked JSON, the only copy that may be shared, is kept in <code>meta_data.extraction.masking</code>. A bad masking answer fails and retries the session; the original text is never a fallback. Both calls ask for a short <code>justification</code> (per field, per finding), stored in <code>feedback_extracted_data.justification</code> and <code>meta_data.extraction.masking.findings</code>; the complete answers are kept in <code>meta_data.extraction.responses</code> (also for a flagged session), and an unusable answer in its failed <code>llm_logs</code> row. Temporal shows one activity; its stages (<code>pii_masking</code>, <code>metadata_extraction</code>) are in the heartbeat details, the result and <code>process_status</code>.</li>
+        <li>The same check is the PII backstop: a long run of digits (8 or more; separators and Unicode digits normalised; year ranges, amounts such as 2,50,000 and lists of small numbers excepted), an email, an @handle or a URL forces the flag on, whatever the model said. A flagged session keeps everything it extracted: the flag marks it, and the export query decides what to leave out.</li>
+        <li>One transaction writes <code>feedback_extracted_data</code>, <code>pii_detected</code>, <code>meta_data.extraction</code> and <code>llm_logs</code>. If the conversation changed during the call, nothing is written and the step retries.</li>
+      </ul>
+      <p class="reads"><b>Reads:</b> <code>fields</code>, <code>pii.types</code>, <code>llm</code>, <code>prompt_name</code>, the prompt text</p>
+    </div>
+    <div class="stage">
+      <h3>Export</h3><div class="steps">STEP 15</div>
+      <ul>
+        <li>A person runs a pivot query: one row per session, one column per DOTS field with a status column beside it.</li>
+        <li>The queries leave out sessions where <code>pii_detected</code> is true or still NULL. Sensitive columns (disability, disability type, household income) stay out of the export until product confirms.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Where each setting is read</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Setting</th><th>Stored in</th><th>Read by (step)</th><th>How to change it</th></tr></thead>
+    <tbody>
+      <tr><td>Size cap, columns, opening row, closing keys, bot sender ids</td><td><code>config_version</code> of <code>feedback_upload</code> · mitra · Youth_Voice</td><td>API (1, 2)</td><td>New config version: <code>tools/feedback_config.py set</code></td></tr>
+      <tr><td>Questionnaire version dates (Google Forms and sessions without a bot id; the event's version is also checked as input)</td><td>same config, <code>questionnaire_versions</code> (a form's own <code>questionnaire_version</code> for Google Forms)</td><td>API, when it stamps each event</td><td><code>tools/questionnaire_versions.py set</code> (after <code>detect</code>)</td></tr>
+      <tr><td>Questionnaire version of a Mitra bot session</td><td><code>feedback_submissions.questionnaire_version</code>, derived: the rank of <code>meta_data.bot_id</code> among the bot ids of its persona (tenant, program, session_type, source), numeric, lowest = V1</td><td>Consumer ingest (7), under a persona lock; a shifted session is relabelled and sent back through extraction in the same transaction</td><td>Nothing to set: a new questionnaire is a new bot id. <code>tools/questionnaire_versions.py restamp</code> repairs the labels</td></tr>
+      <tr><td>Event schema</td><td>same config, <code>ingestion_schema</code></td><td>API (5) and consumer (7)</td><td><code>tools/feedback_config.py set</code></td></tr>
+      <tr><td>Which steps run</td><td>same config, <code>process_steps</code></td><td>Consumer (9)</td><td><code>tools/feedback_config.py set</code></td></tr>
+      <tr><td>Fields, bands, guidance, PII types, model override, prompt name</td><td><code>config_version</code> of <code>feedback_extraction</code> · any · Youth_Voice</td><td>Worker (11)</td><td>New config version (SQL recipe in <code>docs/feedback-extraction-bands.md</code>)</td></tr>
+      <tr><td>Prompt text</td><td><code>prompts</code> + <code>prompt_version</code></td><td>Worker (11)</td><td>New prompt version, no deploy</td></tr>
+      <tr><td>Starting content of all of the above</td><td><code>seed_config.sql</code>, <code>seed_prompts.sql</code></td><td>App start, only when missing</td><td>Edit the file for fresh databases; existing ones keep their versions</td></tr>
+      <tr><td>Safety limits, output format, step names, cache time</td><td><b>Code</b>: PII backstop rules, message length limits, placeholder words, the JSON shape the model must return</td><td>Worker, consumer</td><td>Code change and deploy</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">The same extraction config serves Mitra and Google Forms sessions, because it reads the stored conversation. Upload configs are separate per source: Mitra for all four personas, Google Forms for three (Educator has no form).</p>
+</section>
+
+<section>
+  <h2>How the Youth prompt is chosen</h2>
+  <figure>
+    <div class="scroll"><svg class="dg dg2" viewBox="0 0 1120 350" role="img" aria-label="How the Youth prompt is chosen: the stored session names its persona, the persona config names a prompt, the prompt version is loaded and rendered with the persona fields and the conversation.">
+<defs><marker id="mf2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-flow" d="M0 0L10 5L0 10z"/></marker><marker id="mc2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-conf" d="M0 0L10 5L0 10z"/></marker><marker id="ml2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-llm" d="M0 0L10 5L0 10z"/></marker></defs>
+<rect class="box" x="10" y="30" width="218" height="120" rx="8"/>
+<text class="bt" x="24" y="54">1  Stored session</text>
+<text class="bm" x="24" y="78">feedback_submissions</text>
+<text class="bm" x="24" y="97">session_type = Youth_Voice</text>
+<text class="bl" x="24" y="116">program: 1M Voice / Youth</text>
+<line class="a-conf" x1="228" y1="90" x2="280" y2="90" marker-end="url(#mc2)"/><text class="lbl lbl-conf" x="254" y="80" text-anchor="middle">find</text>
+<rect class="box" x="280" y="30" width="270" height="168" rx="8"/>
+<text class="bt" x="294" y="54">2  Extraction config, active</text>
+<text class="bm" x="294" y="78">config + config_version</text>
+<text class="bm" x="294" y="97">feedback_extraction · any</text>
+<text class="bm" x="294" y="116">fields: 11 DOTS columns</text>
+<text class="bm" x="294" y="135">pii.types: name, phone, email</text>
+<text class="bm" x="294" y="154">llm: {} (model override)</text>
+<text class="bm" x="294" y="173">prompt_name: set per persona</text>
+<line class="a-conf" x1="550" y1="90" x2="640" y2="90" marker-end="url(#mc2)"/><text class="lbl lbl-conf" x="595" y="80" text-anchor="middle">prompt_name</text>
+<rect class="box" x="640" y="30" width="210" height="120" rx="8"/>
+<text class="bt" x="654" y="54">3  Prompt</text>
+<text class="bm" x="654" y="78">prompts + prompt_version</text>
+<text class="bl" x="654" y="97">name equals prompt_name</text>
+<text class="bl" x="654" y="116">highest active version</text>
+<line class="a-flow" x1="850" y1="90" x2="920" y2="90" marker-end="url(#mf2)"/><text class="lbl" x="885" y="80" text-anchor="middle">render</text>
+<rect class="box" x="920" y="30" width="190" height="196" rx="8"/>
+<text class="bt" x="934" y="54">4  Rendered prompt</text>
+<text class="bm" x="934" y="78">{{persona}}</text>
+<text class="bm" x="934" y="97">{{fields}}</text>
+<text class="bm" x="934" y="116">{{field_names}}</text>
+<text class="bm" x="934" y="135">{{pii_types}}</text>
+<text class="bm" x="934" y="154">{{output_format}}</text>
+<text class="bm" x="934" y="173">{{conversation}}</text>
+<text class="bl" x="934" y="192">(fenced by a content hash)</text>
+<polyline class="a-conf" points="415,198 415,250 1015,250 1015,228" fill="none" marker-end="url(#mc2)"/>
+<text class="lbl lbl-conf" x="715" y="242" text-anchor="middle">fields, bands, pii types fill the variables</text>
+<rect class="chip" x="10" y="278" width="350" height="56" rx="8"/><text class="bl" x="24" y="301">Named prompt missing: the run fails</text><text class="bl lbl2" x="24" y="320">No silent fallback to any other prompt.</text>
+<rect class="chip" x="385" y="278" width="350" height="56" rx="8"/><text class="bl" x="399" y="301">No prompt_name in the config: rejected</text><text class="bl lbl2" x="399" y="320">prompt_name is required; there is no default prompt.</text>
+<rect class="chip" x="760" y="278" width="350" height="56" rx="8"/><text class="bl" x="774" y="301">Model: step override, then config.llm, then .env</text><text class="bl lbl2" x="774" y="320">The first one that is set wins.</text>
+</svg></div>
+    <figcaption>The session names its persona, the persona's config names a prompt, and the prompt is rendered with that persona's fields. A Parent session takes the same path and ends at a different config and a different prompt.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>What gets stored</h2>
+  <figure>
+    <div class="scroll"><svg class="dg dg3" viewBox="0 0 1120 440" role="img" aria-label="Tables written for one session: submissions, feedback_submissions, feedbacks and feedback_extracted_data, plus llm_logs, with the config and prompt versions that produced each extraction row.">
+<defs><marker id="mf2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-flow" d="M0 0L10 5L0 10z"/></marker><marker id="mc2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-conf" d="M0 0L10 5L0 10z"/></marker><marker id="ml2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="mk-llm" d="M0 0L10 5L0 10z"/></marker></defs>
+<rect class="box" x="10" y="20" width="270" height="128" rx="8"/>
+<text class="bt" x="24" y="44">submissions</text>
+<text class="bm" x="24" y="68">submission_id, tenant_code</text>
+<text class="bm" x="24" y="87">status: pending → processing</text>
+<text class="bl" x="24" y="106">  → success or failed</text>
+<text class="bm" x="24" y="125">process_status: steps and times</text>
+<rect class="box" x="10" y="196" width="270" height="188" rx="8"/>
+<text class="bt" x="24" y="220">feedback_submissions</text>
+<text class="bm" x="24" y="244">session_type: Youth_Voice</text>
+<text class="bm" x="24" y="263">questionnaire_version: V1, V2 …</text>
+<text class="bm" x="24" y="282">source: mitra | google_forms</text>
+<text class="bm" x="24" y="301">completion_status</text>
+<text class="bm" x="24" y="320">pii_detected: NULL = not checked</text>
+<text class="bm" x="24" y="339">meta_data.extraction: ids, pii</text>
+<text class="bl" x="24" y="358">  types, run_at (no text)</text>
+<line class="a-flow" x1="145" y1="148" x2="145" y2="196" marker-end="url(#mf2)"/><text class="lbl" x="172" y="176" text-anchor="middle">1 : 1</text>
+<rect class="box" x="410" y="20" width="330" height="128" rx="8"/>
+<text class="bt" x="424" y="44">feedbacks</text>
+<text class="bl" x="424" y="68">one row per message</text>
+<text class="bm" x="424" y="87">sequence, question_key, is_follow_up</text>
+<text class="bm" x="424" y="106">message, translated_message</text>
+<text class="bm" x="424" y="125">parent_id: answer → its question</text>
+<line class="a-flow" x1="280" y1="84" x2="410" y2="84" marker-end="url(#mf2)"/><text class="lbl" x="345" y="74" text-anchor="middle">1 : n messages</text>
+<rect class="box" x="410" y="196" width="330" height="224" rx="8"/>
+<text class="bt" x="424" y="220">feedback_extracted_data</text>
+<text class="bl" x="424" y="244">one row per session per field</text>
+<text class="bm" x="424" y="263">field_name: age, state, gender …</text>
+<text class="bm" x="424" y="282">value: the band, or NULL</text>
+<text class="bm" x="424" y="301">raw_value: what the model returned</text>
+<text class="bm" x="424" y="320">status: extracted | not_provided</text>
+<text class="bl" x="424" y="339">  | unmapped</text>
+<text class="bm" x="424" y="358">confidence, extracted_at</text>
+<text class="bm" x="424" y="377">config_version_id, prompt_version_id</text>
+<text class="bl" x="424" y="396">unique (session, field): re-run replaces</text>
+<line class="a-flow" x1="280" y1="300" x2="410" y2="300" marker-end="url(#mf2)"/><text class="lbl" x="345" y="290" text-anchor="middle">1 : n fields</text>
+<rect class="box" x="860" y="20" width="250" height="110" rx="8"/>
+<text class="bt" x="874" y="44">llm_logs</text>
+<text class="bl" x="874" y="68">one row per call</text>
+<text class="bl" x="874" y="87">model and token counts</text>
+<text class="bl" x="874" y="106">status; no prompt or answer text</text>
+<rect class="box box-conf" x="860" y="196" width="250" height="80" rx="8"/>
+<text class="bt" x="874" y="220">config_version</text>
+<text class="bl" x="874" y="244">extraction config that was active</text>
+<text class="bl" x="874" y="263">(fields, bands, prompt_name)</text>
+<rect class="box box-conf" x="860" y="322" width="250" height="80" rx="8"/>
+<text class="bt" x="874" y="346">prompt_version</text>
+<text class="bl" x="874" y="370">prompt text that was rendered</text>
+<text class="bl" x="874" y="389">(Youth prompt, highest active)</text>
+<line class="a-conf" x1="860" y1="236" x2="740" y2="236" marker-end="url(#mc2)"/><text class="lbl lbl-conf" x="800" y="226" text-anchor="middle">config_version_id</text>
+<line class="a-conf" x1="860" y1="362" x2="740" y2="362" marker-end="url(#mc2)"/><text class="lbl lbl-conf" x="800" y="352" text-anchor="middle">prompt_version_id</text>
+</svg></div>
+    <figcaption>Every extraction row points at the config version and prompt version that produced it, so a later band or prompt change never hides which rules a row followed.</figcaption>
+  </figure>
+  <h3 class="nocase">Example rows in <code>feedback_extracted_data</code> (made-up values, not a real respondent)</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>field_name</th><th>value</th><th>raw_value</th><th>status</th><th>why</th></tr></thead>
+    <tbody>
+      <tr><td><code>age</code></td><td>&ge; 16 and &lt; 22</td><td>17</td><td class="st-ok">extracted</td><td>A number (decimals allowed) stored as the label of its band; the stated number stays in raw_value</td></tr>
+      <tr><td><code>state</code></td><td>Delhi</td><td>Delhi/NCR</td><td class="st-ok">extracted</td><td>Every spelling of Delhi (New Delhi, NCT, Delhi/NCR ...) is an alias mapped by the code</td></tr>
+      <tr><td><code>district</code></td><td>Mysuru</td><td>Mysuru</td><td class="st-ok">extracted</td><td>Free text, no reference list yet</td></tr>
+      <tr><td><code>current_activity_status</code></td><td>Studying, Working</td><td>in school, part time job</td><td class="st-ok">extracted</td><td>A multi-value field: labels in config order joined by ", ", each also in value_list</td></tr>
+      <tr><td><code>monthly_household_income</code></td><td>Unclear</td><td><span class="note">NULL</span></td><td class="st-warn">unmapped</td><td>Sensitive field (no words stored); the answer spans two bands</td></tr>
+      <tr><td><code>disability_type</code></td><td>Not answered</td><td><span class="note">NULL</span></td><td class="st-no">not_provided</td><td>Sensitive field; the question applies but nothing was stated. A value is never empty</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>When something goes wrong</h2>
+  <div class="edge">
+    <div><b>Unchanged session</b>Skipped at upload. Nothing is published and nothing is written.</div>
+    <div><b>Bad session in a file</b>Goes to the DLQ topic with its identifiers. The other sessions continue.</div>
+    <div><b>Config missing or invalid</b>The event is dead-lettered with a hint to run <code>feedback_config.py migrate</code> (or <code>migrate-legacy</code> for a database created before <code>session_type</code> existed) and replay it. A stored session is marked failed, not retried in a loop.</div>
+    <div><b>Session grew during the model call</b>The write is refused and the step retries on the new content. The PII flag is never left from older text.</div>
+    <div><b>LLM timeout longer than the activity allows</b>A timeout set in the extraction config that does not fit the activity time limit is shortened to fit, after subtracting the time the step already spent before the call (a warning names both numbers); the run is not refused. If a slow database used up the budget, no call is made and the step is retried. Set <code>llm_timeout_seconds</code> on the workflow step for a longer call.</div>
+    <div><b>Model or provider error</b>Provider text is stripped from errors and logs. Temporal retries up to 3 times, then the step fails.</div>
+    <div><b>Very long respondent message</b>Over the configured limit (default 20,000 characters per message, 200,000 per conversation): no model call, the session is flagged PII and its fields are stored as unmapped.</div>
+  </div>
+</section>
+</main>
+</body>
+</html>

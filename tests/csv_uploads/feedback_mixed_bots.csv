@@ -1,5 +1,5 @@
-bot_id,bot_name,session_status,session,submission_id,language,sequence,conversation_row_id,message,translated_message,created_at,updated_at,stage,receiver_id,sender_id,audio_file,file_url,other_params
-88,Synthetic Parent Bot,COMPLETED,eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,900101,hi,1,9021,[hi] a,a,2026-10-15T08:00:01.123456+05:30,2026-10-15T08:00:01.123456+05:30,STATE_IDENTIFICATION,1,120,,,
-88,Synthetic Parent Bot,COMPLETED,eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,900101,hi,2,9022,t,[hi] t,2026-10-15T08:00:02.123456+05:30,2026-10-15T08:00:02.123456+05:30,THANK_YOU,120,1,,,
-89,Synthetic General Bot,COMPLETED,ffffffffffffffffffffffffffffffff,900102,hi,1,9023,[hi] a,a,2026-10-15T08:00:01.123456+05:30,2026-10-15T08:00:01.123456+05:30,AGE_IDENTIFICATION,1,120,,,
-89,Synthetic General Bot,COMPLETED,ffffffffffffffffffffffffffffffff,900102,hi,2,9024,t,[hi] t,2026-10-15T08:00:02.123456+05:30,2026-10-15T08:00:02.123456+05:30,THANK_YOU,120,1,,,
+bot_id,bot_name,session_type,session_status,session,submission_id,language,sequence,conversation_row_id,message,translated_message,created_at,updated_at,stage,receiver_id,sender_id,audio_file,file_url,other_params
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,900101,hi,1,9021,[hi] a,a,2026-10-15T08:00:01.123456+05:30,2026-10-15T08:00:01.123456+05:30,STATE_IDENTIFICATION,1,120,,,
+88,Synthetic Parent Bot,Parent_Voice,COMPLETED,eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,900101,hi,2,9022,t,[hi] t,2026-10-15T08:00:02.123456+05:30,2026-10-15T08:00:02.123456+05:30,THANK_YOU,120,1,,,
+89,Synthetic General Bot,General_Public_Voice,COMPLETED,ffffffffffffffffffffffffffffffff,900102,hi,1,9023,[hi] a,a,2026-10-15T08:00:01.123456+05:30,2026-10-15T08:00:01.123456+05:30,AGE_IDENTIFICATION,1,120,,,
+89,Synthetic General Bot,General_Public_Voice,COMPLETED,ffffffffffffffffffffffffffffffff,900102,hi,2,9024,t,[hi] t,2026-10-15T08:00:02.123456+05:30,2026-10-15T08:00:02.123456+05:30,THANK_YOU,120,1,,,

@@ -17,7 +17,21 @@ with workflow.unsafe.imports_passed_through():
     from app.temporal.story_rating_activity import story_rating_activity
     from app.temporal.statement_category_activity import statement_category_activity
     from app.temporal.migration_activity import run_migration_activity
+    from app.temporal.feedback_extraction_activity import feedback_metadata_extraction_activity
+    from app.services.feedback_extraction_constants import extraction_activity_timeout_seconds
+    from app.services.feedback_config_validation import FEEDBACK_PROCESS_STEP_NAMES
     from app.config import settings
+
+def _failure_stages(error: BaseException) -> Optional[list]:
+    """The stage list the extraction activity attached to its failure (ApplicationError details `{"stages": [...]}`,
+    reached through the ActivityError's cause), or None when the failure carries none."""
+    details = getattr(getattr(error, "cause", None), "details", None)
+    if isinstance(details, (list, tuple)) and len(details) > 0 and isinstance(details[0], dict):
+        stages = details[0].get("stages")
+        if isinstance(stages, list):
+            return stages
+    return None
+
 
 @workflow.defn
 class ConfigDrivenProcessingWorkflow:
@@ -191,6 +205,35 @@ class ConfigDrivenProcessingWorkflow:
                     completed_steps.append("statement_category")
                     workflow.logger.info(f"Completed workflow step: '{step_name}' with status: {status_val}")
 
+                elif step_name in FEEDBACK_PROCESS_STEP_NAMES:      # the registry the config validator uses (today: the extraction step)
+                    # The activity budget follows the effective LLM timeout (the step's llm_timeout_seconds, else the
+                    # global one) plus a margin, bounded (workflow code cannot read the extraction config); the activity
+                    # clamps a longer `llm.timeout_seconds` of that config to the budget and logs a warning. A step
+                    # that needs a longer call sets llm_timeout_seconds.
+                    step_llm_timeout = llm_overrides["llm_timeout_seconds"]
+                    effective_llm_timeout = step_llm_timeout if step_llm_timeout is not None else settings.LLM_TIMEOUT_SECONDS
+                    res = await workflow.execute_activity(
+                        feedback_metadata_extraction_activity,
+                        {
+                            "submission_id": submission_id,
+                            "tenant_code": tenant_code,
+                            "analysis_type": step_name,
+                            **llm_overrides,
+                        },
+                        start_to_close_timeout=timedelta(
+                            seconds=extraction_activity_timeout_seconds(effective_llm_timeout)),
+                        retry_policy=retry_policy
+                    )
+                    status_val = res.get("status", "success") if isinstance(res, dict) else "success"
+                    steps_execution[idx]["status"] = status_val
+                    steps_execution[idx]["completed_timestamp"] = workflow.now().isoformat()
+                    stages = res.get("stages") if isinstance(res, dict) else None
+                    if isinstance(stages, list):
+                        # what each LLM stage of the one activity did (pii_masking, metadata_extraction)
+                        steps_execution[idx]["stages"] = stages
+                    completed_steps.append(step_name)
+                    workflow.logger.info(f"Completed workflow step: '{step_name}' with status: {status_val}")
+
                 else:
                     unsupported_err = f"Unsupported step name: {step_name}"
                     steps_execution[idx]["status"] = "failed"
@@ -225,6 +268,10 @@ class ConfigDrivenProcessingWorkflow:
                         s["status"] = "failed"
                         s["error"] = str(e)
                         s["completed_timestamp"] = workflow.now().isoformat()
+                        failed_stages = _failure_stages(e)
+                        if failed_stages is not None and s["name"] in FEEDBACK_PROCESS_STEP_NAMES:
+                            # the stages the extraction activity reached before it failed (it attaches them to its error)
+                            s["stages"] = failed_stages
                         break
 
             # Mark remaining pending steps as skipped

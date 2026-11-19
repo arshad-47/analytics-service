@@ -16,6 +16,9 @@
   },
   "data": {
     "source": "google_forms",
+    "adapter": "wide_form",
+    "sessionType": "Youth_Voice",
+    "questionnaireVersion": "V1",
     "language": "en",
     "completionStatus": "COMPLETED",
     "submissionDate": "2026-10-02T10:09:20.000Z",

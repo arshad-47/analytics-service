@@ -6,13 +6,19 @@ from typing import Dict, Any, Optional, List
 import asyncpg
 from datetime import datetime, timezone
 
+from app.database.feedback_bot_versions import (
+    apply_bot_version_ranks, label_for_incoming_bot, lock_personas, lock_submission)
+from app.services.feedback_adapter_config import is_safe_code, is_safe_id, source_label_problem
 from app.services.feedback_constants import (
+    ADAPTERS,
     COMPLETION_COMPLETED,
     COMPLETION_STATUSES,
     FEEDBACK_REPORT_TYPE,
-    FEEDBACK_SOURCES,
-    SOURCE_GOOGLE_FORMS,
+    MAX_SEQUENCE,
+    NATURAL_KEY_ADAPTERS,
 )
+from app.services.feedback_versions import bot_id_problem
+from app.services.ingestion_validation import is_uuid
 
 logger = logging.getLogger("analytics_service.operations")
 
@@ -146,19 +152,38 @@ async def insert_statement_with_parent_check(
         logger.info(f"Statement [{new_id}] stored with no duplicate found.")
 
 
+class TenantOwnershipError(ValueError):
+    """An event names a leader category / program id that already belongs to ANOTHER tenant."""
+
+
+def _present(value: Any) -> bool:
+    """A value the event really carries: not None and not the empty string (explicit, never truthiness)."""
+    return value is not None and value != ""
+
+
+def _no_row_written(command_tag: Any) -> bool:
+    """True when an INSERT ... ON CONFLICT DO UPDATE ... WHERE ran but wrote no row (command tag 'INSERT 0 0'): the
+    conflicting row exists and its WHERE (same tenant) was false."""
+    return isinstance(command_tag, str) and command_tag.startswith("INSERT") and command_tag.endswith(" 0")
+
+
 async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant_code: str) -> tuple:
     """
     Safely upserts parent metadata tables: tenant, leader_category, and programs.
     Reads from the new top-level `tags` dict with flattened keys.
     Returns (program_id, leader_id) as UUIDs.
+
+    Tenant isolation: an existing tenant is never renamed (a first event only creates it), and the conflict update of
+    a leader category / program applies ONLY to a row of the same tenant. An event of tenant A that names an id owned
+    by tenant B raises TenantOwnershipError (nothing of B is changed) instead of renaming B's rows.
     """
-    # 1. Upsert Tenant
+    # 1. Create the tenant if it is new; never rename an existing one.
     tenant_name = tenant_code.capitalize()
     await conn.execute(
         """
         INSERT INTO tenant (name, code)
         VALUES ($1, $2)
-        ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
+        ON CONFLICT (code) DO NOTHING
         """,
         tenant_name, tenant_code
     )
@@ -168,41 +193,61 @@ async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant
 
     # 2. Upsert Leader Category (from flattened tags)
     leader_id = tags.get("leaderCategoryId")
-    if leader_id:
-        await conn.execute(
+    if _present(leader_id):
+        result = await conn.execute(
             """
             INSERT INTO leader_category (id, name, description, tenant_code)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (id) DO UPDATE SET 
-                name = EXCLUDED.name, 
-                description = EXCLUDED.description, 
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
                 updated_at = now()
+            WHERE leader_category.tenant_code = EXCLUDED.tenant_code
             """,
             leader_id,
             tags.get("leaderCategoryName", ""),
-            None,  # TODO: description can be added once the PM provides it 
+            None,  # TODO: description can be added once the PM provides it
             tenant_code
         )
+        if _no_row_written(result):
+            raise TenantOwnershipError(
+                f"leaderCategoryId {leader_id} belongs to another tenant than {tenant_code!r}; rejecting the event."
+            )
 
     # 3. Upsert Programs (depends on leader category)
     program_id = tags.get("programId")
-    if program_id and leader_id:
-        await conn.execute(
+    if _present(program_id) and not _present(leader_id):
+        # No leader category in the event, so the program is not written (programs.leaders_id is NOT NULL). The id is
+        # still stored on the submission, and submissions.program_id has no tenant in its foreign key: an id that
+        # belongs to ANOTHER tenant must be refused here, exactly as the upsert below refuses it. A program that does
+        # not exist yet keeps the old behaviour (the id is returned unchanged).
+        owner = await conn.fetchrow("SELECT tenant_code FROM programs WHERE id = $1", program_id)
+        if owner is not None and owner["tenant_code"] != tenant_code:
+            raise TenantOwnershipError(
+                f"programId {program_id} belongs to another tenant than {tenant_code!r}; rejecting the event."
+            )
+    if _present(program_id) and _present(leader_id):
+        result = await conn.execute(
             """
             INSERT INTO programs (id, leaders_id, name, description, tenant_code)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id) DO UPDATE SET 
-                leaders_id = EXCLUDED.leaders_id, 
-                name = EXCLUDED.name, 
-                description = EXCLUDED.description, 
+            ON CONFLICT (id) DO UPDATE SET
+                leaders_id = EXCLUDED.leaders_id,
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
                 updated_at = now()
+            WHERE programs.tenant_code = EXCLUDED.tenant_code
             """,
             program_id,
             leader_id,
             tags.get("programName", ""),
-            None,  # TODO: description can be added once the PM provides it 
+            None,  # TODO: description can be added once the PM provides it
             tenant_code
         )
+        if _no_row_written(result):
+            raise TenantOwnershipError(
+                f"programId {program_id} belongs to another tenant than {tenant_code!r}; rejecting the event."
+            )
 
     return program_id, leader_id
 
@@ -280,7 +325,7 @@ def is_feedback_type(submission_type: Any) -> bool:
 
 
 class _FeedbackAlreadyStored(Exception):
-    """Internal signal: a Google Forms response with this source_ref is already stored. Raised inside the
+    """Internal signal: a natural-key (wide_form) response with this source_ref is already stored. Raised inside the
     transaction so everything written so far rolls back, then handled as a no-op by the caller."""
 
 
@@ -292,7 +337,7 @@ def _is_source_ref_violation(error: asyncpg.exceptions.UniqueViolationError) -> 
 async def _find_stored_gforms_response(
     conn: asyncpg.Connection, tenant_code: str, source_ref: str
 ) -> Optional[Dict[str, Any]]:
-    """The stored submission of a Google Forms response, looked up by its natural key (None if new)."""
+    """The stored submission of a natural-key (wide_form) response, looked up by its natural key (None if new)."""
     return await conn.fetchrow(
         """
         SELECT s.id, s.submission_id, s.tenant_code, s.status
@@ -305,7 +350,7 @@ async def _find_stored_gforms_response(
 
 
 def _already_stored_result(stored: Dict[str, Any]) -> Dict[str, Any]:
-    """The unchanged result for a Google Forms response that is already stored (nothing was written)."""
+    """The unchanged result for a natural-key response that is already stored (nothing was written)."""
     return {
         "id": stored["id"],
         "submission_id": stored["submission_id"],
@@ -352,8 +397,8 @@ def _parse_feedback_messages(raw_messages: Any) -> List[Dict[str, Any]]:
         if not isinstance(raw, dict):
             raise ValueError(f"{where} must be an object, got {type(raw).__name__}")
         sequence = raw.get("sequence")
-        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
-            raise ValueError(f"{where}.sequence must be an integer >= 1, got {sequence!r}")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1 or sequence > MAX_SEQUENCE:
+            raise ValueError(f"{where}.sequence must be an integer from 1 to {MAX_SEQUENCE}")
         if sequence in seen_sequences:
             raise ValueError(f"{where}.sequence {sequence} appears more than once in the event")
         seen_sequences.add(sequence)
@@ -366,7 +411,7 @@ def _parse_feedback_messages(raw_messages: Any) -> List[Dict[str, Any]]:
         parent_sequence = raw.get("parentSequence")
         if parent_sequence is not None:
             if isinstance(parent_sequence, bool) or not isinstance(parent_sequence, int):
-                raise ValueError(f"{where}.parentSequence must be an integer or null, got {parent_sequence!r}")
+                raise ValueError(f"{where}.parentSequence must be an integer or null")
             if parent_sequence >= sequence:
                 raise ValueError(
                     f"{where}.parentSequence {parent_sequence} must be lower than its own sequence {sequence}"
@@ -398,11 +443,13 @@ async def _ingest_feedback_submission(
       4. parent_id pass from parentSequence (idempotent; null parentSequence leaves parent_id untouched)
     Both `create` (a first upload, or a re-upload of a grown session) and a repeated event take this path:
     a create on an existing session reconciles instead of being skipped.
-    Google Forms responses are immutable and identified by data.sourceRef (feedback_submissions.source_ref,
-    unique per tenant): a response whose sourceRef is already stored is a no-op that returns the stored
-    submission (whatever submissionId the event carries), and this also covers a concurrent writer that
-    stored it first (the unique violation rolls this event back and is treated as already stored).
-    A Google Forms event never updates an existing submission.
+    A source is a free label (the consumer already tied the event to an active upload config of that source). The
+    identity rules come from data.adapter, the adapter of that config: a natural-key adapter (wide_form) identifies a
+    response by data.sourceRef (feedback_submissions.source_ref, unique per tenant) and its responses are immutable: a
+    response whose sourceRef is already stored is a no-op that returns the stored submission (whatever submissionId
+    the event carries), and this also covers a concurrent writer that stored it first (the unique violation rolls
+    this event back and is treated as already stored). Such an event never updates an existing submission. For every
+    other adapter (conversation_rows) sourceRef must be absent and a session grows by id.
     Returns the usual dict plus `changed` (False when nothing was written) and per-table counts.
     """
     submission_id = str(event_payload["submissionId"])
@@ -410,6 +457,8 @@ async def _ingest_feedback_submission(
     submission_type = event_payload["submissionType"]
     session_id = event_payload.get("sessionId")
     tags = event_payload.get("tags", {})
+    if not is_safe_id(submission_id) or not is_safe_code(tenant_code):
+        raise ValueError("feedback event has an unsafe submissionId or tenantCode; rejecting it.")
     ident = f"submission {submission_id} (tenant {tenant_code}, session {session_id})"
 
     if event_type != "create":
@@ -419,28 +468,53 @@ async def _ingest_feedback_submission(
         )
     if not isinstance(session_id, str) or len(session_id.strip()) == 0:
         raise ValueError(f"feedback event requires a non-empty sessionId; rejecting {ident}.")
+    if not is_safe_id(session_id):
+        raise ValueError(f"feedback event has an unsafe sessionId; rejecting submission {submission_id}.")
 
     data = event_payload.get("data", {})
     source = data.get("source")
-    if source not in FEEDBACK_SOURCES:
-        raise ValueError(f"data.source must be one of {FEEDBACK_SOURCES}, got {source!r}; rejecting {ident}.")
+    source_problem = source_label_problem(source)
+    if source_problem is not None:
+        raise ValueError(f"data.source is invalid ({source_problem}); rejecting {ident}.")
+    adapter = data.get("adapter")
+    if adapter not in ADAPTERS:
+        raise ValueError(f"data.adapter must be one of {ADAPTERS}; rejecting {ident}.")
+    is_natural_key = adapter in NATURAL_KEY_ADAPTERS
     completion_status = data.get("completionStatus")
     if completion_status not in COMPLETION_STATUSES:
         raise ValueError(
             f"data.completionStatus must be one of {COMPLETION_STATUSES}, got {completion_status!r}; rejecting {ident}."
         )
     language = _optional_text(data.get("language"), "data.language")
+    session_type = data.get("sessionType")
+    if not isinstance(session_type, str) or len(session_type.strip()) == 0:
+        raise ValueError(f"data.sessionType must be a non-empty string; rejecting {ident}.")
+    questionnaire_version = data.get("questionnaireVersion")
+    if not isinstance(questionnaire_version, str) or len(questionnaire_version.strip()) == 0:
+        raise ValueError(f"data.questionnaireVersion must be a non-empty string; rejecting {ident}.")
+    # The bot of a Mitra session (adapter conversation_rows) decides its questionnaire version: the stored version is
+    # the rank of its bot id among the bot ids of the persona, so the bot id is REQUIRED there and must be a positive
+    # integer written in digits (a numeric order must be well defined). Rejected here, before anything is written.
+    # A natural-key (wide_form) event carries no bot; botName is informational.
+    if not is_natural_key:
+        bot_problem = bot_id_problem(data.get("botId"))
+        if bot_problem is not None:
+            raise ValueError(f"data.botId is invalid for adapter {adapter} ({bot_problem}); rejecting {ident}.")
+    bot_info = {
+        key: value.strip()
+        for key, value in (("bot_id", data.get("botId")), ("bot_name", data.get("botName")))
+        if isinstance(value, str) and len(value.strip()) > 0
+    }
     source_ref = data.get("sourceRef")
-    is_gforms = source == SOURCE_GOOGLE_FORMS
-    if is_gforms:
+    if is_natural_key:
         if not isinstance(source_ref, str) or len(source_ref.strip()) == 0:
-            raise ValueError(f"data.sourceRef must be a non-empty string for a google_forms event; rejecting {ident}.")
+            raise ValueError(f"data.sourceRef must be a non-empty string for adapter {adapter}; rejecting {ident}.")
         if submission_id != session_id:
             raise ValueError(
-                f"a google_forms event must carry the same value as submissionId and sessionId; rejecting {ident}."
+                f"an event of adapter {adapter} must carry the same value as submissionId and sessionId; rejecting {ident}."
             )
     elif source_ref is not None:
-        raise ValueError(f"data.sourceRef must be absent or null unless data.source is google_forms; rejecting {ident}.")
+        raise ValueError(f"data.sourceRef must be absent or null for adapter {adapter}; rejecting {ident}.")
     messages = _parse_feedback_messages(data.get("messages"))
 
     submission_date = _parse_feedback_timestamp(data.get("submissionDate"), "data.submissionDate")
@@ -449,12 +523,12 @@ async def _ingest_feedback_submission(
     state = tags.get("state")
     district = tags.get("district")
 
-    if is_gforms:
+    if is_natural_key:
         # Already stored (by natural key)? Then there is nothing to do, whatever submissionId this event carries.
         stored = await _find_stored_gforms_response(conn, tenant_code, source_ref)
         if stored is not None:
             logger.info(
-                f"Google Forms response already stored as submission {stored['submission_id']} under tenant "
+                f"Natural-key (wide_form) response already stored as submission {stored['submission_id']} under tenant "
                 f"{tenant_code}; ignoring {ident}."
             )
             return _already_stored_result(stored)
@@ -465,28 +539,56 @@ async def _ingest_feedback_submission(
         if id_taken is not None:
             raise ValueError(
                 f"submission {submission_id} already exists under tenant {tenant_code} with a different "
-                f"sourceRef; a google_forms event never updates an existing submission; rejecting {ident}."
+                f"sourceRef; an event of adapter {adapter} never updates an existing submission; rejecting {ident}."
             )
 
     try:
         return await _write_feedback_submission(
             conn, event_payload, ident, source, source_ref, language, completion_status, messages,
-            submission_date, state, district,
+            submission_date, state, district, session_type.strip(), questionnaire_version.strip(), bot_info,
+            is_natural_key,
         )
     except _FeedbackAlreadyStored:
         pass
     except asyncpg.exceptions.UniqueViolationError as e:
-        if not (is_gforms and _is_source_ref_violation(e)):
+        if not (is_natural_key and _is_source_ref_violation(e)):
             raise
     # Only reached when a concurrent writer stored the same response first (the transaction was rolled back).
     stored = await _find_stored_gforms_response(conn, tenant_code, source_ref)
     if stored is None:
-        raise ValueError(f"google_forms response {source_ref!r} conflicted but is not stored; rejecting {ident}.")
+        raise ValueError(f"{adapter} response {source_ref!r} conflicted but is not stored; rejecting {ident}.")
     logger.info(
-        f"Google Forms response lost a write race: already stored as submission {stored['submission_id']} "
+        f"Natural-key (wide_form) response lost a write race: already stored as submission {stored['submission_id']} "
         f"under tenant {tenant_code}; ignoring {ident}."
     )
     return _already_stored_result(stored)
+
+
+def _persona_key(session_type: Any, source: Any, program_id: Any) -> tuple:
+    """What selects the extraction config of a session: session_type, source, program (a UUID in any spelling)."""
+    return (session_type, source, None if program_id is None else str(program_id).lower())
+
+
+async def _stored_persona(conn: asyncpg.Connection, submission_id: str, tenant_code: str) -> Optional[tuple]:
+    """
+    (_persona_key, questionnaire_version) of the stored feedback session, or None when it is not stored yet. Locks the
+    submissions row, then the feedback_submissions row, in the order of the extraction save
+    (feedback_extraction_operations.save_extraction); both values are read under those locks, so they are what the
+    last committed writer left.
+    """
+    program_text = await conn.fetchval(
+        "SELECT program_id::text FROM submissions WHERE submission_id = $1 AND tenant_code = $2 FOR NO KEY UPDATE",
+        submission_id, tenant_code,
+    )
+    stored = await conn.fetchval(
+        "SELECT json_build_array(session_type, source, questionnaire_version)::text FROM feedback_submissions "
+        "WHERE submission_id = $1 AND tenant_code = $2 FOR UPDATE",
+        submission_id, tenant_code,
+    )
+    if stored is None:
+        return None
+    session_type, source, version = json.loads(stored)
+    return _persona_key(session_type, source, program_text), version
 
 
 async def _write_feedback_submission(
@@ -501,6 +603,10 @@ async def _write_feedback_submission(
     submission_date: datetime,
     state: Any,
     district: Any,
+    session_type: str,
+    questionnaire_version: str,
+    bot_info: Dict[str, str],
+    is_natural_key: bool,
 ) -> Dict[str, Any]:
     """The transactional write of _ingest_feedback_submission (see there); one transaction, all or nothing."""
     submission_id = str(event_payload["submissionId"])
@@ -510,7 +616,53 @@ async def _write_feedback_submission(
     tags = event_payload.get("tags", {})
 
     async with conn.transaction():
+        # A Mitra bot session's questionnaire version is the rank of its bot id inside its persona (tenant, program,
+        # session_type, source). The persona advisory lock is the FIRST thing this transaction takes, before the metadata
+        # upserts, any row lock and the read of the bot ids, so two concurrent ingests of two new bots of one persona can
+        # not each rank without the other and no ingest can wait on the lock while holding a row another one needs (see
+        # app/database/feedback_bot_versions.py). A session that moves persona changes the ranks of its OLD persona too,
+        # so both are locked, in key order.
+        bot_id = None if is_natural_key else bot_info["bot_id"]
+        old_bot_persona = None
+        if bot_id is not None:
+            # Writers of this one session run one after the other: the persona it is stored in, read just below, is then
+            # the one the last committed writer left (so a session that moved is re-ranked in the persona it LEFT).
+            await lock_submission(conn, tenant_code, submission_id)
+            event_program = tags.get("programId")
+            event_program = event_program.strip().lower() if isinstance(event_program, str) and len(event_program.strip()) > 0 else None
+            if event_program is not None and not is_uuid(event_program):
+                raise ValueError(f"tags.programId must be a UUID; rejecting {ident}.")
+            before = await conn.fetchrow(
+                """
+                SELECT fs.session_type, fs.source, s.program_id::text AS program_id,
+                       (fs.meta_data ->> 'bot_id') IS NOT NULL AS has_bot
+                FROM feedback_submissions fs
+                JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
+                WHERE fs.submission_id = $1 AND fs.tenant_code = $2
+                """,
+                submission_id, tenant_code,
+            )
+            # the stored program stays when the event names none (the submissions upsert below COALESCEs)
+            effective_program = event_program if event_program is not None else (None if before is None else before["program_id"])
+            personas_to_lock = [(tenant_code, effective_program, session_type, source)]
+            if before is not None:
+                if before["has_bot"]:
+                    old_bot_persona = (tenant_code, before["program_id"], before["session_type"], before["source"])
+                    personas_to_lock.append(old_bot_persona)
+            await lock_personas(conn, personas_to_lock)
+
         program_id, leader_id = await upsert_metadata(conn, tags, tenant_code)
+
+        if bot_id is not None:
+            questionnaire_version = await label_for_incoming_bot(
+                conn, tenant_code, effective_program, session_type, source, submission_id, bot_id
+            )
+
+        # The persona the stored session had before this event (session_type, source, program): it selects the
+        # extraction config, prompt and closing keys. Read under the row locks in the order the extraction save takes
+        # them (submissions, then feedback_submissions), so a persona change below is seen exactly once.
+        stored_before = await _stored_persona(conn, submission_id, tenant_code)
+        persona_before, locked_version_before = (None, None) if stored_before is None else stored_before
 
         # 1. submissions. Unlike story/discussion this must not reset status/updated_at on every conflict,
         # so the update is conditional and keeps identity fields (session_id, submission_date) once set.
@@ -567,25 +719,36 @@ async def _write_feedback_submission(
         # event) never downgrades it. source/language are refreshed; language is kept when the event has none.
         fs_row = await conn.fetchrow(
             """
-            INSERT INTO feedback_submissions (submission_id, tenant_code, source, language, completion_status, source_ref)
-            VALUES ($1, $2, $3, $4, $5, $7)
+            INSERT INTO feedback_submissions (
+                submission_id, tenant_code, source, session_type, questionnaire_version,
+                language, completion_status, source_ref, meta_data
+            )
+            VALUES ($1, $2, $3, $8, $9, $4, $5, $7, $10::jsonb)
             ON CONFLICT (submission_id, tenant_code) DO UPDATE SET
                 source = EXCLUDED.source,
+                session_type = EXCLUDED.session_type,
+                questionnaire_version = EXCLUDED.questionnaire_version,
                 language = COALESCE(EXCLUDED.language, feedback_submissions.language),
                 completion_status = CASE
                     WHEN feedback_submissions.completion_status = $6 THEN feedback_submissions.completion_status
                     ELSE EXCLUDED.completion_status END,
+                meta_data = COALESCE(feedback_submissions.meta_data, '{}'::jsonb) || COALESCE(EXCLUDED.meta_data, '{}'::jsonb),
                 updated_at = now()
             WHERE feedback_submissions.source IS DISTINCT FROM EXCLUDED.source
+               OR feedback_submissions.session_type IS DISTINCT FROM EXCLUDED.session_type
+               OR feedback_submissions.questionnaire_version IS DISTINCT FROM EXCLUDED.questionnaire_version
                OR COALESCE(EXCLUDED.language, feedback_submissions.language) IS DISTINCT FROM feedback_submissions.language
                OR (feedback_submissions.completion_status <> $6
                    AND feedback_submissions.completion_status IS DISTINCT FROM EXCLUDED.completion_status)
+               OR (COALESCE(feedback_submissions.meta_data, '{}'::jsonb) || COALESCE(EXCLUDED.meta_data, '{}'::jsonb))
+                  IS DISTINCT FROM COALESCE(feedback_submissions.meta_data, '{}'::jsonb)
             RETURNING completion_status, (xmax = 0) AS inserted
             """,
             submission_id, tenant_code, source, language, completion_status, COMPLETION_COMPLETED, source_ref,
+            session_type, questionnaire_version, json.dumps(bot_info) if len(bot_info) > 0 else None,
         )
-        if source == SOURCE_GOOGLE_FORMS and (fs_row is None or not fs_row["inserted"]):
-            # Google Forms responses are immutable: a payload row that already existed (a concurrent writer
+        if is_natural_key and (fs_row is None or not fs_row["inserted"]):
+            # Natural-key (wide_form) responses are immutable: a payload row that already existed (a concurrent writer
             # stored this response between the pre-check and here) is never touched. Roll everything back.
             raise _FeedbackAlreadyStored()
         payload_changed = fs_row is not None
@@ -666,6 +829,70 @@ async def _write_feedback_submission(
             )
             parents_set = len(parent_rows)
 
+        persona_changed = False
+        if persona_before is not None:
+            program_now = await conn.fetchval(
+                "SELECT program_id FROM submissions WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            persona_changed = persona_before != _persona_key(session_type, source, program_now)
+        # The bot rank of the session itself changed (a redelivery with another bot id, or a lower bot id among the
+        # other sessions): what the older label's extraction wrote no longer describes it either.
+        # (compared with the version read under the row locks: an unlocked read could be one that a concurrent relabel
+        # of this session has since changed, and a valid extraction would be deleted for nothing)
+        version_changed = bot_id is not None and locked_version_before is not None and locked_version_before != questionnaire_version
+        if persona_changed or version_changed:
+            # The session moved to another persona (a redelivery that changed only session_type, source or program):
+            # what the OLD persona's extraction wrote no longer describes it. Drop its extracted fields and its
+            # extraction record, and go back to "not checked" (the PII flag), in this same transaction; the session
+            # goes back through processing below (the feedback_submissions row changed), so the new persona's
+            # extraction runs from scratch. llm_logs are an audit trail and stay.
+            await conn.execute(
+                "DELETE FROM feedback_extracted_data WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            await conn.execute(
+                "UPDATE feedback_submissions SET pii_detected = NULL, abusive_language = NULL, "
+                "meta_data = meta_data - 'extraction' "
+                "WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            # The state / district copied from the old extraction describe the old persona's answers: cleared,
+            # the new extraction writes them again (config `copy_to_submission`).
+            await conn.execute(
+                "UPDATE submissions SET state = NULL, district = NULL "
+                "WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+        elif len(upserted) > 0 or parents_set > 0:
+            # New or edited messages, or a changed parent link (a bot row can become a respondent row): the PII check
+            # of the older text no longer describes the session. Back to "not checked" (NULL) until the extraction
+            # runs again, so an export never trusts a stale flag.
+            await conn.execute(
+                "UPDATE feedback_submissions SET pii_detected = NULL, abusive_language = NULL "
+                "WHERE submission_id = $1 AND tenant_code = $2 "
+                "AND (pii_detected IS NOT NULL OR abusive_language IS NOT NULL)",
+                submission_id, tenant_code,
+            )
+
+        # The ranks of the persona(s) after this session: relabel every stored session whose label changed (a new bot id
+        # lower than stored ones shifts them) and send it back through processing; the old persona of a session that
+        # moved loses that session's bot id, which can shift its ranks too.
+        restamped: List[str] = []
+        reset: List[str] = []
+        if bot_id is not None:
+            program_final = await conn.fetchval(
+                "SELECT program_id::text FROM submissions WHERE submission_id = $1 AND tenant_code = $2",
+                submission_id, tenant_code,
+            )
+            personas = [(tenant_code, program_final, session_type, source)]
+            if old_bot_persona is not None and old_bot_persona != personas[0]:
+                personas.append(old_bot_persona)
+            for persona in personas:
+                applied = await apply_bot_version_ranks(conn, *persona)
+                restamped.extend(applied["restamped"])
+                reset.extend(applied["reset"])
+
         changed = submission_changed or payload_changed or len(upserted) > 0 or parents_set > 0
         if changed and db_sub_status != "pending":
             # New content: send the submission back through processing (same effect as a story update).
@@ -690,6 +917,12 @@ async def _write_feedback_submission(
         "messages_inserted": messages_inserted,
         "messages_updated": messages_updated,
         "parents_set": parents_set,
+        # other stored sessions of the persona whose questionnaire version moved with the bot ranks
+        "restamped_submission_ids": [sid for sid in restamped if sid != submission_id],
+        # the subset of those that was SET BACK TO 'pending' (a field is asked in one version only, so the stored
+        # extraction no longer describes it): the consumer dispatches exactly these after the commit. The others only
+        # got a new label and keep their extraction and status.
+        "reset_submission_ids": [sid for sid in reset if sid != submission_id],
     }
 
 
@@ -737,7 +970,7 @@ async def insert_or_update_submission(
         if sub_date_str:
             submission_date = datetime.fromisoformat(sub_date_str.replace("Z", "+00:00"))
         elif event_type != "update":
-            submission_date = datetime.utcnow()
+            submission_date = datetime.now(timezone.utc)
         else:
             submission_date = None
 
@@ -1080,6 +1313,40 @@ async def update_submission_status(
             """,
             submission_id, tenant_code, status
         )
+
+async def mark_pending_submission_config_failed(
+    conn: asyncpg.Connection, submission_id: str, tenant_code: str, reason: str
+) -> bool:
+    """
+    A feedback submission whose persona config cannot give its process steps is marked 'failed' with the reason in its
+    process_status (no retry_attempt is recorded, so the bulk retry picks it up once the config is fixed) instead of
+    staying 'pending': a pending row that can never be resolved would keep returning at the head of every batch
+    sweep and starve the other submissions. Identifiers and the config problem only, no content.
+
+    The write only applies to a row that is STILL 'pending'. The caller read it as pending and then awaited the config
+    lookup; in that window the Kafka consumer or a workflow may have moved the row to 'processing' (or it finished),
+    and a blind write would replace that state with 'failed', which a later retry sweep would take for a dead row and
+    start a second run on top of the live one. Returns True when the row was marked, False when it was no longer
+    pending (nothing is written then). Nothing legitimately replaces a non-pending row here: the consumer calls this
+    for a row it has just stored as pending, and the pending-queue sweep only selects pending rows.
+    """
+    process_status = {
+        "status": "failed",
+        "error_message": f"Cannot resolve the process steps of the persona config: {reason}",
+        "steps": [],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "failed_at_step": None,
+    }
+    result = await conn.execute(
+        """
+        UPDATE submissions
+        SET status = 'failed', process_status = $3, updated_at = now()
+        WHERE submission_id = $1 AND tenant_code = $2 AND status = 'pending'
+        """,
+        submission_id, tenant_code, json.dumps(process_status),
+    )
+    return result == "UPDATE 1"
+
 
 async def insert_llm_log(
     conn: asyncpg.Connection,
@@ -1610,6 +1877,17 @@ async def copy_parent_analysis_results(
         return 0
 
 
+def _as_datetime(value: Any) -> Any:
+    """An ISO-8601 string (a trailing 'Z' means UTC, which datetime.fromisoformat only accepts from Python 3.11) as a
+    datetime; anything else (a datetime, None) unchanged."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    return value
+
+
 async def fetch_retryable_submissions(
     conn: asyncpg.Connection,
     tenant_code: Optional[str] = None,
@@ -1631,8 +1909,10 @@ async def fetch_retryable_submissions(
         from app.config import settings
         stuck_processing_min_age_minutes = settings.STUCK_PROCESSING_MIN_AGE_MINUTES
 
-    cutoff_dt = datetime.fromisoformat(failed_before) if isinstance(failed_before, str) else failed_before
-    cursor_dt = datetime.fromisoformat(cursor_updated_at) if isinstance(cursor_updated_at, str) else cursor_updated_at
+    # The cutoff and the keyset cursor may arrive as ISO strings (an API / JSON hand-off); asyncpg only accepts a
+    # datetime for a timestamptz parameter.
+    cutoff_dt = _as_datetime(failed_before)
+    cursor_dt = _as_datetime(cursor_updated_at)
     rows = await conn.fetch(
         """
         SELECT submission_id, session_id, tenant_code, submission_type, status,

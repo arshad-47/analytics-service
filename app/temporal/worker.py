@@ -25,6 +25,7 @@ from app.temporal.thematic_activity import thematic_classification_activity
 from app.temporal.environment_activity import environment_detection_activity
 from app.temporal.story_rating_activity import story_rating_activity
 from app.temporal.statement_category_activity import statement_category_activity
+from app.temporal.feedback_extraction_activity import feedback_metadata_extraction_activity
 logger = logging.getLogger("analytics_service.temporal.worker")
 
 async def start_worker():
@@ -82,6 +83,7 @@ async def start_worker():
         deface_blur_activity,
         story_rating_activity,
         statement_category_activity,
+        feedback_metadata_extraction_activity,
         update_status_activity,
         fetch_pending_submissions_activity,
         run_migration_activity,

@@ -17,11 +17,11 @@ from app.api.services.feedback_gforms import (
     parse_gforms_csv,
     prepare_gforms_responses,
 )
-from app.services.feedback_constants import PERSONAS
+from seed_support import FEEDBACK_PROGRAM_NAME, PERSONAS
 
 FIXTURES = Path(__file__).resolve().parent / "csv_uploads"
 YOUTH = PERSONAS["Youth"]
-PROGRAM = {"id": YOUTH["program_id"], "name": "1M Voice"}
+PROGRAM = {"id": YOUTH["program_id"], "name": FEEDBACK_PROGRAM_NAME}
 LEADER = {"id": YOUTH["leader_category_id"], "name": "Youth"}
 PUBLISHED = "2026-10-20T00:00:00.000Z"
 
@@ -48,17 +48,19 @@ FUTURE = q("FUTURE", "When you think about your future, what do you want your li
 
 def make_config():
     return {
-        "layout": "wide",
+        "session_type": "Youth_Voice",
+        "adapter": "wide_form",
         "timestamp_column": "Timestamp",
         "datetime": {"formats": ["%m/%d/%Y %H:%M:%S"], "fallback_timezone": "Asia/Kolkata"},
-        "id_strategy": "generate_uuid4",
         "default_completion": "COMPLETED",
         "ignored_columns": ["Email Address"],
         "ignored_column_patterns": ["^Column \\d+$"],
         "language": {"default": "en", "script_detect": {"kn": "[\\u0C80-\\u0CFF]"}},
         "forms": {
-            "general": {"name": "General Public", "questions": [AGE, GENDER, STATE, HOPE, WORRY]},
-            "youth": {"name": "Youth", "questions": [AGE, GENDER, STATE, CLASS, INCOME, FUTURE]},
+            "general": {"name": "General Public", "questionnaire_version": "V1",
+                        "questions": [AGE, GENDER, STATE, HOPE, WORRY]},
+            "youth": {"name": "Youth", "questionnaire_version": "V2",
+                      "questions": [AGE, GENDER, STATE, CLASS, INCOME, FUTURE]},
         },
     }
 
@@ -92,7 +94,7 @@ def prepare(df, cfg):
 
 def build(responses, cfg=None, **overrides):
     kwargs = dict(known_refs=set(), program_info=PROGRAM, leader_info=LEADER, tenant_code="mitra",
-                  published_at=PUBLISHED, config=cfg)
+                  source="google_forms", published_at=PUBLISHED, config=cfg)
     kwargs.update(overrides)
     return build_gforms_events(responses, **kwargs)
 
@@ -245,8 +247,8 @@ class TestMatchForm:
 
     def test_form_that_maps_every_column_wins(self):
         cfg = make_config()
-        cfg["forms"] = {"small": {"name": "small", "questions": [AGE, GENDER]},
-                        "big": {"name": "big", "questions": [AGE, GENDER, STATE]}}
+        cfg["forms"] = {"small": {"name": "small", "questionnaire_version": "V1", "questions": [AGE, GENDER]},
+                        "big": {"name": "big", "questionnaire_version": "V1", "questions": [AGE, GENDER, STATE]}}
         df = frame([["10/2/2026 10:09:20", "22", "F", "Goa"]], ["Timestamp", "How old are you?",
                                                                  "What is your gender?", "Which state do you stay in?"])
         # 'small' leaves the state column unmapped, only 'big' maps every column
@@ -254,15 +256,15 @@ class TestMatchForm:
 
     def test_tighter_fit_wins_when_matched_counts_are_equal(self):
         cfg = make_config()
-        cfg["forms"] = {"small": {"name": "small", "questions": [AGE, GENDER]},
-                        "big": {"name": "big", "questions": [AGE, GENDER, STATE]}}
+        cfg["forms"] = {"small": {"name": "small", "questionnaire_version": "V1", "questions": [AGE, GENDER]},
+                        "big": {"name": "big", "questionnaire_version": "V1", "questions": [AGE, GENDER, STATE]}}
         df = frame([["10/2/2026 10:09:20", "22", "F"]], ["Timestamp", "How old are you?", "What is your gender?"])
         assert match_gforms_form(df, cfg) == ("small", [])
 
     def test_exact_tie_is_ambiguous(self):
         cfg = make_config()
-        cfg["forms"] = {"a": {"name": "a", "questions": [AGE, GENDER]},
-                        "b": {"name": "b", "questions": [AGE, GENDER]}}
+        cfg["forms"] = {"a": {"name": "a", "questionnaire_version": "V1", "questions": [AGE, GENDER]},
+                        "b": {"name": "b", "questionnaire_version": "V1", "questions": [AGE, GENDER]}}
         df = frame([["10/2/2026 10:09:20", "22", "F"]], ["Timestamp", "How old are you?", "What is your gender?"])
         form_key, errors = match_gforms_form(df, cfg)
         assert form_key is None
@@ -271,6 +273,9 @@ class TestMatchForm:
     def test_invalid_config_raises(self):
         df = frame([["10/2/2026 10:09:20", "22"]], ["Timestamp", "How old are you?"])
         with pytest.raises(ValueError, match="forms"):
+            match_gforms_form(df, {"adapter": "wide_form", "timestamp_column": "Timestamp",
+                                   "datetime": {"formats": ["%m/%d/%Y"]}})
+        with pytest.raises(ValueError, match="adapter"):  # a config without an adapter is never guessed
             match_gforms_form(df, {"timestamp_column": "Timestamp", "datetime": {"formats": ["%m/%d/%Y"]}})
 
 
@@ -316,7 +321,8 @@ class TestPrepare:
         df = general_frame([("26/9/2026 9:58:05", "22", "F", "Goa", "a", "b")])
         responses, skipped, _ = prepare(df, config)
         assert responses == []
-        assert skipped[0]["problems"][0].startswith("Timestamp '26/9/2026 9:58:05' does not match")
+        assert skipped[0]["problems"][0].startswith("Timestamp does not match any of the accepted formats")
+        assert "26/9/2026" not in skipped[0]["problems"][0]  # the cell value is never echoed
 
     def test_answers_follow_form_order_and_skip_blanks(self, config):
         # columns in a different order than the form; the worry cell is blank
@@ -496,7 +502,7 @@ class TestEvents:
         assert event["eventType"] == "create"
         assert event["eventPublishedAt"] == PUBLISHED
         assert event["tags"] == {
-            "programId": PROGRAM["id"], "programName": "1M Voice",
+            "programId": PROGRAM["id"], "programName": FEEDBACK_PROGRAM_NAME,
             "leaderCategoryId": LEADER["id"], "leaderCategoryName": "Youth",
             "state": None, "district": None, "source": "google_forms",
         }
@@ -517,7 +523,7 @@ class TestEvents:
             assert m["messageAt"] == "2026-10-02T04:39:20.000Z"
             if n % 2 == 0:                                              # question row
                 assert m["parentSequence"] is None
-                assert m["message"] == m["translatedMessage"]
+                assert m["message"] != "" and m["translatedMessage"] is None       # CHANGED: no copy of the question text
             else:                                                       # answer row
                 assert m["parentSequence"] == messages[n - 1]["sequence"]
                 assert m["questionKey"] == messages[n - 1]["questionKey"]
@@ -526,10 +532,11 @@ class TestEvents:
         assert messages[1]["message"] == "22"
         assert messages[-1]["message"] == "Prices"
 
-    def test_english_answers_carry_translated_message(self, config):
+    # CHANGED: an English answer used to be copied into translatedMessage; a form carries no translation, so it is None
+    def test_english_answers_have_no_translated_message(self, config):
         events, _ = build(self.responses(config), config)
         answers = [m for m in events[0]["data"]["messages"] if m["parentSequence"] is not None]
-        assert all(m["translatedMessage"] == m["message"] for m in answers)
+        assert len(answers) > 0 and all(m["translatedMessage"] is None and m["message"] != "" for m in answers)
 
     def test_kannada_response_has_no_translated_message_on_answers(self, config):
         responses = self.responses(config, [("10/2/2026 10:09:20", "22", "Female", "Goa", "ಕಲಿಕೆ", "Prices")])
@@ -539,16 +546,17 @@ class TestEvents:
         answers = [m for m in data["messages"] if m["parentSequence"] is not None]
         questions = [m for m in data["messages"] if m["parentSequence"] is None]
         assert all(m["translatedMessage"] is None for m in answers)
-        assert all(m["translatedMessage"] == m["message"] for m in questions)    # English question text
+        assert all(m["translatedMessage"] is None and m["message"] != "" for m in questions)   # CHANGED: English question text, no copy
         assert any(m["message"] == "ಕಲಿಕೆ" for m in answers)
 
-    def test_translated_rule_follows_the_configured_default_language(self, config):
+    # CHANGED: the default language no longer decides translatedMessage (it is None for every answer)
+    def test_default_language_does_not_fill_translated_message(self, config):
         config["language"]["default"] = "hi"
         responses = prepare(general_frame([ROW]), config)[0]
         assert responses[0]["language"] == "hi"
         events, _ = build(responses, config)
         answers = [m for m in events[0]["data"]["messages"] if m["parentSequence"] is not None]
-        assert all(m["translatedMessage"] == m["message"] for m in answers)
+        assert len(answers) > 0 and all(m["translatedMessage"] is None for m in answers)
 
     def test_known_refs_are_skipped_and_counted(self, config):
         responses = self.responses(config, [ROW, ROW[:5] + ("Taxes",), ROW[:5] + ("Rent",)])
@@ -587,15 +595,53 @@ class TestEvents:
         stamp = events[0]["eventPublishedAt"]
         assert stamp.endswith("Z") and len(stamp) == len("2026-10-20T00:00:00.000Z")
 
-    def test_default_completion_comes_from_config(self, config):
-        config["default_completion"] = "IN_PROGRESS"
+    def test_default_completion_must_be_completed_for_a_form_response(self, config):
+        config["default_completion"] = "COMPLETED"
         events, _ = build(self.responses(config), config)
-        assert events[0]["data"]["completionStatus"] == "IN_PROGRESS"
+        assert events[0]["data"]["completionStatus"] == "COMPLETED"
+        config["default_completion"] = "IN_PROGRESS"   # a response is immutable: the config is refused, loudly
+        with pytest.raises(ValueError, match="default_completion"):
+            build(self.responses(config), config)
 
     def test_without_config_the_defaults_apply(self, config):
         events, _ = build(self.responses(config), None)
         assert events[0]["data"]["completionStatus"] == "COMPLETED"
         assert events[0]["tags"]["state"] is None
+
+    def test_events_carry_session_type_and_the_forms_questionnaire_version(self, config):
+        events, _ = build(self.responses(config), config)       # the general form is V1
+        assert events[0]["data"]["sessionType"] == "Youth_Voice"
+        assert events[0]["data"]["questionnaireVersion"] == "V1"
+
+    def test_questionnaire_version_follows_the_matched_form(self, config):
+        youth = prepare(read_fixture("feedback_gforms_kannada.csv"), config)[0]
+        assert youth[0]["form_key"] == "youth"
+        events, _ = build(youth, config)
+        assert {e["data"]["questionnaireVersion"] for e in events} == {"V2"}
+        assert {e["data"]["sessionType"] for e in events} == {"Youth_Voice"}
+
+    def test_session_type_comes_from_the_config(self, config):
+        config["session_type"] = "General_Public_Voice"
+        events, _ = build(self.responses(config), config)
+        assert events[0]["data"]["sessionType"] == "General_Public_Voice"
+
+    def test_session_type_and_version_are_none_without_the_config_keyword(self, config):
+        events, _ = build(self.responses(config), None)
+        assert events[0]["data"]["sessionType"] is None
+        assert events[0]["data"]["questionnaireVersion"] is None
+
+    def test_prepared_responses_carry_the_form_key(self, config):
+        responses = self.responses(config)
+        assert {r["form_key"] for r in responses} == {"general"}
+
+    def test_real_gforms_config_stamps_each_launch_form_as_v1(self):
+        from seed_support import gforms_config_v1
+        real = gforms_config_v1("General Public")
+        responses = prepare_gforms_responses(general_frame([ROW]).rename(
+            columns={"What is your gender? ": "What is your gender?"}), real)[0]
+        events, _ = build(responses, real)
+        assert events[0]["data"]["sessionType"] == "General_Public_Voice"
+        assert events[0]["data"]["questionnaireVersion"] == "V1"
 
     def test_location_tags_when_configured(self, config):
         config["location"] = {"state": {"stage": "STATE_IDENTIFICATION",
