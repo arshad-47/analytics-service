@@ -23,7 +23,7 @@ import re
 _ISO_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 DEFAULT_DAY_FIRST_FORMATS: Tuple[str, ...] = (
-    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d/%m/%Y",
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d/%m/%Y", "%d-%m-%Y",
 )
 
 

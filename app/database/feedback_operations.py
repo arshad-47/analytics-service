@@ -632,18 +632,18 @@ async def _bot_personas(conn, cfg: Mapping[str, Any]) -> List[tuple]:
     return [(cfg["tenant_code"], program, cfg["session_type"], cfg["config_source"]) for program in programs]
 
 
-async def _restamp_bot_sessions(conn, cfg: Mapping[str, Any]) -> Dict[str, Any]:
+async def _restamp_bot_sessions(conn, cfg: Mapping[str, Any], personas: List[Any]) -> Dict[str, Any]:
     """
     Recompute the bot-rank labels of every persona (program) among the bot sessions ONE config governs and relabel
     what differs (apply_bot_version_ranks: a relabelled session whose asked fields do not change only gets the new
     label, one whose fields change is sent back through processing). This is the manual repair of the ingest rule.
-    Writes through `conn` (the caller owns the transaction); the personas are locked first, in one fixed order.
+    Writes through `conn` (the caller owns the transaction). `personas` is the set the caller read AND locked (in one
+    fixed order, with every other config's personas): this function takes no lock of its own, because a persona found
+    by a second read (one committed meanwhile) could be locked out of that order and deadlock with an ingest.
     Returns {"personas": n, "sessions": n, "changed": n (every relabelled session), "label_only": n (relabelled
     without reprocessing), "reprocess": [submission_id] (set back to 'pending'; real-time mode does not start them
     by itself here, batch mode or the retry sweep picks them up)}.
     """
-    personas = await _bot_personas(conn, cfg)
-    await lock_personas(conn, personas)       # (the sweep already holds them: see restamp_questionnaire_versions)
     sessions = 0
     relabelled = 0
     reprocess: List[str] = []
@@ -710,7 +710,10 @@ async def restamp_questionnaire_versions(
                 # Every persona of every config, locked once in ONE key order before anything else: configs are visited by
                 # program name but personas are locked by key, so locking them config by config could take two personas in
                 # opposite orders from a concurrent ingest that moves a session between them (a deadlock).
-                await lock_personas(conn, [p for cfg in configs for p in await _bot_personas(conn, cfg)])
+                personas_of: Dict[Any, List[Any]] = {}
+                for cfg in configs:
+                    personas_of[cfg["config_id"]] = await _bot_personas(conn, cfg)
+                await lock_personas(conn, [p for cfg in configs for p in personas_of[cfg["config_id"]]])
                 for cfg in configs:
                     # Lock the config row, THEN read its active windows, and keep the lock until the commit: the
                     # windows read by _find_upload_configs above can be older than a set_questionnaire_version that
@@ -722,7 +725,7 @@ async def restamp_questionnaire_versions(
                     versions = parse_versions(active["config"])
                     summary = await _restamp_sessions(conn, cfg, versions)
                     # bot sessions follow their bot ids, not the windows: recompute those labels too (the repair)
-                    bot_summary = await _restamp_bot_sessions(conn, cfg)
+                    bot_summary = await _restamp_bot_sessions(conn, cfg, personas_of[cfg["config_id"]])
                     result["session_types"][keys[cfg["config_id"]]] = {
                         **summary, "bot_sessions": bot_summary, **_identity(cfg)}
                     result["changed"] += summary["changed"] + bot_summary["changed"]

@@ -24,6 +24,23 @@ pytestmark = pytest.mark.skipif(DSN is None or DSN == "", reason=pg_support.SKIP
 PARENT = "Parent_Voice"
 
 
+async def _until_a_backend_waits_for_a_lock(conn, timeout: float = 10.0) -> None:
+    """
+    Returns once another backend of this database reports that it waits for a lock (pg_stat_activity), so the holder
+    commits only after the contender really reached the lock (a fixed sleep can pass before it, for example while the
+    pool is still opening its connection). Bounded: fails the test instead of hanging.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        waiting = await conn.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")
+        if waiting > 0:
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail("no backend reached a lock wait within %.0f seconds" % timeout)
+
+
 def test_a_replay_that_waited_for_the_lock_keeps_the_extraction_a_label_only_relabel_left_valid():
     async def body(conn, pool):
         program = rl._seeded("General Public")           # V1 and V2 ask the same fields: a relabel keeps the extraction
@@ -43,7 +60,7 @@ def test_a_replay_that_waited_for_the_lock_keeps_the_extraction_a_label_only_rel
                     return await insert_or_update_submission(own, event)      # the same event again
 
             waiting = asyncio.create_task(replay())
-            await asyncio.sleep(0.6)
+            await _until_a_backend_waits_for_a_lock(conn)
             assert not waiting.done()                                         # it waits for the persona lock
             lower = factories.conversation_event(program, rl.GENERAL, "mitra", "V1", bot_id="89")
             await insert_or_update_submission(holder, lower)                  # bot 89 relabels S to V2, label only
@@ -79,7 +96,7 @@ def test_a_session_that_moves_twice_re_ranks_the_persona_it_left_the_second_time
                     await insert_or_update_submission(own, move(PARENT))      # S: (General) -> Parent
 
             waiting = asyncio.create_task(second())
-            await asyncio.sleep(0.6)
+            await _until_a_backend_waits_for_a_lock(conn)
             assert not waiting.done()                                         # one session: one writer at a time
             await transaction.commit()
             await asyncio.wait_for(waiting, timeout=10)
@@ -106,4 +123,5 @@ def test_the_restamp_sweep_locks_the_personas_of_every_config_in_one_call_first(
         monkeypatch.setattr(fo, "lock_personas", recording)
         await fo.restamp_questionnaire_versions(tenant_code="mitra", source="mitra")
         assert len(calls[0]) == 2 and {p[1] for p in calls[0]} == {first["program_id"], second["program_id"]}
+        assert len(calls) == 1          # and nothing more is locked later: no second read of the personas takes a lock
     bv._run(body)

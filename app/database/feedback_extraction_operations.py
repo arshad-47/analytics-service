@@ -807,6 +807,7 @@ async def extract_submission(
             except Exception as exc:
                 # Any other failure of the write (a database error, a deadlock): nothing was stored, but the calls were
                 # made and billed, so the callers that total the usage of failed sessions (the CLI) must see them.
+                exc.stages = tracker.stages     # the stage list reaches the failure too (also when no call was made)
                 if run.llm_called:
                     exc.usage = dict(run.usage)
                     if run.masking is not None:

@@ -221,6 +221,22 @@ def test_a_failure_carries_the_stage_list_naming_the_stage_that_failed():
     _run(body)
 
 
+def test_a_failed_save_carries_the_stage_list_too(monkeypatch):
+    import app.database.feedback_extraction_operations as extraction_ops
+
+    async def failing_save(*args, **kwargs):
+        raise RuntimeError("the database went away")
+    monkeypatch.setattr(extraction_ops, "save_extraction", failing_save)
+
+    async def body(conn, pool):
+        sid = await _session(conn)
+        with pytest.raises(RuntimeError) as caught:
+            await extract_submission(pool, sid, "mitra", llm_function=Fake(masking=_clean_masking, extraction=_extraction()))
+        assert [(s["name"], s["status"]) for s in caught.value.stages] == [
+            ("pii_masking", "success"), ("metadata_extraction", "success")]
+    _run(body)
+
+
 def test_a_session_without_an_answer_makes_no_call_and_both_stages_are_skipped_with_the_reason():
     async def body(conn, pool):
         from app.database.operations import insert_or_update_submission

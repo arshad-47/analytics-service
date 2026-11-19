@@ -270,9 +270,9 @@ def created_at_session(stamps, shape=V1_STYLE):
 
 
 @pytest.mark.parametrize("stamp", ["15/10/2026 08:54:43", "15/10/2026 08:54", "15-10-2026 08:54:43",
-                                   "15-10-2026 08:54", "15/10/2026"])
+                                   "15-10-2026 08:54", "15/10/2026", "15-10-2026"])    # CHANGED: the dashed date alone
 def test_day_first_formats_are_read(config, stamp):
-    assert len(DEFAULT_DAY_FIRST_FORMATS) == 5
+    assert len(DEFAULT_DAY_FIRST_FORMATS) == 6
     rows = created_at_session([stamp, "", "", ""])
     events, skipped = build(make_df(rows), config)
     assert skipped == []
