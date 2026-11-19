@@ -1714,7 +1714,6 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "≥ ₹66,000 and < ₹83,000": "a monthly amount from 66,000 up to but not including 83,000",
         "≥ ₹83,000": "a monthly amount of 83,000 or more"
       },
-      "sensitive": true,
       "versions": [
         "V2"
       ]
@@ -1745,7 +1744,6 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "≥ ₹8 lakh and < ₹10 lakh": "a yearly amount from 8 lakh up to but not including 10 lakh",
         "≥ ₹10 lakh": "a yearly amount of 10 lakh or more"
       },
-      "sensitive": true,
       "versions": [
         "V1"
       ]
@@ -1765,8 +1763,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "No": "the respondent says there is none",
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "sensitive": true
+      }
     },
     {
       "name": "disability_type",
@@ -1786,7 +1783,6 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "sensitive": true,
       "multi": true,
       "applies_when": {
         "field": "disability",
