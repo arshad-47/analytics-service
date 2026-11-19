@@ -281,6 +281,37 @@ def test_day_first_formats_are_read(config, stamp):
     assert events[0]["data"]["submissionDate"] == day
 
 
+@pytest.mark.parametrize("stamp, expected", [
+    ("November 16, 2026, 9:09:20.296 AM ", "2026-11-16T09:09:20.296Z"),       # the Metabase export, with its trailing space
+    ("November 16, 2026, 9:09:20.296 PM", "2026-11-16T21:09:20.296Z"),
+    ("November 16, 2026, 9:09:20 AM", "2026-11-16T09:09:20.000Z"),
+    ("November 16, 2026, 12:05 AM", "2026-11-16T00:05:00.000Z"),
+    ("November 16, 2026, 12:05 PM", "2026-11-16T12:05:00.000Z"),
+    ("Nov 6, 2026, 9:09:20.296 AM", "2026-11-06T09:09:20.296Z"),             # abbreviated month, one-digit day
+    ("November 16, 2026 9:09:20.296 am", "2026-11-16T09:09:20.296Z"),        # no comma after the year, lower case
+    ("November 16, 2026, 21:09:20", "2026-11-16T21:09:20.000Z"),             # 24-hour clock
+    ("November 16, 2026", "2026-11-16T00:00:00.000Z"),                       # the date alone
+])
+def test_dates_with_the_month_written_out_are_read(config, stamp, expected):
+    config["datetime"] = {"fallback_timezone": "UTC"}
+    events, skipped = build(make_df(created_at_session([stamp, "", "", ""])), config)
+    assert skipped == []
+    assert by_sequence(events[0])[2]["messageAt"] == expected
+    assert events[0]["data"]["submissionDate"] == expected
+
+
+def test_a_written_out_month_stamp_is_read_in_the_fallback_timezone(config):
+    config["datetime"] = {"fallback_timezone": "Asia/Kolkata"}
+    events, _ = build(make_df(created_at_session(["November 16, 2026, 9:09:20.296 AM", "", "", ""])), config)
+    assert by_sequence(events[0])[2]["messageAt"] == "2026-11-16T03:39:20.296Z"
+
+
+@pytest.mark.parametrize("stamp", ["Novembre 16, 2026", "November 31, 2026, 9:09 AM", "November 16 2026 9:09 AM", "16 November 2026"])
+def test_an_impossible_or_unknown_written_stamp_stays_unparsable(config, stamp):
+    events, skipped = build(make_df(created_at_session([stamp, "2026-10-15T08:00:09+05:30", "", ""])), config)
+    assert skipped == [] and by_sequence(events[0])[2]["messageAt"] is None      # a null time, never a wrong date
+
+
 def test_a_day_first_stamp_is_read_in_the_fallback_timezone(config):
     config["datetime"] = {"fallback_timezone": "Asia/Kolkata"}
     events, _ = build(make_df(created_at_session(["15/10/2026 08:54:43", "", "", ""])), config)

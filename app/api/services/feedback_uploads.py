@@ -22,6 +22,12 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from app.services.datetime_parsing import (
+    DEFAULT_ACCEPTED_FORMATS,
+    DEFAULT_DAY_FIRST_FORMATS,
+    TEXT_MONTH_FORMATS,
+    parse_datetime_text,
+)
 from app.services.feedback_adapter_config import (
     config_adapter,
     is_safe_id,
@@ -43,7 +49,6 @@ from app.services.feedback_constants import (
 logger = logging.getLogger("analytics_service.api.services.feedback_uploads")
 
 _INT_RE = re.compile(r"^[0-9]+$")
-_ISO_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 # C0 control characters except TAB (0x09), LF (0x0a) and CR (0x0d), plus DEL (0x7f). Zero-width and right-to-left marks
 # (U+200B..U+200F, U+202A..U+202E), emoji and every other printable character are NOT in the class: they are part of
 # what a respondent typed. NUL (0x00) is in the class for frames built without parse_feedback_csv.
@@ -52,12 +57,8 @@ _CONTROL_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # plus these defaults): `empty_message_placeholder` and `datetime.formats`.
 DEFAULT_EMPTY_MESSAGE_PLACEHOLDER = "[no text]"
 CONFIG_KEY_EMPTY_MESSAGE_PLACEHOLDER = "empty_message_placeholder"
-# Accepted in addition to ISO 8601 (which is tried first): day-first dates, as a spreadsheet saved in a European or
-# Indian locale writes them. Month-first is NOT accepted: 03/04/2026 is ambiguous and a wrong guess would move a
-# session by months, so it stays an unparsable value (the row then has no message time).
-DEFAULT_DAY_FIRST_FORMATS: Tuple[str, ...] = (
-    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d/%m/%Y",
-)
+# The date formats read (ISO 8601, day-first numeric, written-out month) live in app/services/datetime_parsing.py, shared with
+# the story / discussion upload; `datetime.formats` of the config adds more (see _datetime_formats).
 # Row numbers listed in a problem message (the rest is only counted). Problems carry counts, row numbers and column
 # names, NEVER a cell value: a misaligned or hostile file can hold respondent text in any column, and the problems go to
 # the DLQ, the logs, csv_uploads.meta_data and the 400 body.
@@ -240,40 +241,7 @@ def _resolve_timezone(name: str):
         raise ValueError(f"config.datetime.fallback_timezone {name!r} is not a known timezone")
 
 
-def _parse_datetime(value: str, fallback_tz, day_first_formats: Tuple[str, ...] = DEFAULT_DAY_FIRST_FORMATS) -> Optional[datetime]:
-    """Aware datetime, or None when unparsable. Naive values are read in `fallback_tz`. ISO 8601 is tried first, then
-    each of `day_first_formats` (strptime patterns, no offset in them)."""
-    text = value.strip()
-    if text == "":
-        return None
-    dt: Optional[datetime] = None
-    try:
-        dt = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
-    except ValueError:
-        if _ISO_LIKE_RE.match(text):
-            try:
-                ts = pd.Timestamp(text)
-            except (ValueError, OverflowError):
-                return None
-            if pd.isna(ts):
-                return None
-            dt = ts.to_pydatetime()
-    if dt is None:
-        for pattern in day_first_formats:
-            try:
-                dt = datetime.strptime(text, pattern)
-                break
-            except ValueError:
-                continue
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=fallback_tz)
-    try:
-        dt.astimezone(timezone.utc)
-    except (OverflowError, ValueError):
-        return None  # year 0001 / 9999 at an offset: not representable in UTC, so it is an unparsable date
-    return dt
+_parse_datetime = parse_datetime_text   # (the name this module has always used)
 
 
 def _clean_text(text: str) -> str:
@@ -282,14 +250,14 @@ def _clean_text(text: str) -> str:
 
 
 def _datetime_formats(config: Dict[str, Any]) -> Tuple[str, ...]:
-    """The day-first formats of the file: the defaults followed by the optional config `datetime.formats` (a list of
-    strptime patterns). Raises ValueError naming the key when the list is malformed."""
+    """The formats read after ISO 8601: the defaults (day-first and written-out month) followed by the optional config
+    `datetime.formats` (a list of strptime patterns). Raises ValueError naming the key when the list is malformed."""
     block = config.get("datetime", {})
     if not isinstance(block, dict):
         raise ValueError("Feedback config 'datetime' must be an object")
     extra = block.get("formats")
     if extra is None:
-        return DEFAULT_DAY_FIRST_FORMATS
+        return DEFAULT_ACCEPTED_FORMATS
     if not isinstance(extra, list) or not all(isinstance(f, str) and len(f.strip()) > 0 for f in extra):
         raise ValueError("Feedback config 'datetime.formats' must be a list of non-empty strptime patterns")
     for pattern in extra:
@@ -297,7 +265,7 @@ def _datetime_formats(config: Dict[str, Any]) -> Tuple[str, ...]:
             datetime.strptime(datetime(2026, 1, 2, 3, 4, 5).strftime(pattern), pattern)
         except ValueError:
             raise ValueError("Feedback config 'datetime.formats' has a pattern that does not read its own output")
-    return DEFAULT_DAY_FIRST_FORMATS + tuple(f for f in extra if f not in DEFAULT_DAY_FIRST_FORMATS)
+    return DEFAULT_ACCEPTED_FORMATS + tuple(f for f in extra if f not in DEFAULT_ACCEPTED_FORMATS)
 
 
 def _folded_completion_map(completion_map: Dict[str, str]) -> Dict[str, str]:

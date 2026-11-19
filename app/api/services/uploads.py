@@ -21,6 +21,7 @@ from app.database import operations
 from app.database import feedback_operations
 from app.database.feedback_operations import AmbiguousFeedbackConfigError
 from app.database.db import db
+from app.services.datetime_parsing import parse_datetime_text
 from app.services.ingestion_validation import validate_ingestion_schema
 from app.services.feedback_adapter_config import (
     is_safe_code,
@@ -201,18 +202,27 @@ def parse_segments(val, delimiter="|") -> List[str]:
 
 
 def format_datetime(val, with_ms=True, fallback_to_now=True) -> Optional[str]:
-    if pd.isna(val) or val is None:
+    """
+    The event text ('2026-11-16T09:09:20.296Z', UTC) of a story / discussion date cell. The text is read by
+    parse_datetime_text, the SAME reader as the feedback upload (ISO 8601, day-first numeric, month written out such as
+    'November 16, 2026, 9:09:20.296 AM'; numeric month-first is not guessed; an offset is converted to UTC, a value
+    without one is read as UTC). An empty cell becomes the current time unless `fallback_to_now` is False (then None);
+    text that cannot be read is returned unchanged, so the ingestion schema check rejects it.
+    """
+    if val is None or (not isinstance(val, str) and pd.isna(val)) or (isinstance(val, str) and val.strip() == ""):
         if not fallback_to_now:
             return None
         val = datetime.now(timezone.utc)
     if isinstance(val, str):
-        try:
-            val = pd.to_datetime(val)
-        except Exception:
+        parsed = parse_datetime_text(val)
+        if parsed is None:
             return val
+        val = parsed
     if hasattr(val, "to_pydatetime"):
         val = val.to_pydatetime()
     if isinstance(val, datetime):
+        if val.tzinfo is not None:
+            val = val.astimezone(timezone.utc)
         if with_ms:
             return val.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         else:
