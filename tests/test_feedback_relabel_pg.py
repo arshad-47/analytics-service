@@ -7,7 +7,7 @@ Postgres server and tests/pg_support.py gives this file its own scratch database
 When a lower bot id arrives, the sessions of the higher ones are relabelled (V1 -> V2). The persona's ACTIVE extraction
 config says whether that matters: when the old and the new label ask the same fields (General Public: no
 version-dependent field) only the label changes and the finished extraction, the PII flag and the status stay; when a
-field is asked in one version only (Youth: annual_household_income V1, monthly_household_income V2) the stored rows no
+field is asked in one version only (a field with `versions`; none in the seeded configs now) the stored rows no
 longer describe the session, so it goes back to 'pending' and is listed for dispatch (reset_submission_ids).
 """
 import asyncio
@@ -155,30 +155,27 @@ def test_a_session_still_processing_or_failed_keeps_its_status_when_only_the_lab
     _run(body)
 
 
-def test_youth_103_then_89_changes_the_asked_fields_so_the_sessions_are_reset_and_listed():
+def test_youth_103_then_89_relabels_but_keeps_the_finished_extraction_as_both_versions_ask_the_same_fields():
     async def body(conn, pool):
         program = _seeded("Youth")
         y1, _ = await _ingest(conn, program, "103", YOUTH)
         y2, _ = await _ingest(conn, program, "103", YOUTH)
         await _pretend_extracted(conn, y1)
         await _pretend_extracted(conn, y2)
+        before = {sid: await _state(conn, sid) for sid in (y1, y2)}
 
-        new, res = await _ingest(conn, program, "89", YOUTH)
+        new, res = await _ingest(conn, program, "89", YOUTH)            # V1 -> V2: one monthly income field for both
 
-        assert sorted(res["reset_submission_ids"]) == sorted([y1, y2])
+        _unchanged_but_label(before[y1], await _state(conn, y1), "V2")
+        _unchanged_but_label(before[y2], await _state(conn, y2), "V2")
         assert sorted(res["restamped_submission_ids"]) == sorted([y1, y2])
-        for sid in (y1, y2):
-            after = await _state(conn, sid)
-            assert after["version"] == "V2" and after["status"] == "pending"
-            assert after["pii"] is None and after["abusive"] is None and after["extracted"] == []
-            assert "extraction" not in after["meta"] and after["meta"]["bot_id"] == "103"
-            assert after["llm_logs"] == 1                                       # the audit trail stays
+        assert res["reset_submission_ids"] == []
         assert (await _state(conn, new))["status"] == "pending"
     _run(body)
 
 
 def test_a_mixed_persona_resets_only_what_changed_per_label_pair():
-    """Three bots: Youth V1 -> V2 differs (annual <-> monthly income), V2 -> V3 differs too (V3 asks neither)."""
+    """Three bots: the seeded Youth config has no version-dependent field, so neither V1 -> V2 nor V2 -> V3 resets."""
     async def body(conn, pool):
         program = _seeded("Youth")
         a, _ = await _ingest(conn, program, "103", YOUTH)
@@ -186,7 +183,8 @@ def test_a_mixed_persona_resets_only_what_changed_per_label_pair():
         await _pretend_extracted(conn, a)
         await _pretend_extracted(conn, b)
         _, res = await _ingest(conn, program, "89", YOUTH)                     # a: V1 -> V2, b: V2 -> V3
-        assert sorted(res["reset_submission_ids"]) == sorted([a, b])
+        assert sorted(res["restamped_submission_ids"]) == sorted([a, b])
+        assert res["reset_submission_ids"] == []
     _run(body)
 
 

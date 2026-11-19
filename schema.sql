@@ -559,7 +559,7 @@ CREATE TABLE feedback_submissions (
     UNIQUE (tenant_code, source_ref) -- NULLs are allowed; guarantees a Google Forms response is stored once
 );
 
-CREATE TABLE feedbacks (
+CREATE TABLE IF NOT feedbacks (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     submission_id      TEXT NOT NULL,
     tenant_code        TEXT NOT NULL,

@@ -128,7 +128,7 @@ A category is matched ignoring case and repeated spaces and stored with the conf
 
 | persona (`session_type`) | fields (S = `sensitive`) |
 |---|---|
-| Youth (`Youth_Voice`) | `gender`, `age`, `state`, `district`, `current_activity_status`, `education_level`, `course_details`, `institution_type`, `monthly_household_income` (S, V2 only), `annual_household_income` (S, V1 only), `disability` (S), `disability_type` (S) |
+| Youth (`Youth_Voice`) | `gender`, `age`, `state`, `district`, `current_activity_status`, `education_level`, `course_details`, `institution_type`, `monthly_household_income` (every version: a V1 yearly answer is divided by 12), `disability` (S), `disability_type` (S) |
 | General Public (`General_Public_Voice`) | `gender`, `age`, `state`, `district`, `occupation` |
 | Parent (`Parent_Voice`) | `state`, `district`, `child_gender`, `disability` (S), `disability_type` (S), `respondent_relationship`, `school_type`, `child_grade`, `parent_education`, `parent_education_level` |
 | Educator (`Educator_Voice`) | `state`, `district`, `gender`, `institution_type`, `teaching_level` |
@@ -206,7 +206,7 @@ All queries read `feedback_extracted_data` (long form) and pivot it to **one row
 
 ### 6.1 Export-ready rows: Youth (PII-checked and clean)
 
-`age` is the label of its band (`≥ 16 and < 22`, ...). `monthly_household_income`, `annual_household_income`, `disability` and `disability_type` are **sensitive**: they are in the commented-out block, **do not include them in a DOTS export until product confirms** (see section 7). They are still extracted and stored.
+`age` is the label of its band (`≥ 16 and < 22`, ...). `monthly_household_income`, `disability` and `disability_type` are **sensitive**: they are in the commented-out block, **do not include them in a DOTS export until product confirms** (see section 7). They are still extracted and stored.
 
 ```sql
 SELECT s.submission_id, s.submission_date, fs.session_type, fs.source, fs.questionnaire_version,
@@ -231,8 +231,6 @@ SELECT s.submission_id, s.submission_date, fs.session_type, fs.source, fs.questi
        -- lines below here and in the LATERAL list further down (the comma is part of each commented line).
        -- , e.monthly_household_income
        -- , e.monthly_household_income_status
-       -- , e.annual_household_income
-       -- , e.annual_household_income_status
        -- , e.disability
        -- , e.disability_status
        -- , e.disability_type
@@ -259,8 +257,6 @@ LEFT JOIN LATERAL (
            -- SENSITIVE (see above):
            -- , max(d.value)  FILTER (WHERE d.field_name = 'monthly_household_income') AS monthly_household_income
            -- , max(d.status) FILTER (WHERE d.field_name = 'monthly_household_income') AS monthly_household_income_status
-           -- , max(d.value)  FILTER (WHERE d.field_name = 'annual_household_income') AS annual_household_income
-           -- , max(d.status) FILTER (WHERE d.field_name = 'annual_household_income') AS annual_household_income_status
            -- , max(d.value)  FILTER (WHERE d.field_name = 'disability') AS disability
            -- , max(d.status) FILTER (WHERE d.field_name = 'disability') AS disability_status
            -- , max(d.value)  FILTER (WHERE d.field_name = 'disability_type') AS disability_type
@@ -529,7 +525,7 @@ ORDER BY d.raw_value;
 
 Confirmation items found in review. Until product answers, the affected fields are marked `provisional` in the config (see `show-config` or the bands document for which) and a change is a new config version plus a re-run:
 
-- **Sensitive columns are not for the DOTS export yet.** `monthly_household_income` and `annual_household_income` (Youth), `disability` and `disability_type` (Youth and Parent) are flagged `sensitive` in the config: they are extracted only when the respondent states them explicitly, the respondent's own words are not stored for them (`raw_value` is NULL; the labels are stored), and they are in the commented-out block of the queries in 6.1 and 6.2. **Do not include them in a DOTS export until product confirms** that they may be exported.
+- **Sensitive columns are not for the DOTS export yet.** `monthly_household_income` (Youth), `disability` and `disability_type` (Youth and Parent) are flagged `sensitive` in the config: they are extracted only when the respondent states them explicitly, the respondent's own words are not stored for them (`raw_value` is NULL; the labels are stored), and they are in the commented-out block of the queries in 6.1 and 6.2. **Do not include them in a DOTS export until product confirms** that they may be exported.
 - **State**: `Unmapped` (a direction, a region, a city, or a district name used in several states with no state given) and `Outside India` are categories of `state` and `district`; `not_provided` (value `Not answered`) and `unmapped` stay apart in the `status` column. A state is derived from a named district only when the district belongs to exactly one state (the justification says so).
 - **Gender**: an explicit `do not want to say` is `Prefer not to say`; a skip is `Not answered`; `something else` is `Others`; `Unsure / don't know` is its own value.
 - **School and institution type**: the Youth bot asks everybody, including people who work (about their past school); per the data team's comments an answer about a college is `Invalid response` (the question is about schools), also for Youth and Educator, and an aided school is `Others` for Parent and Educator (Youth has `Government-aided`). The justification of such a value says why.
