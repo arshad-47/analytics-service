@@ -1917,7 +1917,7 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
   "schema_version": 1,
   "persona": "Parent",
   "session_type": "Parent_Voice",
-  "source_note": "Fields are the DOTS metadata columns of the persona. The category lists are the data team's finalised lists (1MV dashboard requirements sheet) in the engine's normalised spellings; Not answered and N/A are written by the engine and are not listed. Fields with `versions` exist in those questionnaire versions only (N/A otherwise); a field with `applies_when` is N/A unless the earlier field holds one of the listed values; `multi` fields may hold several categories. Sensitive fields are filled only when the respondent states them explicitly.",
+  "source_note": "Fields are the DOTS metadata columns of the persona. The category lists are the data team's finalised lists (1MV dashboard requirements sheet) in the engine's normalised spellings; Not answered and N/A are written by the engine and are not listed. Fields with `versions` exist in those questionnaire versions only (N/A otherwise); a field with `applies_when` is N/A unless the earlier field holds one of the listed values; `multi` fields may hold several categories.",
   "prompt_name": "Feedback Metadata Extraction - Parent",
   "fields": [
     {
@@ -2095,7 +2095,6 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "sensitive": true,
       "versions": [
         "V2"
       ]
@@ -2118,7 +2117,6 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "sensitive": true,
       "multi": true,
       "applies_when": {
         "field": "disability",
