@@ -747,6 +747,6 @@ def _seed_answer(persona, pii=(False, []), **overrides):
                        "pii": {"detected": pii[0], "types": pii[1]}})
 
 
-SENSITIVE = {"Youth": {"monthly_household_income", "annual_household_income", "disability", "disability_type"},
+SENSITIVE = {"Youth": set(),
              "Parent": {"disability", "disability_type"}}
 

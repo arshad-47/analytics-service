@@ -24,14 +24,14 @@ SEED_PROMPTS = ROOT / "seed_prompts.sql"
 # The DOTS export columns (the headers of the user's DOTS samples), in export order.
 DOTS_FIELDS = {
     "Youth": ["gender", "age", "state", "district", "current_activity_status", "education_level", "course_details",
-              "institution_type", "monthly_household_income", "annual_household_income", "disability", "disability_type"],
+              "institution_type", "monthly_household_income", "disability", "disability_type"],
     "General Public": ["gender", "age", "state", "district", "occupation"],
     "Parent": ["state", "district", "child_gender", "disability", "disability_type", "respondent_relationship",
                "school_type", "child_grade", "parent_education", "parent_education_level"],
     "Educator": ["state", "district", "gender", "institution_type", "teaching_level"],
 }
 SENSITIVE = {
-    "Youth": {"monthly_household_income", "annual_household_income", "disability", "disability_type"},
+    "Youth": set(),        # the seed keeps raw_value for every field (the `sensitive` key was removed on purpose)
     "General Public": set(),
     "Parent": set(),
     "Educator": set(),
@@ -171,31 +171,24 @@ def test_youth_status_education_and_course_lists_are_the_finalised_ones_and_depe
         "Government", "Private", "Government-aided", "Others", "Not sure", "Prefer not to say", "Invalid response")
 
 
-def test_youth_income_has_a_monthly_band_list_for_v2_and_an_annual_one_for_v1_with_the_symbols_the_data_team_chose():
+def test_youth_has_one_monthly_income_field_for_every_version_and_no_annual_field():
     by_name = {f.name: f for f in _config("Youth").fields}
-    monthly, annual = by_name["monthly_household_income"], by_name["annual_household_income"]
+    assert "annual_household_income" not in by_name
+    monthly = by_name["monthly_household_income"]
     assert monthly.categories == (
         "Zero income / no income", "< ₹25,000", "≥ ₹25,000 and < ₹66,000", "≥ ₹66,000 and < ₹83,000",
         "≥ ₹83,000", "Don't know", "Prefer not to say", "Invalid response", "Unclear")
-    assert annual.categories == (
-        "Zero income / no income", "< ₹3 lakh", "≥ ₹3 lakh and < ₹8 lakh", "≥ ₹8 lakh and < ₹10 lakh",
-        "≥ ₹10 lakh", "Don't know", "Prefer not to say", "Invalid response", "Unclear")
-    assert monthly.versions == ("V2",) and annual.versions == ("V1",) and monthly.sensitive and annual.sensitive
-    assert "divide the amount by 12" in monthly.description and "MONTH" in monthly.description
-    assert "multiply the amount by 12" in annual.description and "YEAR" in annual.description
+    assert monthly.versions is None          # asked in V1 (yearly question) and V2 (monthly question): every version
+    assert "divide it by 12" in monthly.description and "MONTH" in monthly.description and "YEAR" in monthly.description
     assert "'around 25,000' belongs here" in monthly.guidance["≥ ₹25,000 and < ₹66,000"]
 
 
-def test_disability_fields_are_sensitive_and_disability_type_is_a_multi_value_category_that_needs_a_yes():
+def test_disability_type_is_a_multi_value_category_that_needs_a_yes():
     for persona in ("Youth", "Parent"):
         by_name = {f.name: f for f in _config(persona).fields}
         assert by_name["disability"].categories == ("Yes", "No", "Prefer not to say", "Invalid response")
         kind = by_name["disability_type"]
         assert kind.kind == "category" and kind.multi
-        if persona == "Youth":
-            assert kind.sensitive and by_name["disability"].sensitive
-        else:
-            assert not kind.sensitive and not by_name["disability"].sensitive
         assert kind.categories == ("Physical disability", "Intellectual disability", "Others", "Prefer not to say", "Invalid response")
         assert kind.applies_when == ("disability", ("Yes",))
     assert "CHILD" in {f.name: f for f in _config("Parent").fields}["disability"].description
@@ -335,7 +328,7 @@ def test_persona_prompt_renders_with_the_engine_and_lists_every_field(sql, perso
 def test_persona_prompts_are_specific_to_their_persona(sql):
     prompts = {p: _seeded_prompt(sql, PERSONA_PROMPT_NAMES[p])[1] for p in PERSONA_NAMES}
     # Youth: a period conversion for income, several statuses, a dropout rule
-    assert "MONTHLY or YEARLY" in prompts["Youth"] and "convert first" in prompts["Youth"]
+    assert "divide it by 12" in prompts["Youth"] and "yearly (annual) income" in prompts["Youth"]
     assert "Not currently studying" in prompts["Youth"] and "both Studying and Working" in prompts["Youth"]
     assert "disability_type: the kinds they name" in prompts["Youth"]
     # General Public: sector of work
@@ -389,8 +382,8 @@ def test_out_of_range_age_and_a_stated_value_that_fits_no_band_are_unmapped_with
     answer = _answer(config, {"age": ("244", "244"), "monthly_household_income": (None, "between 60 and 90 thousand")})
     fields = {f.field_name: f for f in fx.parse_model_response(answer, config).fields}
     assert (fields["age"].status, fields["age"].value, fields["age"].raw_value) == ("unmapped", "Invalid response", "244")
-    # monthly_household_income is a sensitive field: its words are not stored (raw_value NULL) unless store_raw is set
-    assert (fields["monthly_household_income"].status, fields["monthly_household_income"].raw_value) == ("unmapped", None)
+    assert (fields["monthly_household_income"].status, fields["monthly_household_income"].raw_value) == (
+        "unmapped", "between 60 and 90 thousand")
 
 
 def test_each_persona_accepts_an_answer_with_every_configured_field_and_rejects_a_missing_or_extra_one():

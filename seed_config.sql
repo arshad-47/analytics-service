@@ -1691,7 +1691,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
     {
       "name": "monthly_household_income",
       "kind": "category",
-      "description": "The household income per MONTH, as a band. Asked only in the newer questionnaire. When the respondent speaks of a year (annual, yearly, per year, a lakh a year), divide the amount by 12 first, then pick the band; when it is per month, use it as is.",
+      "description": "The household income per MONTH, as a band, for every questionnaire version. The older questionnaire asked for the income per YEAR and the newer one per MONTH. When the amount is per year (the respondent says annual, yearly, per year, a lakh a year, or the bot asked for the yearly income and the respondent gives a bare amount), divide it by 12 first, then pick the band; when it is per month, use it as is.",
       "categories": [
         "Zero income / no income",
         "< ₹25,000",
@@ -1713,42 +1713,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "≥ ₹25,000 and < ₹66,000": "a monthly amount from 25,000 up to but not including 66,000; 'around 25,000' belongs here",
         "≥ ₹66,000 and < ₹83,000": "a monthly amount from 66,000 up to but not including 83,000",
         "≥ ₹83,000": "a monthly amount of 83,000 or more"
-      },
-      "sensitive": true,
-      "versions": [
-        "V2"
-      ]
-    },
-    {
-      "name": "annual_household_income",
-      "kind": "category",
-      "description": "The household income per YEAR, as a band. Asked only in the older questionnaire. When the respondent speaks of a month, multiply the amount by 12 first, then pick the band; when it is per year, use it as is.",
-      "categories": [
-        "Zero income / no income",
-        "< ₹3 lakh",
-        "≥ ₹3 lakh and < ₹8 lakh",
-        "≥ ₹8 lakh and < ₹10 lakh",
-        "≥ ₹10 lakh",
-        "Don't know",
-        "Prefer not to say",
-        "Invalid response",
-        "Unclear"
-      ],
-      "guidance": {
-        "Zero income / no income": "the household has no income",
-        "Don't know": "the respondent says they are unsure or do not know the household income",
-        "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
-        "Invalid response": "a given answer that is gibberish or has nothing to do with the question",
-        "Unclear": "a range that spans two or more bands, or an amount whose period (month or year) cannot be told",
-        "< ₹3 lakh": "a yearly amount above zero and below 3 lakh",
-        "≥ ₹3 lakh and < ₹8 lakh": "a yearly amount from 3 lakh up to but not including 8 lakh; 'around 4 lakh' belongs here",
-        "≥ ₹8 lakh and < ₹10 lakh": "a yearly amount from 8 lakh up to but not including 10 lakh",
-        "≥ ₹10 lakh": "a yearly amount of 10 lakh or more"
-      },
-      "sensitive": true,
-      "versions": [
-        "V1"
-      ]
+      }
     },
     {
       "name": "disability",
@@ -1765,8 +1730,7 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "No": "the respondent says there is none",
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
-      },
-      "sensitive": true
+      }
     },
     {
       "name": "disability_type",
@@ -1786,7 +1750,6 @@ SELECT '09e1cd04-4605-54e5-a535-8e21218bb05c'::uuid, 1, TRUE, $cfg$
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
         "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
       },
-      "sensitive": true,
       "multi": true,
       "applies_when": {
         "field": "disability",

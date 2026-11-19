@@ -89,7 +89,7 @@ def test_the_same_label_never_needs_it_with_a_config_and_is_still_safe_without()
 def test_the_seeded_personas_decide_as_documented():
     youth = parse_extraction_config(extraction_config_v1("Youth"))
     general = parse_extraction_config(extraction_config_v1("General Public"))
-    assert relabel_needs_reextraction(youth, "V1", "V2") is True       # annual (V1) <-> monthly (V2) household income
+    assert relabel_needs_reextraction(youth, "V1", "V2") is False      # one monthly income field for both versions
     assert relabel_needs_reextraction(general, "V1", "V2") is False    # no version-dependent field
     assert "General Public" in PERSONAS
 

@@ -197,9 +197,9 @@ def test_each_persona_extracts_with_its_own_prompt_and_stores_every_dots_field_a
                 assert (rows["age"]["value"], rows["age"]["status"], rows["age"]["raw_value"]) == (
                     expected_band, "extracted", "fourteen and a half")
                 assert list(rows["age"]["value_list"]) == [expected_band]
-            if persona == "Youth":      # V1: the monthly income was never asked, the code says so without the model
-                assert (rows["monthly_household_income"]["value"], rows["monthly_household_income"]["status"]) == ("N/A", "not_applicable")
-                assert (rows["annual_household_income"]["value"], rows["annual_household_income"]["status"]) == ("Not answered", "not_provided")
+            if persona == "Youth":      # one monthly income field for every version: not answered here, so not_provided
+                assert (rows["monthly_household_income"]["value"], rows["monthly_household_income"]["status"]) == ("Not answered", "not_provided")
+                assert "annual_household_income" not in rows
                 assert rows["disability_type"]["value"] == "N/A"       # no disability answer: the type does not apply
             prompt_version = await conn.fetchval(
                 "SELECT pv.id FROM prompt_version pv JOIN prompts pr ON pr.id = pv.prompt_id WHERE pr.name = $1",
