@@ -329,7 +329,16 @@ def test_restamp_repairs_a_general_public_persona_without_reprocessing_it():
 
 def test_restamp_repairs_a_youth_persona_and_resets_the_sessions_whose_fields_changed():
     async def body(conn, pool):
+        # the seeded Youth config asks the same fields in V1 and V2 now: keep the seeded program (the restamp tool needs its
+        # upload config) and add a V2-only field to its active extraction config (a scratch database: safe to change)
         program = _seeded("Youth")
+        own = copy.deepcopy(extraction_config_v1("Youth"))
+        own["fields"].append({"name": "only_v2", "kind": "free_text", "description": "asked since V2", "versions": ["V2"]})
+        await conn.execute(
+            "UPDATE config_version SET config = $1::jsonb WHERE is_active AND config_id = ("
+            "SELECT id FROM config WHERE config_type = 'feedback_extraction' AND tenant_code = $2 "
+            "AND program_id = $3::uuid AND session_type = $4)",
+            json.dumps(own), TENANT, program["program_id"], YOUTH)
         a, _ = await _ingest(conn, program, "89", YOUTH)
         b, _ = await _ingest(conn, program, "103", YOUTH)
         for sid in (a, b):

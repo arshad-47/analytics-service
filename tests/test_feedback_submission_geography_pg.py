@@ -4,13 +4,15 @@ extraction are written to submissions.state / district in the SAME transaction a
 later extraction is not valid, and cleared when the session is reset (persona change, questionnaire relabel).
 A config without the key leaves the columns alone. Fake LLM only. SYNTHETIC data only.
 """
+import copy
 import json
 
 import pytest
 
+import factories
 import pg_support
 from app.database.feedback_extraction_operations import extract_submission
-from seed_support import extraction_config_id
+from seed_support import extraction_config_id, extraction_config_v1
 from test_feedback_pii_masking_pg import MASKING_NAME, Fake, _mask_names, _run, _session
 
 DSN = pg_support.SERVER_URL
@@ -114,7 +116,11 @@ def test_a_relabel_that_resets_the_session_clears_the_copied_place():
     r = _relabel_helpers()
 
     async def body(conn, pool):
-        program = r._seeded("Youth")
+        # the seeded Youth config asks the same fields in V1 and V2 now: use a program config with a V2-only field
+        program = await r._program(conn)
+        own = copy.deepcopy(extraction_config_v1("Youth"))
+        own["fields"].append({"name": "only_v2", "kind": "free_text", "description": "asked since V2", "versions": ["V2"]})
+        await factories.add_config(conn, program, "any", r.YOUTH, own, config_type="feedback_extraction")
         y1, _ = await r._ingest(conn, program, "103", r.YOUTH)
         y2, _ = await r._ingest(conn, program, "103", r.YOUTH)
         for sid in (y1, y2):
