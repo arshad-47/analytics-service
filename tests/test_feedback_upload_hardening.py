@@ -225,7 +225,7 @@ def test_an_empty_respondent_row_is_kept_with_the_placeholder(config):
     events, skipped = build(make_df(session_with_an_empty_row(1)), config, report=report)
     assert skipped == []
     kept = by_sequence(events[0])[2]
-    assert kept["message"] == "[no text]" and kept["translatedMessage"] == "[no text]"
+    assert kept["message"] == "[no text]" and kept["translatedMessage"] is None      # CHANGED: no copy of the placeholder
     assert kept["parentSequence"] == 1 and kept["messageAt"] is not None
     assert len(events[0]["data"]["messages"]) == len(V1_STYLE)
     assert report["respondent_rows_without_text"] == 1

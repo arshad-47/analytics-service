@@ -661,13 +661,15 @@ def build_feedback_events(
         def row_texts(i: int, is_bot: bool) -> Tuple[str, Optional[str]]:
             """(text in the conversation language, English text) of a row; bot rows swap the CSV columns."""
             if i in placeholder_rows:
-                return placeholder, placeholder
+                return placeholder, None
             text_map = bot_map if is_bot else respondent_map
             conversation_text = mapped(text_map["message"])[i]
             english_text = mapped(text_map["translated_message"])[i]
             if _is_blank(conversation_text):
+                # only the English text exists: it is the message; the English column is not a second copy of it
                 conversation_text = english_text
-            if _is_blank(english_text):
+                english_text = None
+            elif _is_blank(english_text):
                 english_text = None   # the CSV gave no English text: stored as NULL, never a copy of the message
             return conversation_text, english_text
 
@@ -717,7 +719,7 @@ def build_feedback_events(
                 "questionKey": first_key,
                 "isFollowUp": False,
                 "message": synth_text,
-                "translatedMessage": synth_text,
+                "translatedMessage": None,
                 "messageAt": _format_utc(parsed_at[first]) if first in parsed_at else None,
                 "parentSequence": None,
             })

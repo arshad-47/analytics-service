@@ -523,7 +523,7 @@ class TestEvents:
             assert m["messageAt"] == "2026-10-02T04:39:20.000Z"
             if n % 2 == 0:                                              # question row
                 assert m["parentSequence"] is None
-                assert m["message"] == m["translatedMessage"]
+                assert m["message"] != "" and m["translatedMessage"] is None       # CHANGED: no copy of the question text
             else:                                                       # answer row
                 assert m["parentSequence"] == messages[n - 1]["sequence"]
                 assert m["questionKey"] == messages[n - 1]["questionKey"]
@@ -546,7 +546,7 @@ class TestEvents:
         answers = [m for m in data["messages"] if m["parentSequence"] is not None]
         questions = [m for m in data["messages"] if m["parentSequence"] is None]
         assert all(m["translatedMessage"] is None for m in answers)
-        assert all(m["translatedMessage"] == m["message"] for m in questions)    # English question text
+        assert all(m["translatedMessage"] is None and m["message"] != "" for m in questions)   # CHANGED: English question text, no copy
         assert any(m["message"] == "ಕಲಿಕೆ" for m in answers)
 
     # CHANGED: the default language no longer decides translatedMessage (it is None for every answer)

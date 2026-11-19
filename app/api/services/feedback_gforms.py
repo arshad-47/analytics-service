@@ -451,8 +451,8 @@ def build_gforms_events(
     submissionId = sessionId = id_factory() (a uuid4 string by default), drawn only for new responses.
     Messages are numbered 1..n: per answer a question row (odd; parentSequence null) then its answer
     row (even; parentSequence = the question's sequence); messageAt = the response's submission_date.
-    translatedMessage of an answer is None (a Google Forms response carries no translation; one comes later).
-    The question row carries the English text in both message and translatedMessage.
+    translatedMessage is None on every row (a Google Forms response carries no translation; one comes later). The
+    question row's message is the form's English question text.
 
     `config` (optional, keyword) supplies session_type, the forms' questionnaire_version, default_completion,
     language.default and the optional `location` block (state / district via aliases, same semantics as the Mitra builder). Without it
@@ -488,7 +488,7 @@ def build_gforms_events(
                 "questionKey": answer["question_key"],
                 "isFollowUp": False,
                 "message": answer["text"],
-                "translatedMessage": answer["text"],
+                "translatedMessage": None,
                 "messageAt": submitted,
                 "parentSequence": None,
             })
