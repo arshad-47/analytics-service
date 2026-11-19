@@ -961,10 +961,14 @@ For each field return an object with:
 ## Rules for this persona
 
 - No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
+- Invalid response: when a field lists Invalid response as an allowed category, any reply that is completely irrelevant, nonsensical, or unrelated to what was asked (such as naming a language, an object, greetings, numbers, or gibberish) MUST return "Invalid response" as "value" (with the respondent''s words in "raw"). Do NOT return null for "value" when the respondent gave an answer that is irrelevant or nonsense.
 - Only the fields listed above are asked in this questionnaire version: ignore any rule below about a field that is not listed.
 - age: the number the respondent states as their own age, in digits; decimals such as 15.5 are valid. A class, a birth year or "I am in college" is not an age. If an age is given only inside another answer, still use it. A range that spans more than one band or a vague answer ("thirty something") is Unclear.
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - state and district: follow the field text, including how "Delhi/NCR" and a named district are handled.
+  * If the answer has nothing to do with geography (such as naming a language like Hindi or English, an object, a person, greetings, or gibberish), return "Invalid response" as "value" with the raw text. Never return null.
+  * If the answer is a geographic location or direction that does not identify a specific state or district (for example "North India", "near mountains"), return "Unmapped".
+  * If the place is outside India, return "Outside India".
 - current_activity_status: what they do NOW. A student who also works (for example part time) gets both Studying and Working, as a JSON list. Someone who dropped out or is not enrolled anywhere is Not currently studying. Preparing for an exam as a student is Studying.
 - education_level and course_details: only for a respondent who studies; if the bot never asked, null. A dropout gets the last COMPLETED level. course_details uses only the values of the respondent''s education level.
 - institution_type: the kind of school or institution they study or studied in. A working respondent is also asked: use their answer about their past school. An answer about a college is Invalid response (the question is about schools).
@@ -1033,9 +1037,13 @@ For each field return an object with:
 ## Rules for this persona
 
 - No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
+- Invalid response: when a field lists Invalid response as an allowed category, any reply that is completely irrelevant, nonsensical, or unrelated to what was asked (such as naming a language, an object, greetings, numbers, or gibberish) MUST return "Invalid response" as "value" (with the respondent''s words in "raw"). Do NOT return null for "value" when the respondent gave an answer that is irrelevant or nonsense.
 - age: the number the respondent states as their own age, in digits; decimals are valid. A birth year or a date of birth is not an age. A range that spans more than one band or a vague answer ("thirty something") is Unclear.
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - state and district: follow the field text, including how "Delhi/NCR" and a named district are handled.
+  * If the answer has nothing to do with geography (such as naming a language like Hindi or English, an object, a person, greetings, or gibberish), return "Invalid response" as "value" with the raw text. Never return null.
+  * If the answer is a geographic location or direction that does not identify a specific state or district (for example "North India", "near mountains"), return "Unmapped".
+  * If the place is outside India, return "Outside India".
 - occupation: the sector of the respondent''s work. A job title maps to its sector (teacher or anganwadi teacher is Education, nurse is Health, farmer is Agriculture, shopkeeper is Retail and trade). If the work could sit in two sectors, the sector of the work wins over the employer. Someone between jobs or looking for work is Not currently working; homemaker, student and retired-or-other follow the guidance. A valid occupation that fits no sector (actor, driver, electrician, tailor, daily wage) is Others. "I work somewhere" or "in a private company" is Unclear. Invalid response only for a gibberish answer.
 
 ## PII check (whole conversation)
@@ -1100,8 +1108,12 @@ For each field return an object with:
 ## Rules for this persona
 
 - No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
+- Invalid response: when a field lists Invalid response as an allowed category, any reply that is completely irrelevant, nonsensical, or unrelated to what was asked (such as naming a language, an object, greetings, numbers, or gibberish) MUST return "Invalid response" as "value" (with the respondent''s words in "raw"). Do NOT return null for "value" when the respondent gave an answer that is irrelevant or nonsense.
 - Only the fields listed above are asked in this questionnaire version: ignore any rule below about a field that is not listed.
 - state and district: where the bot asked, the CHILD''s state and the district where the child goes to school; if the bot asked where the parent stays, use that. Follow the field text for "Delhi/NCR" and a named district.
+  * If the answer has nothing to do with geography (such as naming a language like Hindi or English, an object, a person, greetings, or gibberish), return "Invalid response" as "value" with the raw text. Never return null.
+  * If the answer is a geographic location or direction that does not identify a specific state or district (for example "North India", "near mountains"), return "Unmapped".
+  * If the place is outside India, return "Outside India".
 - child_gender: the gender of the CHILD ("boy" is Male, "girl" is Female, "other" is Others), never the parent''s. With several children, list every gender that applies once each, as a JSON list.
 - disability and disability_type: about the CHILD only, never the parent. disability_type: the kinds named (a JSON list when several); otherwise null.
 - respondent_relationship: the respondent''s relation to the child. Mother, Father; Guardian only when they say they are the guardian; an aunt, uncle, grandparent or other relative is Other relative; "parent" or "both parents" without saying which is Unmapped.
@@ -1172,7 +1184,11 @@ For each field return an object with:
 ## Rules for this persona
 
 - No answer: a reply that only says NA, N/A, idk, I do not know, don''t know, skip, none or nothing is NOT an answer: return null for that field so it is stored as Not answered; a lone symbol (- ? . 0) is Invalid response. The field''s own categories (for example Not sure, Don''t know) still apply when the field lists them.
+- Invalid response: when a field lists Invalid response as an allowed category, any reply that is completely irrelevant, nonsensical, or unrelated to what was asked (such as naming a language, an object, greetings, numbers, or gibberish) MUST return "Invalid response" as "value" (with the respondent''s words in "raw"). Do NOT return null for "value" when the respondent gave an answer that is irrelevant or nonsense.
 - state and district: where the respondent teaches. Follow the field text for "Delhi/NCR" and a named district.
+  * If the answer has nothing to do with geography (such as naming a language like Hindi or English, an object, a person, greetings, or gibberish), return "Invalid response" as "value" with the raw text. Never return null.
+  * If the answer is a geographic location or direction that does not identify a specific state or district (for example "North India", "near mountains"), return "Unmapped".
+  * If the place is outside India, return "Outside India".
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - institution_type: the kind of institution the respondent teaches at. If they say "other" and then name a kind (for example a trust school), the value is Others and the kind goes in raw. An aided school is Others. An answer about a college is Invalid response (the question is about schools).
 - teaching_level: the bot asks "primary, middle, high school or college". Primary is Primary (classes 1-5), middle is Middle (classes 6-8), "high school" is High school (classes 9-12); "college" alone is Undergraduate, and Postgraduate only when they say they teach a master''s level. Several levels (for example classes 6 to 10): every band that applies, once each, as a JSON list. Vocational training or other settings are Others.
