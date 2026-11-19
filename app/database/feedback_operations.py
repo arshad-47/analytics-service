@@ -626,6 +626,12 @@ async def _bot_rank_overview(conn, cfg: Mapping[str, Any]) -> List[Dict[str, Any
     return overview
 
 
+async def _bot_personas(conn, cfg: Mapping[str, Any]) -> List[tuple]:
+    """The personas (tenant, program, session_type, source) among the bot sessions ONE config governs."""
+    programs = sorted({row["program_id"] for row in await _governed_bot_rows(conn, cfg)}, key=lambda p: (p is not None, p))
+    return [(cfg["tenant_code"], program, cfg["session_type"], cfg["config_source"]) for program in programs]
+
+
 async def _restamp_bot_sessions(conn, cfg: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Recompute the bot-rank labels of every persona (program) among the bot sessions ONE config governs and relabel
@@ -636,9 +642,8 @@ async def _restamp_bot_sessions(conn, cfg: Mapping[str, Any]) -> Dict[str, Any]:
     without reprocessing), "reprocess": [submission_id] (set back to 'pending'; real-time mode does not start them
     by itself here, batch mode or the retry sweep picks them up)}.
     """
-    programs = sorted({row["program_id"] for row in await _governed_bot_rows(conn, cfg)}, key=lambda p: (p is not None, p))
-    personas = [(cfg["tenant_code"], program, cfg["session_type"], cfg["config_source"]) for program in programs]
-    await lock_personas(conn, personas)
+    personas = await _bot_personas(conn, cfg)
+    await lock_personas(conn, personas)       # (the sweep already holds them: see restamp_questionnaire_versions)
     sessions = 0
     relabelled = 0
     reprocess: List[str] = []
@@ -702,6 +707,10 @@ async def restamp_questionnaire_versions(
                 if session_type is not None and len(configs) > 1:
                     _exactly_one(configs, "", "versioned upload configs", _PICK_HINT)
                 keys = _result_keys(configs)
+                # Every persona of every config, locked once in ONE key order before anything else: configs are visited by
+                # program name but personas are locked by key, so locking them config by config could take two personas in
+                # opposite orders from a concurrent ingest that moves a session between them (a deadlock).
+                await lock_personas(conn, [p for cfg in configs for p in await _bot_personas(conn, cfg)])
                 for cfg in configs:
                     # Lock the config row, THEN read its active windows, and keep the lock until the commit: the
                     # windows read by _find_upload_configs above can be older than a set_questionnaire_version that

@@ -334,12 +334,18 @@ class IngestionConsumer:
         if settings.PROCESSING_MODE.lower().strip() != "real-time":
             logger.info(f"Batch mode enabled. {len(reset_ids)} relabelled session(s) stay 'pending' for the batch run.")
             return
-        async with db.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT submission_id FROM submissions WHERE tenant_code = $1 AND submission_id = ANY($2::text[]) "
-                "AND status = 'pending' ORDER BY submission_id",
-                tenant_code, reset_ids,
-            )
+        try:
+            async with db.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT submission_id FROM submissions WHERE tenant_code = $1 AND submission_id = ANY($2::text[]) "
+                    "AND status = 'pending' ORDER BY submission_id",
+                    tenant_code, reset_ids,
+                )
+        except Exception as exc:  # noqa: BLE001 - the ingest is committed; retrying the message could not start them
+            logger.error(
+                f"Could not look up the {len(reset_ids)} relabelled session(s) to start (tenant {tenant_code}): "
+                f"{type(exc).__name__}; they stay 'pending' for the batch run or a retry sweep.")
+            return
         pending = [row["submission_id"] for row in rows]
         to_start = pending[:MAX_RELABEL_DISPATCH_PER_INGEST]
         skipped = len(pending) - len(to_start)

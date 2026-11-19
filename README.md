@@ -192,8 +192,8 @@ The rest of this section describes the 1 Million Voices program, the first user 
 form field is the persona's leader category **name** as stored for the program (`Youth`, `Parent`, `General Public`,
 `Educator` as seeded), not the `session_type`: together with `program_name` and `tenant_code` it selects the program, and
 the program's active upload config for `source` fixes the one `session_type` every row of the file must carry (a row of
-another persona rejects the whole file; a program or leader name that does not exist is a 404). The endpoint rejects a body above the persona config's `max_csv_upload_bytes` (100 MB
-when seeded; see step 4). The Mitra
+another persona rejects the whole file; a program or leader name that does not exist is a 404). The endpoint rejects a body above the persona config's `max_csv_upload_bytes` (100 MiB,
+104,857,600 bytes, when seeded; see step 4). The Mitra
 export holds all personas in one file, so it is prepared before upload. These are operator tools in `tools/`; the
 service never calls them.
 
@@ -202,13 +202,13 @@ export: `split_mitra_export.py` is not part of the Docker image. The other tools
 (`feedback_config.py`, `questionnaire_versions.py`, `run_feedback_extraction.py`) are in the image and run inside the
 container, for example `docker exec <container> python tools/feedback_config.py show`.
 ```bash
-python tools/feedback_config.py show     # the max_csv_upload_bytes of each persona: 100000000 as seeded
+python tools/feedback_config.py show     # the max_csv_upload_bytes of each persona: 104857600 as seeded
 python tools/split_mitra_export.py all_4_persona_data.csv --out-dir out/ --max-mb 80
 # out/Youth_Voice.csv, out/General_Public_Voice.csv, out/Educator_Voice.csv, out/Parent_Voice_part1.csv, ... and split_summary.json
 ```
 `--max-mb` (1 MB = 1,000,000 bytes) must be **at or below the smallest `max_csv_upload_bytes / 1_000_000` of the
 personas in the export**: a part above its persona's cap is refused by the upload with 413. The example fits the seeded
-100,000,000 bytes; after `feedback_config.py set ... --key max_csv_upload_bytes --value 50000000` (step 4) split with
+104,857,600 bytes (100 MiB); after `feedback_config.py set ... --key max_csv_upload_bytes --value 50000000` (step 4) split with
 `--max-mb 50` or less (or run the tool once per persona with its own limit). The tool does not read the database.
 A session is never split across files, so a persona that is too big for one upload becomes several parts. Uploading
 the parts is safe: the delta check publishes only sessions that are new or grew. Uploading the SAME file again (same

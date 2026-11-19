@@ -22,6 +22,17 @@ with workflow.unsafe.imports_passed_through():
     from app.services.feedback_config_validation import FEEDBACK_PROCESS_STEP_NAMES
     from app.config import settings
 
+def _failure_stages(error: BaseException) -> Optional[list]:
+    """The stage list the extraction activity attached to its failure (ApplicationError details `{"stages": [...]}`,
+    reached through the ActivityError's cause), or None when the failure carries none."""
+    details = getattr(getattr(error, "cause", None), "details", None)
+    if isinstance(details, (list, tuple)) and len(details) > 0 and isinstance(details[0], dict):
+        stages = details[0].get("stages")
+        if isinstance(stages, list):
+            return stages
+    return None
+
+
 @workflow.defn
 class ConfigDrivenProcessingWorkflow:
     @workflow.run
@@ -257,6 +268,10 @@ class ConfigDrivenProcessingWorkflow:
                         s["status"] = "failed"
                         s["error"] = str(e)
                         s["completed_timestamp"] = workflow.now().isoformat()
+                        failed_stages = _failure_stages(e)
+                        if failed_stages is not None and s["name"] in FEEDBACK_PROCESS_STEP_NAMES:
+                            # the stages the extraction activity reached before it failed (it attaches them to its error)
+                            s["stages"] = failed_stages
                         break
 
             # Mark remaining pending steps as skipped

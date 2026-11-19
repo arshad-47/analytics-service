@@ -108,7 +108,9 @@ async def store_session(conn, program: Dict[str, str], session_type: str, source
     """Stores one session through the real ingest path; returns its submission id. The tests that use it are about
     version labels that come from date windows, which only apply to a session WITHOUT a bot id (a bot session's label
     is the rank of its bot id), so a conversation_rows session is stored and then turned into one carrying `version`
-    and no bot id (as_window_stamped_session); pass window_stamped=False to keep it a bot session."""
+    and no bot id (as_window_stamped_session); pass window_stamped=False to keep it a bot session.
+    It stores the default bot 101 first: do not mix it with other bot ids of the same persona in one test (the ingest
+    would rank them against each other and could relabel the others), use conversation_event for that."""
     window_stamped = event_options.pop("window_stamped", True)
     event = conversation_event(program, session_type, source, version, started_at, **event_options)
     await insert_or_update_submission(conn, event)

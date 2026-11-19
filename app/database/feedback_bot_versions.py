@@ -15,9 +15,14 @@ session that moved persona (operations._write_feedback_submission); the caller m
 does so in real-time mode, batch mode picks it up).
 
 Locking (this order everywhere, so no two writers can deadlock):
-  1. the persona advisory lock (lock_persona), the FIRST lock of the transaction (before the metadata upserts, any row
-     lock and the read of the bot ids), so two concurrent ingests of two new bots of one persona can not each compute
-     ranks without the other. A transaction that needs two personas takes them in key order (lock_personas);
+  0. the submission advisory lock (lock_submission), taken only by the ingest of one session and first of all, so the
+     writers of ONE session are serialized: the persona the session is stored in (and so the persona it leaves) is then
+     read after every earlier writer of that session committed. Nobody else takes it, and no transaction that holds a
+     persona lock waits for it, so it can not close a cycle;
+  1. the persona advisory lock (lock_persona), the first lock after that (before the metadata upserts, any row lock and
+     the read of the bot ids), so two concurrent ingests of two new bots of one persona can not each compute ranks
+     without the other. A transaction that needs several personas takes ALL of them in key order (lock_personas), also
+     the restamp sweep over several configs;
   2. the submissions rows, then the feedback_submissions rows (the order of the extraction save,
      feedback_extraction_operations.save_extraction), in ascending submission_id.
 The extraction save never takes the advisory lock, so it can only make a restamp wait, never deadlock with it.
@@ -84,6 +89,17 @@ def _program_text(program_id: Any) -> Optional[str]:
 def _lock_key(tenant_code: str, program_id: Any, session_type: str, source: str) -> str:
     """The persona as JSON, so that two personas can not share a key."""
     return "feedback_bot_versions:" + json.dumps([tenant_code, _program_text(program_id), session_type, source])
+
+
+async def lock_submission(conn, tenant_code: str, submission_id: str) -> None:
+    """
+    Transaction-level advisory lock of one feedback session, released at the end of the current transaction: the ingest
+    of a session takes it first, so two writers of the same session run one after the other (see the module docstring).
+    """
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        "feedback_submission:" + json.dumps([tenant_code, submission_id]),
+    )
 
 
 async def lock_persona(conn, tenant_code: str, program_id: Any, session_type: str, source: str) -> None:

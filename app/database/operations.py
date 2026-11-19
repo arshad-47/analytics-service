@@ -6,7 +6,8 @@ from typing import Dict, Any, Optional, List
 import asyncpg
 from datetime import datetime, timezone
 
-from app.database.feedback_bot_versions import apply_bot_version_ranks, label_for_incoming_bot, lock_personas
+from app.database.feedback_bot_versions import (
+    apply_bot_version_ranks, label_for_incoming_bot, lock_personas, lock_submission)
 from app.services.feedback_adapter_config import is_safe_code, is_safe_id, source_label_problem
 from app.services.feedback_constants import (
     ADAPTERS,
@@ -570,22 +571,24 @@ def _persona_key(session_type: Any, source: Any, program_id: Any) -> tuple:
 
 async def _stored_persona(conn: asyncpg.Connection, submission_id: str, tenant_code: str) -> Optional[tuple]:
     """
-    _persona_key of the stored feedback session, or None when it is not stored yet. Locks the submissions row, then the
-    feedback_submissions row, in the order of the extraction save (feedback_extraction_operations.save_extraction).
+    (_persona_key, questionnaire_version) of the stored feedback session, or None when it is not stored yet. Locks the
+    submissions row, then the feedback_submissions row, in the order of the extraction save
+    (feedback_extraction_operations.save_extraction); both values are read under those locks, so they are what the
+    last committed writer left.
     """
     program_text = await conn.fetchval(
         "SELECT program_id::text FROM submissions WHERE submission_id = $1 AND tenant_code = $2 FOR NO KEY UPDATE",
         submission_id, tenant_code,
     )
     stored = await conn.fetchval(
-        "SELECT json_build_array(session_type, source)::text FROM feedback_submissions "
+        "SELECT json_build_array(session_type, source, questionnaire_version)::text FROM feedback_submissions "
         "WHERE submission_id = $1 AND tenant_code = $2 FOR UPDATE",
         submission_id, tenant_code,
     )
     if stored is None:
         return None
-    session_type, source = json.loads(stored)
-    return _persona_key(session_type, source, program_text)
+    session_type, source, version = json.loads(stored)
+    return _persona_key(session_type, source, program_text), version
 
 
 async def _write_feedback_submission(
@@ -620,16 +623,18 @@ async def _write_feedback_submission(
         # app/database/feedback_bot_versions.py). A session that moves persona changes the ranks of its OLD persona too,
         # so both are locked, in key order.
         bot_id = None if is_natural_key else bot_info["bot_id"]
-        stored_version_before = None
         old_bot_persona = None
         if bot_id is not None:
+            # Writers of this one session run one after the other: the persona it is stored in, read just below, is then
+            # the one the last committed writer left (so a session that moved is re-ranked in the persona it LEFT).
+            await lock_submission(conn, tenant_code, submission_id)
             event_program = tags.get("programId")
             event_program = event_program.strip().lower() if isinstance(event_program, str) and len(event_program.strip()) > 0 else None
             if event_program is not None and not is_uuid(event_program):
                 raise ValueError(f"tags.programId must be a UUID; rejecting {ident}.")
             before = await conn.fetchrow(
                 """
-                SELECT fs.session_type, fs.source, fs.questionnaire_version, s.program_id::text AS program_id,
+                SELECT fs.session_type, fs.source, s.program_id::text AS program_id,
                        (fs.meta_data ->> 'bot_id') IS NOT NULL AS has_bot
                 FROM feedback_submissions fs
                 JOIN submissions s ON s.submission_id = fs.submission_id AND s.tenant_code = fs.tenant_code
@@ -641,7 +646,6 @@ async def _write_feedback_submission(
             effective_program = event_program if event_program is not None else (None if before is None else before["program_id"])
             personas_to_lock = [(tenant_code, effective_program, session_type, source)]
             if before is not None:
-                stored_version_before = before["questionnaire_version"]
                 if before["has_bot"]:
                     old_bot_persona = (tenant_code, before["program_id"], before["session_type"], before["source"])
                     personas_to_lock.append(old_bot_persona)
@@ -657,7 +661,8 @@ async def _write_feedback_submission(
         # The persona the stored session had before this event (session_type, source, program): it selects the
         # extraction config, prompt and closing keys. Read under the row locks in the order the extraction save takes
         # them (submissions, then feedback_submissions), so a persona change below is seen exactly once.
-        persona_before = await _stored_persona(conn, submission_id, tenant_code)
+        stored_before = await _stored_persona(conn, submission_id, tenant_code)
+        persona_before, locked_version_before = (None, None) if stored_before is None else stored_before
 
         # 1. submissions. Unlike story/discussion this must not reset status/updated_at on every conflict,
         # so the update is conditional and keeps identity fields (session_id, submission_date) once set.
@@ -833,7 +838,9 @@ async def _write_feedback_submission(
             persona_changed = persona_before != _persona_key(session_type, source, program_now)
         # The bot rank of the session itself changed (a redelivery with another bot id, or a lower bot id among the
         # other sessions): what the older label's extraction wrote no longer describes it either.
-        version_changed = stored_version_before is not None and stored_version_before != questionnaire_version
+        # (compared with the version read under the row locks: an unlocked read could be one that a concurrent relabel
+        # of this session has since changed, and a valid extraction would be deleted for nothing)
+        version_changed = bot_id is not None and locked_version_before is not None and locked_version_before != questionnaire_version
         if persona_changed or version_changed:
             # The session moved to another persona (a redelivery that changed only session_type, source or program):
             # what the OLD persona's extraction wrote no longer describes it. Drop its extracted fields and its

@@ -482,3 +482,31 @@ def test_only_a_budget_with_nothing_left_for_the_call_is_a_setup_error(monkeypat
 def test_the_default_activity_budget_always_holds_the_default_llm_timeout():
     """The workflow's floor of 300 s leaves 180 s: the clamp is only ever hit by a config timeout above 180 s."""
     assert constants.extraction_activity_timeout_seconds(None) - constants.ACTIVITY_MARGIN_SECONDS == 180
+
+
+def test_a_failure_while_saving_still_carries_the_usage_of_the_calls_that_were_billed(monkeypatch):
+    config = _config()
+
+    async def fake_inputs(conn, submission_id, tenant_code):
+        return {"session_type": "Parent_Voice", "questionnaire_version": "V1",
+                "rows": [_row(1, "Q", answer=False), _row(2, "Mysuru")], "fingerprint": "f", "identity": None,
+                "loaded_at": None, "config_row": {"id": "cv", "config": config}, "closing_keys": []}
+
+    async def fake_prompt(conn, config):
+        return {"id": "pv", "name": "Some Prompt", "system_prompt": SYSTEM, "user_prompt": USER}
+
+    async def database_down(*args, **kwargs):
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(ops, "load_submission_inputs", fake_inputs)
+    monkeypatch.setattr(ops, "load_prompt_for_config", fake_prompt)
+    monkeypatch.setattr(ops, "save_extraction", database_down)
+    answer = json.dumps({"fields": {name: {"value": None, "raw": None} for name in config.field_names()},
+                         "pii": {"detected": False, "types": []}})
+
+    def llm(prompt, **kwargs):
+        return answer, {"prompt_tokens": 3, "completion_tokens": 2}
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(ops.extract_submission(_Pool(object()), "s1", "t", llm_function=llm, write=True))
+    assert raised.value.usage["prompt_tokens"] == 3 and raised.value.usage["completion_tokens"] == 2

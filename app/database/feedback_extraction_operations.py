@@ -690,7 +690,7 @@ async def extract_submission(
     (retryable), both before any call.
     `on_stage` (the Temporal activity passes its heartbeat) is called with the stage list (see StageTracker) after each
     stage change; the final list is `SubmissionOutcome.stages`, and `exc.stages` of an error raised after the calls
-    began. The complete answers of the calls are stored with the session (not when it is flagged) and the answer of a
+    began. The complete answers of the calls are stored with the session, flagged ones included (an export query decides what may leave), and the answer of a
     call that was not usable is kept, cut, in its failed llm log.
     """
     if llm_function is None:
@@ -804,6 +804,14 @@ async def extract_submission(
                 )
             except StaleExtractionError as exc:
                 stale = exc
+            except Exception as exc:
+                # Any other failure of the write (a database error, a deadlock): nothing was stored, but the calls were
+                # made and billed, so the callers that total the usage of failed sessions (the CLI) must see them.
+                if run.llm_called:
+                    exc.usage = dict(run.usage)
+                    if run.masking is not None:
+                        exc.prior_usage = dict(run.masking.usage)
+                raise
         if stale is not None:
             stale.stages = tracker.stages
             # Nothing was written (the transaction rolled back). The call still cost tokens: log it as failed.

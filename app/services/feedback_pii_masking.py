@@ -258,7 +258,7 @@ def masking_meta(result: MaskingResult, prompt_version_id: Any) -> Dict[str, Any
     """
     The object stored under feedback_submissions.meta_data.extraction.masking: masked text, and what was found with the
     model's justification per finding (never the matched text). The raw answer of the call is stored separately, under
-    meta_data.extraction.responses, and only for a session that is not flagged.
+    meta_data.extraction.responses, for every session including a flagged one (an export query decides what may leave).
     """
     return {
         "prompt_version_id": str(prompt_version_id),

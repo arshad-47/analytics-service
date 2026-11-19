@@ -371,11 +371,11 @@ def submission_geography(config: ExtractionConfig, result: "ExtractionResult") -
         name = config.submission_columns[column]
         found = by_name.get(name)
         valid = found is not None and found.status == STATUS_EXTRACTED and found.value is not None \
-            and found.value not in NON_GEOGRAPHY_LABELS \
+            and _norm(found.value) not in _NON_GEOGRAPHY_KEYS \
             and not (specs[name].kind == KIND_FREE_TEXT and found.value in specs[name].categories)
         out[column] = found.value if valid else None
-    if "district" in out and out.get("state") is None:
-        out["district"] = None
+    if "state" in out and out["state"] is None:
+        out["district"] = None       # a district never stays without its state, also one an earlier extraction copied
     return out
 
 
@@ -405,6 +405,11 @@ def _parse_prompt_variables(raw: Any) -> Dict[str, str]:
 
 
 _ENGINE_LABEL_KEYS = frozenset({LABEL_NOT_ANSWERED.casefold(), LABEL_NOT_APPLICABLE.casefold()})
+# The special labels compared in the normalised spelling: a config may spell a category 'unmapped' or 'UNMAPPED', and
+# the stored value keeps the configured spelling, so a comparison must not depend on the case.
+_UNMAPPED_KEYS = frozenset(_norm(label) for label in UNMAPPED_LABELS)
+_EXCLUSIVE_KEYS = frozenset(_norm(label) for label in EXCLUSIVE_LABELS)
+_NON_GEOGRAPHY_KEYS = frozenset(_norm(label) for label in NON_GEOGRAPHY_LABELS)
 
 
 def _parse_aliases(raw: Any, categories: Tuple[str, ...], where: str) -> Dict[str, Tuple[str, ...]]:
@@ -441,6 +446,8 @@ def _parse_bands(raw: Any, categories: Tuple[str, ...], where: str) -> Tuple[Ban
         label = item.get("label")
         if not _is_text(label) or label != label.strip() or _norm(label) in labels:
             raise ExtractionConfigError(f"{label_where}.label must be a unique non-empty string")
+        if _norm(label) in _ENGINE_LABEL_KEYS:
+            raise ExtractionConfigError(f"{label_where}.label must not be {LABEL_NOT_ANSWERED!r} or {LABEL_NOT_APPLICABLE!r} (the engine writes those)")
         labels.add(_norm(label))
         low, high = item.get("min"), item.get("max")
         for bound in (low, high):
@@ -1447,7 +1454,11 @@ def _map_field_values(spec: FieldSpec, entry: Mapping[str, Any], limits: Limits,
             multi_items = None
             if spec.multi and value is not None:
                 # a single string that lists several ("Studying, Working"): split it at commas and semicolons
-                multi_items = [part.strip() for part in re.split(r"[;,]", value) if len(part.strip()) > 0]
+                # (a category that itself contains a semicolon is matched whole first)
+                if _canonical(spec, value) is not None:
+                    multi_items = [value]
+                else:
+                    multi_items = [part.strip() for part in re.split(r"[;,]", value) if len(part.strip()) > 0]
     raw = _text_or_none(entry.get("raw"), f"{where} raw")
     confidence = entry.get("confidence")
     if confidence is not None:
@@ -1530,7 +1541,7 @@ def _canonical(spec: FieldSpec, text: str) -> Optional[str]:
 
 def _labelled(spec: FieldSpec, label: str, raw: Optional[str], confidence: Optional[float]) -> FieldResult:
     """An answer that is one of the field's labels; a label that needs a person's look (Unmapped ...) is `unmapped`."""
-    status = STATUS_UNMAPPED if label in UNMAPPED_LABELS else STATUS_EXTRACTED
+    status = STATUS_UNMAPPED if _norm(label) in _UNMAPPED_KEYS else STATUS_EXTRACTED
     return FieldResult(spec.name, label, raw, status, confidence)
 
 
@@ -1583,9 +1594,9 @@ def _map_multi(spec: FieldSpec, items: Optional[List[str]], raw: Optional[str], 
         return FieldResult(spec.name, None, raw if raw is not None else MULTI_VALUE_SEPARATOR.join(items)[:limits.max_raw_chars],
                            STATUS_UNMAPPED, confidence)
     in_config_order = [c for c in spec.categories if c in matched]
-    real = [c for c in in_config_order if c not in EXCLUSIVE_LABELS]
+    real = [c for c in in_config_order if _norm(c) not in _EXCLUSIVE_KEYS]
     ordered = real if len(real) > 0 else in_config_order[:1]
-    unmapped = off_list or any(c in UNMAPPED_LABELS for c in ordered)
+    unmapped = off_list or any(_norm(c) in _UNMAPPED_KEYS for c in ordered)
     return FieldResult(spec.name, MULTI_VALUE_SEPARATOR.join(ordered),
                        raw if raw is not None else MULTI_VALUE_SEPARATOR.join(items)[:limits.max_raw_chars],
                        STATUS_UNMAPPED if unmapped else STATUS_EXTRACTED, confidence, None, tuple(ordered))
@@ -1623,6 +1634,10 @@ def _map_banded(spec: FieldSpec, value: Any, raw: Optional[str], confidence: Opt
         number = float(value.strip())
         shown = value.strip()
     else:
+        if isinstance(value, int) and abs(value) >= 10 ** MAX_BAND_NUMBER_DIGITS:
+            # far outside any age, and float() would raise OverflowError for a few hundred digits: unmapped, words kept
+            return FieldResult(spec.name, None, raw if raw is not None else str(value)[:config.limits.max_raw_chars],
+                               STATUS_UNMAPPED, confidence)
         number = float(value)
         shown = repr(value) if isinstance(value, float) else str(value)
     kept_raw = raw if raw is not None else shown[:config.limits.max_raw_chars]
@@ -1819,8 +1834,8 @@ def extract(
     # `conversation` is now the MASKED copy (local check, then the model); the extraction call reads the original unless
     # the config says 'masked'. The masked copy is what the masking step stores for sharing, never what is analysed first.
     extraction_conversation = original if config.pii_policy.extraction_text == EXTRACTION_TEXT_ORIGINAL else conversation
-    prompt = render_prompt(system_template, user_template, config, extraction_conversation)
     try:
+        prompt = render_prompt(system_template, user_template, config, extraction_conversation)
         note(STAGE_METADATA_EXTRACTION, "running")
         try:
             answer, usage = call_llm(prompt)

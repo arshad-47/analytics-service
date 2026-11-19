@@ -402,6 +402,36 @@ def test_the_workflow_copies_the_stages_into_the_step_entry_of_process_status(mo
     asyncio.run(run())
 
 
+def test_a_failed_extraction_step_keeps_the_stages_the_activity_attached_to_its_error(monkeypatch):
+    from temporalio.exceptions import ApplicationError
+
+    async def run():
+        stages = [{"name": STAGE_PII_MASKING, "status": "success", "seconds": 1.0},
+                  {"name": STAGE_METADATA_EXTRACTION, "status": "failed"}]
+        failure = RuntimeError("Activity task failed")                 # what the SDK raises: an ActivityError ...
+        failure.cause = ApplicationError("bad answer (stage: metadata_extraction)", {"stages": stages}, non_retryable=True)
+        exec_mock, _, _ = install_fake_workflow_context(
+            monkeypatch, activity_results={workflows_module.feedback_metadata_extraction_activity: failure})
+        with pytest.raises(RuntimeError):
+            await workflows_module.ConfigDrivenProcessingWorkflow().run(_payload([{"name": STEP_NAME}]))
+        last = exec_mock.call_args_list[-1].args[1]
+        step = last["process_status"]["steps"][0]
+        assert step["status"] == "failed" and step["stages"] == stages
+        assert last["process_status"]["failed_at_step"] == STEP_NAME
+    asyncio.run(run())
+
+
+def test_a_failure_without_stage_details_leaves_the_failed_step_without_stages(monkeypatch):
+    async def run():
+        exec_mock, _, _ = install_fake_workflow_context(
+            monkeypatch, activity_results={workflows_module.feedback_metadata_extraction_activity: RuntimeError("plain")})
+        with pytest.raises(RuntimeError):
+            await workflows_module.ConfigDrivenProcessingWorkflow().run(_payload([{"name": STEP_NAME}]))
+        step = exec_mock.call_args_list[-1].args[1]["process_status"]["steps"][0]
+        assert step["status"] == "failed" and "stages" not in step
+    asyncio.run(run())
+
+
 def test_a_result_without_stages_leaves_the_step_entry_as_before(monkeypatch):
     async def run():
         install_fake_workflow_context(

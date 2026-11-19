@@ -243,6 +243,34 @@ def test_process_message_dispatches_the_reset_sessions_after_the_ingested_one(mo
     asyncio.run(run())
 
 
+def test_the_ingested_session_is_started_before_the_reset_ones(monkeypatch):
+    async def run():
+        consumer, trigger, dispatch = _wired_consumer(monkeypatch, {
+            "submission_id": "new-1", "status": "pending", "changed": True,
+            "restamped_submission_ids": ["b"], "reset_submission_ids": ["b"]})
+        calls = []
+        trigger.side_effect = lambda *args: calls.append(("trigger",) + args) or "started"
+        dispatch.side_effect = lambda *args: calls.append(("dispatch",) + args)
+        await consumer.process_message(json.dumps(_event()))
+        assert calls == [("trigger", "new-1", "mitra", "feedback"), ("dispatch", ["b"], "mitra", "feedback")]
+    asyncio.run(run())
+
+
+def test_a_failing_pending_lookup_does_not_stop_the_message_and_logs_only_the_exception_type(monkeypatch, caplog):
+    async def run():
+        consumer = consumer_module.IngestionConsumer()
+        conn = install_fake_db(monkeypatch, consumer_module)
+        conn.fetch = AsyncMock(side_effect=RuntimeError("secret detail"))
+        monkeypatch.setattr(consumer_module.settings, "PROCESSING_MODE", "real-time")
+        trigger = AsyncMock()
+        monkeypatch.setattr(consumer, "_trigger_realtime_workflow", trigger)
+        with caplog.at_level("ERROR"):
+            await consumer._dispatch_reset_sessions(["a", "b"], "mitra", "feedback")     # does not raise
+        trigger.assert_not_awaited()
+        assert "RuntimeError" in caplog.text and "secret detail" not in caplog.text
+    asyncio.run(run())
+
+
 def test_process_message_also_dispatches_when_only_other_sessions_changed(monkeypatch):
     async def run():
         consumer, trigger, dispatch = _wired_consumer(monkeypatch, {

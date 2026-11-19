@@ -190,6 +190,27 @@ def test_a_mixed_persona_resets_only_what_changed_per_label_pair():
     _run(body)
 
 
+def test_one_sweep_decides_per_label_pair_a_label_only_relabel_next_to_a_reset():
+    """V1 and V2 ask the same fields, V3 asks one more: bot 89 arriving shifts a V1 -> V2 (keeps its extraction) and b V2 -> V3 (reset)."""
+    async def body(conn, pool):
+        program = await _program(conn)
+        own = copy.deepcopy(extraction_config_v1("General Public"))
+        own["fields"].append({"name": "only_v3", "kind": "free_text", "description": "asked since V3", "versions": ["V3"]})
+        await factories.add_config(conn, program, "any", GENERAL, own, config_type="feedback_extraction")
+        a, _ = await _ingest(conn, program, "103", GENERAL)                    # V1
+        b, _ = await _ingest(conn, program, "200", GENERAL)                    # V2
+        await _pretend_extracted(conn, a)
+        await _pretend_extracted(conn, b)
+        before_a = await _state(conn, a)
+        _, res = await _ingest(conn, program, "89", GENERAL)                   # a: V1 -> V2, b: V2 -> V3
+        assert sorted(res["restamped_submission_ids"]) == sorted([a, b])
+        assert res["reset_submission_ids"] == [b]                              # only the pair whose fields differ
+        _unchanged_but_label(before_a, await _state(conn, a), "V2")
+        after_b = await _state(conn, b)
+        assert after_b["version"] == "V3" and after_b["status"] == "pending" and after_b["extracted"] == []
+    _run(body)
+
+
 def test_a_persona_without_an_active_extraction_config_takes_the_safe_side():
     async def body(conn, pool):
         program = await _program(conn)

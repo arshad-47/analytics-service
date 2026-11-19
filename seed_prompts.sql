@@ -1254,7 +1254,7 @@ Mask any detail or combination of details that could identify or reveal a specif
 - Phone numbers, Aadhaar, PAN, voter, bank, student or any other ID number, e-mail addresses, social media handles. Tags: <PHONE>, <ID>, <EMAIL>
 - Specific small places or institutions: a village, a ward, a street, a house address, the name of one specific school or college (for example "DPS School"). Tag: <LOCATION>
   Example: "my daughter studies in Dumra village school" -> "my daughter studies in <LOCATION>"
-- The answer to a question that asks for a name, a number, an address or a school, even when it is a single word.
+- The answer to a question that asks for the name of a person, a contact or ID number, an address, or the name of one specific school, even when it is a single word (an age, a class or a generic school type is not covered here, see Do NOT mask below).
 - A role or relationship that points to ONE specific person when it comes with a place or an office: "my husband is the MLA of our constituency", "sister of the district collector", "the only headmaster of the school in X". Replace the role with <ID>. A plain occupation ("teacher", "farmer") is not one of these and stays.
 
 ### Do NOT mask
