@@ -39,16 +39,8 @@ SELECT
     cs.language,
     1 AS sequence,
     NULL::bigint,
-    (SELECT COALESCE(NULLIF(h.alt_introductory_message, ''), h.introductory_message)
-       FROM chatbot_historicalbotvernacular h
-      WHERE h.company_bot_id = cs.company_bot_id AND h.language = 'en'
-        AND h.history_type <> '-' AND h.history_date <= s.first_at
-      ORDER BY h.history_date DESC, h.history_id DESC LIMIT 1),       -- message (English)
-    (SELECT COALESCE(NULLIF(h.alt_introductory_message, ''), h.introductory_message)
-       FROM chatbot_historicalbotvernacular h
-      WHERE h.company_bot_id = cs.company_bot_id AND h.language = cs.language
-        AND h.history_type <> '-' AND h.history_date <= s.first_at
-      ORDER BY h.history_date DESC, h.history_id DESC LIMIT 1),       -- translated_message
+    intro.msg_en,
+    intro.msg_trans,
     NULL::timestamptz,
     NULL::timestamptz,
     NULL::text,
@@ -64,6 +56,19 @@ JOIN LATERAL (
     FROM chatbot_companychat
     WHERE session = cs.session
 ) s ON s.first_at IS NOT NULL
+JOIN LATERAL (
+    SELECT
+        (SELECT COALESCE(NULLIF(h.alt_introductory_message, ''), h.introductory_message)
+           FROM chatbot_historicalbotvernacular h
+          WHERE h.company_bot_id = cs.company_bot_id AND h.language = 'en'
+            AND h.history_type <> '-' AND h.history_date <= s.first_at
+          ORDER BY h.history_date DESC, h.history_id DESC LIMIT 1) AS msg_en,
+        (SELECT COALESCE(NULLIF(h.alt_introductory_message, ''), h.introductory_message)
+           FROM chatbot_historicalbotvernacular h
+          WHERE h.company_bot_id = cs.company_bot_id AND h.language = cs.language
+            AND h.history_type <> '-' AND h.history_date <= s.first_at
+          ORDER BY h.history_date DESC, h.history_id DESC LIMIT 1) AS msg_trans
+) intro ON (intro.msg_en IS NOT NULL OR intro.msg_trans IS NOT NULL)
 WHERE cs.session_type = ANY(%(session_types)s::text[])
   AND (cardinality(%(submission_ids)s::bigint[]) = 0 OR cs.id = ANY(%(submission_ids)s::bigint[]))
 ORDER BY bot_id, session, sequence;

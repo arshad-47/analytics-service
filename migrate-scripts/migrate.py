@@ -299,6 +299,8 @@ class Config:
         self.feedback_session_types = feedback_st
         self.all_session_types = configured_st or (self.story_disc_session_types + self.feedback_session_types)
         self.feedback_batch_size = int(e.get("FEEDBACK_BATCH_SIZE", 50))
+        if self.feedback_batch_size <= 0:
+            raise ValueError("FEEDBACK_BATCH_SIZE must be greater than zero.")
 
 
 # --------------------------------------------------------------------------- logging
