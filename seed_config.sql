@@ -2895,6 +2895,7 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
         "High school (classes 9-12)",
         "Undergraduate",
         "Postgraduate",
+        "Skill programs",
         "Others",
         "Prefer not to say",
         "Invalid response"
@@ -2906,9 +2907,10 @@ SELECT '1e8f69f1-2626-58dc-a0e8-786edcfc58fe'::uuid, 1, TRUE, $cfg$
         "High school (classes 9-12)": "classes 9 to 12",
         "Undergraduate": "teaches bachelor's degree students (for example BCom, BCA, BE)",
         "Postgraduate": "teaches master's degree students (for example MBA, MCom)",
-        "Others": "a valid level that is none of these: vocational or skill training (ITI, polytechnic), tuitions, home schooling, alternative education, doctoral programmes",
+        "Skill programs": "includes ITI, polytechnic, vocational programmes educators",
+        "Others": "valid education level categories that don't sit in any of the defined categories like homeschooling, alternative education, doctoral programs, tuitions",
         "Prefer not to say": "the respondent explicitly says they do not want to share it (a skipped question or no answer is null, not this)",
-        "Invalid response": "a given answer that is gibberish or has nothing to do with the question"
+        "Invalid response": "a given answer that is gibberish, irrelevant, or has nothing to do with the question"
       },
       "multi": true
     }
