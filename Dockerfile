@@ -33,6 +33,7 @@ COPY main.py schema.sql seed_prompts.sql seed_themes.sql seed_config.sql run_all
 # is NOT here: it prepares a CSV on the workstation that holds the export. tests/test_feedback_upgrade.py derives the
 # required list from the repo, so a tool named in a message or the README must be added to this line.
 COPY tools/feedback_config.py tools/questionnaire_versions.py tools/run_feedback_extraction.py tools/
+COPY migrate-scripts/ migrate-scripts/
 RUN chmod +x run_all.sh
 
 RUN mkdir -p logs downloads
