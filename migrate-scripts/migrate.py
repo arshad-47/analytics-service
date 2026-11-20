@@ -272,13 +272,33 @@ class Config:
         self.default_program_name = cfg_defaults.get("program_name") or e.get("DEFAULT_PROGRAM_NAME", "Shiksha Chaupals")
         self.default_leader_category_name = cfg_defaults.get("leader_category") or e.get("DEFAULT_LEADER_CATEGORY_NAME", "Women leader (WL)")
 
-        # Collect configured session types across programs
+        # Collect configured session types across programs (partitioned by submission_type)
         configured_st = []
+        story_disc_st = []
+        feedback_st = []
         for _, p_conf in self.programs_config.get("programs", {}).items():
+            sub_t = p_conf.get("submission_type")
             for st in p_conf.get("session_types", []):
                 if st and st not in configured_st:
                     configured_st.append(st)
-        self.all_session_types = configured_st or (self.discussion_types + ["guest-mi-story", "guided-validation", "mi-story"])
+                if st:
+                    if sub_t == "feedback":
+                        if st not in feedback_st:
+                            feedback_st.append(st)
+                    else:
+                        if st not in story_disc_st:
+                            story_disc_st.append(st)
+
+        # Only default story/discussion session types if the user has NOT explicitly configured programs
+        has_explicit_programs = bool(self.programs_config.get("programs"))
+        if not story_disc_st and not has_explicit_programs:
+            self.story_disc_session_types = self.discussion_types + ["guest-mi-story", "guided-validation", "mi-story"]
+        else:
+            self.story_disc_session_types = story_disc_st
+
+        self.feedback_session_types = feedback_st
+        self.all_session_types = configured_st or (self.story_disc_session_types + self.feedback_session_types)
+        self.feedback_batch_size = int(e.get("FEEDBACK_BATCH_SIZE", 50))
 
 
 # --------------------------------------------------------------------------- logging
@@ -656,17 +676,26 @@ def format_sql(raw_sql: str, params: dict) -> str:
         escaped_values = (str(value).replace("'", "''") for value in values)
         return "ARRAY[" + ", ".join(f"'{value}'" for value in escaped_values) + "]::text[]"
 
+    def format_bigint_array(name: str) -> str:
+        values = [v for v in params.get(name, []) if str(v).isdigit()]
+        if not values:
+            return "ARRAY[]::bigint[]"
+        return "ARRAY[" + ", ".join(str(v) for v in values) + "]::bigint[]"
+
     for name in ("tenants", "submission_ids", "discussion_types", "session_types", "excluded_sources"):
         sql = sql.replace(f"%({name})s::text[]", format_text_array(name))
+        sql = sql.replace(f"%({name})s::bigint[]", format_bigint_array(name))
     return sql
 
 
 def fetch_candidate_ids(source: Any, cfg: Config) -> list[dict]:
+    if not cfg.story_disc_session_types:
+        return []
     sql_path = BASE_DIR / "candidate_ids.sql"
     sql = sql_path.read_text(encoding="utf-8")
     params = {
         "tenants": cfg.tenants,
-        "session_types": cfg.all_session_types,
+        "session_types": cfg.story_disc_session_types,
         "discussion_types": cfg.discussion_types,
         "excluded_sources": cfg.excluded_sources,
     }
@@ -677,9 +706,27 @@ def fetch_candidate_ids(source: Any, cfg: Config) -> list[dict]:
         raise RuntimeError("Direct PostgreSQL connection to SL Prod DB is not supported without MetabaseClient.")
 
 
+def fetch_candidate_feedback_ids(source: Any, cfg: Config) -> list[dict]:
+    if not cfg.feedback_session_types:
+        return []
+    sql_path = BASE_DIR / "candidate_feedback_ids.sql"
+    if not sql_path.exists():
+        return []
+    sql = sql_path.read_text(encoding="utf-8")
+    params = {
+        "session_types": cfg.feedback_session_types,
+        "excluded_sources": cfg.excluded_sources,
+    }
+    formatted_sql = format_sql(sql, params)
+    if isinstance(source, MetabaseClient):
+        return source.execute_query(formatted_sql)
+    else:
+        raise RuntimeError("Direct PostgreSQL connection to SL Prod DB is not supported without MetabaseClient.")
+
+
 # --------------------------------------------------------------------------- transformation & classification
-def classify_by_config(row: dict, cfg: Config) -> tuple[Optional[str], str, str]:
-    """Returns (submission_type, program_name, leader_category) using programs_config.json session_types or fallbacks."""
+def classify_by_config(row: dict, cfg: Config) -> tuple[Optional[str], str, str, Optional[str]]:
+    """Returns (submission_type, program_name, leader_category, source) using programs_config.json session_types or fallbacks."""
     session_type = row.get("session_type")
 
     # 1. Match against configured programs by session_type
@@ -688,15 +735,15 @@ def classify_by_config(row: dict, cfg: Config) -> tuple[Optional[str], str, str]
         sub_type = p_conf.get("submission_type")
         s_types = p_conf.get("session_types", [])
         if session_type and session_type in s_types:
-            return sub_type, p_conf.get("name", cfg.default_program_name), p_conf.get("leader_category", cfg.default_leader_category_name)
+            return sub_type, p_conf.get("name", cfg.default_program_name), p_conf.get("leader_category", cfg.default_leader_category_name), p_conf.get("source")
 
     # 2. Fall back to standard discussion session types
     if session_type in cfg.discussion_types:
-        return "discussion", cfg.default_program_name, cfg.default_leader_category_name
+        return "discussion", cfg.default_program_name, cfg.default_leader_category_name, None
 
     if cfg.unknown_policy == "story":
-        return "story", cfg.default_program_name, cfg.default_leader_category_name
-    return None, cfg.default_program_name, cfg.default_leader_category_name
+        return "story", cfg.default_program_name, cfg.default_leader_category_name, None
+    return None, cfg.default_program_name, cfg.default_leader_category_name, None
 
 
 def clean_image_urls(urls: Optional[list]) -> list[str]:
@@ -773,7 +820,8 @@ def enrich_row(row: dict, geo: GeoMapping, org_resolver: OrganizationResolver, c
 
 # --------------------------------------------------------------------------- upload api client
 def post_csv_to_upload_api(cfg: Config, report_type: str, program_name: str, leader_category: str,
-                           csv_content: str, filename: str, tenant_code: str, log: logging.Logger) -> bool:
+                           csv_content: str, filename: str, tenant_code: str, log: logging.Logger,
+                           source: Optional[str] = None) -> bool:
     """
     Submits generated CSV batch to Analytics API (/v1/upload/).
     Upload API validates, publishes to Kafka, persists to DB, and starts Temporal.
@@ -788,6 +836,8 @@ def post_csv_to_upload_api(cfg: Config, report_type: str, program_name: str, lea
         "leader_category": leader_category,
         "tenant_code": tenant_code,
     }
+    if source:
+        fields["source"] = source
     for name, value in fields.items():
         body.write(f"--{boundary}\r\n".encode("utf-8"))
         body.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
@@ -919,6 +969,30 @@ def build_discussion_csv_row(enriched_row: dict, raw_row: dict) -> dict:
     }
 
 
+FEEDBACK_CSV_COLUMNS = [
+    "bot_id", "bot_name", "session_type", "session_status", "session",
+    "submission_id", "language", "sequence", "conversation_row_id",
+    "message", "translated_message", "created_at", "updated_at",
+    "stage", "receiver_id", "sender_id", "audio_file", "file_url", "other_params"
+]
+
+
+def format_feedback_csv_row(row: dict) -> dict:
+    """Formats a feedback conversation row returned from Metabase/DB into CSV format."""
+    out = {}
+    for col in FEEDBACK_CSV_COLUMNS:
+        val = row.get(col)
+        if val is None:
+            out[col] = ""
+        elif isinstance(val, (dict, list)):
+            out[col] = json.dumps(val)
+        elif isinstance(val, datetime):
+            out[col] = iso_z(val) or ""
+        else:
+            out[col] = str(val)
+    return out
+
+
 # --------------------------------------------------------------------------- pipeline orchestrator
 def run_pipeline(cfg: Config, source: Any, geo: GeoMapping, org_resolver: OrganizationResolver,
                  log: logging.Logger, run_id: str, dry_run: bool) -> str:
@@ -942,76 +1016,127 @@ def run_pipeline(cfg: Config, source: Any, geo: GeoMapping, org_resolver: Organi
     log.info("Step 2: Fetching candidate IDs from SL [MItra] DB...")
     candidates = fetch_candidate_ids(source, cfg)
     candidate_id_set = {str(r["submission_id"]) for r in candidates if r.get("submission_id")}
-    log.info("Found %d candidate submission IDs in SL Prod DB.", len(candidate_id_set))
+    log.info("Found %d candidate story/discussion submission IDs in SL Prod DB.", len(candidate_id_set))
+
+    feedback_candidates = fetch_candidate_feedback_ids(source, cfg)
+    candidate_fb_id_set = {str(r["submission_id"]) for r in feedback_candidates if r.get("submission_id")}
+    if candidate_fb_id_set:
+        log.info("Found %d candidate feedback session IDs in SL Prod DB.", len(candidate_fb_id_set))
 
     # Delta:
     # Strictly new submissions: ID not present in Analytics DB
     new_ids = candidate_id_set - existing_ids
     delta_ids = sorted(list(new_ids), key=lambda x: int(x) if x.isdigit() else x)
-    log.info("Step 3: Computed Delta: %d new submission(s) to fetch and ingest.", len(delta_ids))
+    log.info("Step 3: Computed Delta: %d new story/discussion submission(s) to fetch and ingest.", len(delta_ids))
 
-    if not delta_ids:
+    new_fb_ids = candidate_fb_id_set - existing_ids
+    delta_fb_ids = sorted(list(new_fb_ids), key=lambda x: int(x) if x.isdigit() else x)
+    if candidate_fb_id_set:
+        log.info("Computed Feedback Delta: %d new feedback session(s) to fetch and ingest.", len(delta_fb_ids))
+
+    if not delta_ids and not delta_fb_ids:
         log.info("No delta to process. Analytics DB is already fully synchronized!")
         return "success"
 
     # Fetch full data for delta_ids in batches
-    sql_path = BASE_DIR / "submission.sql"
-    sql = sql_path.read_text(encoding="utf-8")
-
     story_rows = []
     discussion_rows = []
     sent_tuples = []
 
-    # Process in chunks of batch_size
-    chunk_size = cfg.batch_size
-    total_raw_rows = 0
-    skipped_classification = 0
-    for i in range(0, len(delta_ids), chunk_size):
-        chunk = delta_ids[i:i + chunk_size]
-        params = {
-            "tenants": cfg.tenants,
-            "submission_ids": chunk,
-            "session_types": cfg.all_session_types,
-            "discussion_types": cfg.discussion_types,
-            "excluded_sources": cfg.excluded_sources,
-            "window_start": None,
-            "window_end": None,
-        }
-        formatted_sql = format_sql(sql, params)
-        if isinstance(source, MetabaseClient):
-            rows = source.execute_query(formatted_sql)
-        else:
-            raise RuntimeError("Direct PostgreSQL connection to SL Prod DB is not supported without MetabaseClient.")
+    if delta_ids:
+        sql_path = BASE_DIR / "submission.sql"
+        sql = sql_path.read_text(encoding="utf-8")
 
-        total_raw_rows += len(rows)
-        for row in rows:
-            sub_id = str(row.get("chat_session_id"))
-            sub_type, prog_name, leader_cat = classify_by_config(row, cfg)
-            if not sub_type:
-                skipped_classification += 1
-                continue
-
-            enriched = enrich_row(row, geo, org_resolver, cfg, sub_type)
-            if sub_type == "story":
-                story_rows.append((prog_name, leader_cat, build_story_csv_row(enriched, row, cfg.story_columns), (row["story_id"], sub_type, sub_id)))
+        # Process in chunks of batch_size
+        chunk_size = cfg.batch_size
+        total_raw_rows = 0
+        skipped_classification = 0
+        for i in range(0, len(delta_ids), chunk_size):
+            chunk = delta_ids[i:i + chunk_size]
+            params = {
+                "tenants": cfg.tenants,
+                "submission_ids": chunk,
+                "session_types": cfg.story_disc_session_types,
+                "discussion_types": cfg.discussion_types,
+                "excluded_sources": cfg.excluded_sources,
+                "window_start": None,
+                "window_end": None,
+            }
+            formatted_sql = format_sql(sql, params)
+            if isinstance(source, MetabaseClient):
+                rows = source.execute_query(formatted_sql)
             else:
-                disc_row = build_discussion_csv_row(enriched, row)
-                if disc_row is None:
-                    log.warning(
-                        "Skipping discussion submission %s (story_id: %s): missing or non-positive participant count.",
-                        sub_id, row.get("story_id")
-                    )
+                raise RuntimeError("Direct PostgreSQL connection to SL Prod DB is not supported without MetabaseClient.")
+
+            total_raw_rows += len(rows)
+            for row in rows:
+                sub_id = str(row.get("chat_session_id"))
+                sub_type, prog_name, leader_cat, _ = classify_by_config(row, cfg)
+                if not sub_type:
                     skipped_classification += 1
                     continue
-                discussion_rows.append((prog_name, leader_cat, disc_row, (row["story_id"], sub_type, sub_id)))
 
-    log.info("Query returned %d row(s) from SL Prod DB across all chunks (skipped %d unclassified).",
-             total_raw_rows, skipped_classification)
-    log.info("Prepared %d story row(s) and %d discussion row(s) for ingestion.", len(story_rows), len(discussion_rows))
+                enriched = enrich_row(row, geo, org_resolver, cfg, sub_type)
+                if sub_type == "story":
+                    story_rows.append((prog_name, leader_cat, build_story_csv_row(enriched, row, cfg.story_columns), (row["story_id"], sub_type, sub_id)))
+                else:
+                    disc_row = build_discussion_csv_row(enriched, row)
+                    if disc_row is None:
+                        log.warning(
+                            "Skipping discussion submission %s (story_id: %s): missing or non-positive participant count.",
+                            sub_id, row.get("story_id")
+                        )
+                        skipped_classification += 1
+                        continue
+                    discussion_rows.append((prog_name, leader_cat, disc_row, (row["story_id"], sub_type, sub_id)))
+
+        log.info("Query returned %d row(s) from SL Prod DB across all story/discussion chunks (skipped %d unclassified).",
+                 total_raw_rows, skipped_classification)
+        log.info("Prepared %d story row(s) and %d discussion row(s) for ingestion.", len(story_rows), len(discussion_rows))
+
+    # Fetch full data for delta_fb_ids in batches
+    feedback_sessions_map: dict[tuple[str, str, str], dict[str, list[dict]]] = {}
+    total_feedback_rows = 0
+    if delta_fb_ids:
+        fb_sql_path = BASE_DIR / "feedback.sql"
+        fb_sql = fb_sql_path.read_text(encoding="utf-8")
+        fb_chunk_size = cfg.feedback_batch_size
+        log.info("Fetching %d delta feedback session(s) from SL Prod DB in chunks of %d...", len(delta_fb_ids), fb_chunk_size)
+
+        for i in range(0, len(delta_fb_ids), fb_chunk_size):
+            fb_chunk = delta_fb_ids[i:i + fb_chunk_size]
+            params = {
+                "session_types": cfg.feedback_session_types,
+                "submission_ids": fb_chunk,
+            }
+            formatted_sql = format_sql(fb_sql, params)
+            if isinstance(source, MetabaseClient):
+                fb_rows = source.execute_query(formatted_sql)
+            else:
+                raise RuntimeError("Direct PostgreSQL connection to SL Prod DB is not supported without MetabaseClient.")
+
+            total_feedback_rows += len(fb_rows)
+            for row in fb_rows:
+                sub_type, prog_name, leader_cat, src = classify_by_config(row, cfg)
+                if sub_type != "feedback":
+                    continue
+                src_val = src or "mitra"
+                grp_key = (prog_name, leader_cat, src_val)
+                sess_id = str(row.get("session") or row.get("submission_id"))
+                formatted_fb_row = format_feedback_csv_row(row)
+                feedback_sessions_map.setdefault(grp_key, {}).setdefault(sess_id, []).append(formatted_fb_row)
+
+        total_sessions_prepared = sum(len(s_map) for s_map in feedback_sessions_map.values())
+        log.info("Query returned %d feedback row(s) representing %d session(s) across all personas.",
+                 total_feedback_rows, total_sessions_prepared)
 
     if dry_run:
         log.info("[DRY-RUN] Sample Story row: %s", story_rows[0][2] if story_rows else "None")
         log.info("[DRY-RUN] Sample Discussion row: %s", discussion_rows[0][2] if discussion_rows else "None")
+        if feedback_sessions_map:
+            first_grp = next(iter(feedback_sessions_map.values()))
+            first_sess_rows = next(iter(first_grp.values())) if first_grp else []
+            log.info("[DRY-RUN] Sample Feedback session (%d rows): %s", len(first_sess_rows), first_sess_rows[0] if first_sess_rows else "None")
         return "success"
 
     # Post batches to Upload API
@@ -1031,7 +1156,7 @@ def run_pipeline(cfg: Config, source: Any, geo: GeoMapping, org_resolver: Organi
             for (prog, ldr), group_rows in grouped_rows.items()
             for start in range(0, len(group_rows), cfg.batch_size)
         ]
-        success = True
+        part_success = True
         multiple_groups = len(upload_parts) > 1
         for part_index, ((prog, ldr), part_rows) in enumerate(upload_parts, 1):
             buf = io.StringIO()
@@ -1044,17 +1169,47 @@ def run_pipeline(cfg: Config, source: Any, geo: GeoMapping, org_resolver: Organi
             group_suffix = f"_group_{part_index}" if multiple_groups else ""
             fn = f"migration_{r_type}_{run_id}_{ts}{group_suffix}.csv"
             if not post_csv_to_upload_api(cfg, r_type, prog, ldr, buf.getvalue(), fn, cfg.target_tenant_code, log):
-                success = False
+                part_success = False
             else:
                 batch_sub_ids = [str(meta_tuple[2]) for _, _, _, meta_tuple in part_rows if len(meta_tuple) > 2 and meta_tuple[2]]
                 tracker = SubmittedIdTracker(cfg.sent_cache_file)
                 tracker.record_sent_ids(batch_sub_ids, log)
-        return success
+        return part_success
+
+    # Helper to post feedback groups
+    def post_feedback_batches(sessions_map: dict[tuple[str, str, str], dict[str, list[dict]]]) -> bool:
+        fb_success = True
+        for (prog, ldr, src), sessions_dict in sessions_map.items():
+            session_keys = list(sessions_dict.keys())
+            for start_idx in range(0, len(session_keys), cfg.feedback_batch_size):
+                chunk_keys = session_keys[start_idx:start_idx + cfg.feedback_batch_size]
+                chunk_rows = [r for k in chunk_keys for r in sessions_dict[k]]
+                if not chunk_rows:
+                    continue
+
+                buf = io.StringIO()
+                writer = csv.DictWriter(buf, fieldnames=FEEDBACK_CSV_COLUMNS)
+                writer.writeheader()
+                for r in chunk_rows:
+                    writer.writerow(r)
+
+                part_idx = (start_idx // cfg.feedback_batch_size) + 1
+                fn = f"migration_feedback_{ldr.replace(' ', '_')}_{run_id}_{ts}_part{part_idx}.csv"
+                if not post_csv_to_upload_api(cfg, "feedback", prog, ldr, buf.getvalue(), fn, cfg.target_tenant_code, log, source=src):
+                    fb_success = False
+                else:
+                    batch_sub_ids = list({str(r["submission_id"]) for r in chunk_rows if r.get("submission_id")})
+                    tracker = SubmittedIdTracker(cfg.sent_cache_file)
+                    tracker.record_sent_ids(batch_sub_ids, log)
+        return fb_success
 
     if not post_batch_group(story_rows, "story"):
         success = False
 
     if not post_batch_group(discussion_rows, "discussion"):
+        success = False
+
+    if not post_feedback_batches(feedback_sessions_map):
         success = False
 
     return "success" if success else "failed"
