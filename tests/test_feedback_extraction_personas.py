@@ -216,7 +216,7 @@ def test_educator_lists_are_the_finalised_ones_and_a_teacher_of_several_levels_g
     by_name = {f.name: f for f in _config("Educator").fields}
     level = by_name["teaching_level"]
     assert level.categories == ("Pre-primary", "Primary (classes 1-5)", "Middle (classes 6-8)", "High school (classes 9-12)",
-                                "Undergraduate", "Postgraduate", "Others", "Prefer not to say", "Invalid response")
+                                "Undergraduate", "Postgraduate", "Skill programs", "Others", "Prefer not to say", "Invalid response")
     assert level.multi and "Postgraduate only when" in level.description
     assert by_name["institution_type"].categories == ("Government", "Private", "Others", "Not sure", "Prefer not to say", "Invalid response")
 
