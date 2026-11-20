@@ -1191,7 +1191,7 @@ For each field return an object with:
   * If the place is outside India, return "Outside India".
 - gender: map the respondent''s words with the guidance above; "skip" or no answer is null (the code stores Not answered); an explicit "do not want to say" is Prefer not to say.
 - institution_type: the kind of institution the respondent teaches at. If they say "other" and then name a kind (for example a trust school), the value is Others and the kind goes in raw. An aided school is Others. An answer about a college is Invalid response (the question is about schools).
-- teaching_level: the bot asks "primary, middle, high school or college". Primary is Primary (classes 1-5), middle is Middle (classes 6-8), "high school" is High school (classes 9-12); "college" alone is Undergraduate, and Postgraduate only when they say they teach a master''s level. Several levels (for example classes 6 to 10): every band that applies, once each, as a JSON list. Vocational training or other settings are Others.
+- teaching_level: the bot asks "primary, middle, high school or college". Primary is Primary (classes 1-5), middle is Middle (classes 6-8), "high school" is High school (classes 9-12); "college" alone is Undergraduate, and Postgraduate only when they say they teach a master''s level. Several levels (for example classes 6 to 10): every band that applies, once each, as a JSON list. Vocational training, ITI or polytechnic are Skill programs; homeschooling, alternative education, doctoral programs or tuitions are Others.
 
 ## PII check (whole conversation)
 
