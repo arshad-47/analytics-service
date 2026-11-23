@@ -58,6 +58,8 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _TRAILING_JUNK = ' /"”“'
 _MAX_LISTED = 20
 _DEFAULT_LANGUAGE = "en"
+# Indic scripts Unicode ranges: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam
+_NON_ENGLISH_SCRIPT_RE = re.compile(r"[\u0900-\u0D7F]")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -387,13 +389,25 @@ def prepare_gforms_responses(
 
         answers: List[Dict[str, str]] = []
         kinds: List[Optional[str]] = []
+        non_english_cols: List[str] = []
+        enforce_english = config.get("language", {}).get("english_only", False)
         for _, question, col in ordered:
             value = cells[col][i]
             if _normalise_answer(value) == "":
                 continue
+            cleaned_val = value.strip()
+            if enforce_english:
+                if _NON_ENGLISH_SCRIPT_RE.search(cleaned_val):
+                    non_english_cols.append(col)
+                elif question.get("question_key") == "LANGUAGE_IDENTIFICATION" and cleaned_val.lower() not in ("english", "en"):
+                    non_english_cols.append(col)
             kinds.append(question.get("kind"))
             answers.append({"question_key": question["question_key"], "text": question["text"],
-                            "answer": value.strip()})
+                            "answer": cleaned_val})
+        if non_english_cols:
+            problems.append(
+                f"Non-English content detected in column(s): {', '.join(non_english_cols)}"
+            )
         if len(answers) == 0:
             problems.append("The response has no non-blank answer")
 

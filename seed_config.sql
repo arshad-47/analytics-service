@@ -251,7 +251,12 @@ SELECT '957b809a-028a-4139-8455-881d24696eb7'::uuid, 1, TRUE, $cfg$
   "timestamp_column": "Timestamp",
   "datetime": {
     "formats": [
-      "%m/%d/%Y %H:%M:%S"
+      "%m/%d/%Y %H:%M:%S",
+      "%m/%d/%Y",
+      "%d/%m/%Y",
+      "%d/%m/%Y %H:%M:%S",
+      "%Y-%m-%d",
+      "%Y-%m-%d %H:%M:%S"
     ],
     "fallback_timezone": "Asia/Kolkata"
   },
@@ -264,6 +269,7 @@ SELECT '957b809a-028a-4139-8455-881d24696eb7'::uuid, 1, TRUE, $cfg$
   ],
   "language": {
     "default": "en",
+    "english_only": true,
     "script_detect": {
       "kn": "[\\u0C80-\\u0CFF]"
     },
@@ -636,7 +642,12 @@ SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
   "timestamp_column": "Timestamp",
   "datetime": {
     "formats": [
-      "%m/%d/%Y %H:%M:%S"
+      "%m/%d/%Y %H:%M:%S",
+      "%m/%d/%Y",
+      "%d/%m/%Y",
+      "%d/%m/%Y %H:%M:%S",
+      "%Y-%m-%d",
+      "%Y-%m-%d %H:%M:%S"
     ],
     "fallback_timezone": "Asia/Kolkata"
   },
@@ -649,6 +660,7 @@ SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
   ],
   "language": {
     "default": "en",
+    "english_only": true,
     "script_detect": {
       "kn": "[\\u0C80-\\u0CFF]"
     },
@@ -686,7 +698,8 @@ SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
         },
         {
           "headers": [
-            "Does your child study in government school or private school?"
+            "Does your child study in government school or private school?",
+            "What type of school / college does your child study in?"
           ],
           "question_key": "SCHOOL_TYPE",
           "text": "Does your child study in government school or private school?",
@@ -782,6 +795,141 @@ SELECT '34bd6a47-1f76-4760-bf45-bea23bea72be'::uuid, 1, TRUE, $cfg$
         }
       ],
       "questionnaire_version": "V1"
+    },
+    "parents_survey_v2": {
+      "name": "Parents Survey V2 (Multilingual)",
+      "questionnaire_version": "V2",
+      "questions": [
+        {
+          "headers": [
+            "Language"
+          ],
+          "kind": "metadata",
+          "question_key": "LANGUAGE_IDENTIFICATION",
+          "text": "Language"
+        },
+        {
+          "headers": [
+            "Which state does your child stay in?",
+            "Which State do you stay in?"
+          ],
+          "kind": "metadata",
+          "question_key": "STATE_IDENTIFICATION",
+          "text": "Which state does your child stay in?"
+        },
+        {
+          "headers": [
+            "Which district does your child stay in?"
+          ],
+          "kind": "metadata",
+          "question_key": "DISTRICT_IDENTIFICATION",
+          "text": "Which district does your child stay in?"
+        },
+        {
+          "headers": [
+            "What is your relationship to the child?"
+          ],
+          "kind": "metadata",
+          "question_key": "RESPONDENT_RELATION",
+          "text": "What is your relationship to the child?"
+        },
+        {
+          "headers": [
+            "Which school or college does your child or did your child study in?"
+          ],
+          "kind": "metadata",
+          "question_key": "SCHOOL_TYPE",
+          "text": "Which school or college does your child or did your child study in?"
+        },
+        {
+          "headers": [
+            "What is your child's gender?"
+          ],
+          "kind": "metadata",
+          "question_key": "GENDER_IDENTIFICATION",
+          "text": "What is your child's gender?"
+        },
+        {
+          "headers": [
+            "In which class does your child study?"
+          ],
+          "kind": "metadata",
+          "question_key": "CHILD_CLASS",
+          "text": "In which class does your child study?"
+        },
+        {
+          "headers": [
+            "Does your child have any disability? Knowing this will help us understand your experiences better."
+          ],
+          "kind": "metadata",
+          "question_key": "DISABILITY_STATUS",
+          "text": "Does your child have any disability? Knowing this will help us understand your experiences better."
+        },
+        {
+          "headers": [
+            "Did you get an opportunity to go to school or college? If yes, till where did you study?"
+          ],
+          "kind": "metadata",
+          "question_key": "PARENT_EDUCATION",
+          "text": "Did you get an opportunity to go to school or college? If yes, till where did you study?"
+        },
+        {
+          "headers": [
+            "How satisfied are you with how your child is learning and growing in school or college?"
+          ],
+          "kind": "open",
+          "question_key": "ACADEMIC_PROGRESS_SATISFACTION",
+          "text": "How satisfied are you with how your child is learning and growing in school or college?"
+        },
+        {
+          "headers": [
+            "Please share why you think so"
+          ],
+          "kind": "open",
+          "question_key": "ACADEMIC_PROGRESS_REASON",
+          "text": "Please share why you think so"
+        },
+        {
+          "headers": [
+            "When your child grows up, what kind of work and life do you wish they will have?"
+          ],
+          "kind": "open",
+          "question_key": "FUTURE_ASPIRATION",
+          "text": "When your child grows up, what kind of work and life do you wish they will have?"
+        },
+        {
+          "headers": [
+            "Which are the top three skills you think young people need to do well in the future?"
+          ],
+          "kind": "open",
+          "question_key": "FUTURE_SKILLS",
+          "text": "Which are the top three skills you think young people need to do well in the future?"
+        },
+        {
+          "headers": [
+            "What changes would you like to see in schools or colleges to better prepare your children for their future?"
+          ],
+          "kind": "open",
+          "question_key": "SCHOOL_CHANGES",
+          "text": "What changes would you like to see in schools or colleges to better prepare your children for their future?"
+        },
+        {
+          "headers": [
+            "What all are you currently doing to support your child's future?"
+          ],
+          "kind": "open",
+          "question_key": "HOME_LEARNING_SUPPORT",
+          "text": "What all are you currently doing to support your child's future?"
+        },
+        {
+          "headers": [
+            "As a final thought, what do you think would help your child most to have a successful future?"
+          ],
+          "kind": "open",
+          "question_key": "KEY_SUPPORT_FOR_FUTURE",
+          "text": "As a final thought, what do you think would help your child most to have a successful future?"
+        }
+      ]
     }
   },
   "max_csv_upload_bytes": 104857600,
@@ -996,7 +1144,12 @@ SELECT '6543fdb5-8d6e-4929-ae6e-576d7237f38a'::uuid, 1, TRUE, $cfg$
   "timestamp_column": "Timestamp",
   "datetime": {
     "formats": [
-      "%m/%d/%Y %H:%M:%S"
+      "%m/%d/%Y %H:%M:%S",
+      "%m/%d/%Y",
+      "%d/%m/%Y",
+      "%d/%m/%Y %H:%M:%S",
+      "%Y-%m-%d",
+      "%Y-%m-%d %H:%M:%S"
     ],
     "fallback_timezone": "Asia/Kolkata"
   },
@@ -1009,6 +1162,7 @@ SELECT '6543fdb5-8d6e-4929-ae6e-576d7237f38a'::uuid, 1, TRUE, $cfg$
   ],
   "language": {
     "default": "en",
+    "english_only": true,
     "script_detect": {
       "kn": "[\\u0C80-\\u0CFF]"
     },
@@ -2164,7 +2318,8 @@ SELECT '973cd290-fbe9-5e02-9eba-861804e5f91d'::uuid, 1, TRUE, $cfg$
       },
       "multi": true,
       "versions": [
-        "V1"
+        "V1",
+        "V2"
       ]
     },
     {

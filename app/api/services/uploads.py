@@ -1009,11 +1009,15 @@ def _build_dlq_messages(skipped: List[dict], record_id: int, tenant_code: str, s
     messages = []
     for entry in skipped:
         problems = entry["problems"]
+        sub_id = entry.get("submissionId") or (
+            f"gforms-upload-{record_id}-row-{entry['row']}" if entry.get("row") is not None else None
+        )
+        sess_id = entry.get("sessionId") or sub_id
         value = {
             "submissionType": FEEDBACK_REPORT_TYPE,
             "eventType": "create",
-            "submissionId": entry.get("submissionId"),
-            "sessionId": entry.get("sessionId"),
+            "submissionId": sub_id,
+            "sessionId": sess_id,
             "tenantCode": tenant_code,
             "source": source,
             "csvUploadId": record_id,
@@ -1029,9 +1033,9 @@ def _build_dlq_messages(skipped: List[dict], record_id: int, tenant_code: str, s
         where = f" (row {entry['row']})" if entry.get("row") is not None else ""
         headers = {
             "reason": f"Skipped feedback session{where}: {'; '.join(problems)}"[:1000],
-            "submissionId": entry.get("submissionId"),
+            "submissionId": sub_id,
             "tenantCode": tenant_code,
-            "sessionId": entry.get("sessionId"),
+            "sessionId": sess_id,
         }
         messages.append((json.dumps(value, default=str), headers))
     return messages
@@ -1395,6 +1399,12 @@ async def _process_feedback_inline(
         return
 
     if skipped:
+        # Assign synthetic row-based submissionId/sessionId if missing before logging and DLQ
+        for entry in skipped:
+            if not entry.get("submissionId") and entry.get("row") is not None:
+                synthetic_id = f"gforms-upload-{record_id}-row-{entry['row']}"
+                entry["submissionId"] = synthetic_id
+                entry["sessionId"] = synthetic_id
         logger.warning(
             "record %s: %d session(s)/response(s) were skipped (sent to the DLQ): %s",
             record_id, len(skipped), skipped[:20],
