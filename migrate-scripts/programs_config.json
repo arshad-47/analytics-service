@@ -34,6 +34,42 @@
         "SLC"
       ],
       "leader_category": "School Leader"
+    },
+    "1mv_parent": {
+      "name": "1M Voice",
+      "submission_type": "feedback",
+      "session_types": [
+        "Parent_Voice"
+      ],
+      "leader_category": "Parent",
+      "source": "mitra"
+    },
+    "1mv_youth": {
+      "name": "1M Voice",
+      "submission_type": "feedback",
+      "session_types": [
+        "Youth_Voice"
+      ],
+      "leader_category": "Youth",
+      "source": "mitra"
+    },
+    "1mv_general": {
+      "name": "1M Voice",
+      "submission_type": "feedback",
+      "session_types": [
+        "General_Public_Voice"
+      ],
+      "leader_category": "General Public",
+      "source": "mitra"
+    },
+    "1mv_educator": {
+      "name": "1M Voice",
+      "submission_type": "feedback",
+      "session_types": [
+        "Educator_Voice"
+      ],
+      "leader_category": "Educator",
+      "source": "mitra"
     }
   },
   "defaults": {
