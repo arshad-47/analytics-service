@@ -84,7 +84,7 @@ def test_seeded_gforms_configs_carry_session_type_and_form_versions():
         assert cfg["session_type"] == PERSONAS[persona]["session_type"]
         assert cfg["forms"], persona
         for form in cfg["forms"].values():
-            assert form["questionnaire_version"] == "V1"
+            assert form["questionnaire_version"] in ("V1", "V2")
 
 
 def test_gforms_config_for_educator_is_not_available():

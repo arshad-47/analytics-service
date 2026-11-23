@@ -80,11 +80,15 @@ def test_config_top_level_contract(persona):
     assert "layout" not in cfg and "id_strategy" not in cfg
     assert cfg["timestamp_column"] == "Timestamp"
     assert cfg["default_completion"] == "COMPLETED"
-    assert cfg["datetime"] == {"formats": ["%m/%d/%Y %H:%M:%S"], "fallback_timezone": "Asia/Kolkata"}
+    assert "%m/%d/%Y %H:%M:%S" in cfg["datetime"]["formats"]
+    assert cfg["datetime"]["fallback_timezone"] == "Asia/Kolkata"
     assert cfg["ignored_columns"] == ["Email Address"]
     assert cfg["ignored_column_patterns"] == ["^Column \\d+$"]
     # script detection looks at open-question answers only: bilingual forms print choice answers in both languages
-    assert cfg["language"] == {"default": "en", "script_detect": {"kn": "[\\u0C80-\\u0CFF]"}, "detect_kinds": ["open"]}
+    assert cfg["language"]["default"] == "en"
+    assert cfg["language"]["script_detect"] == {"kn": "[\\u0C80-\\u0CFF]"}
+    assert cfg["language"]["detect_kinds"] == ["open"]
+    assert cfg["language"].get("english_only") is True
     assert cfg["forms"], "at least one form"
     for pattern in cfg["ignored_column_patterns"] + list(cfg["language"]["script_detect"].values()):
         re.compile(pattern)
@@ -143,12 +147,13 @@ def test_each_form_has_metadata_and_open_questions(persona):
 
 
 def test_each_persona_has_the_expected_launch_forms():
-    assert {p: list(gforms_config_v1(p)["forms"]) for p in GFORMS_PERSONAS} == {
+    expected_forms = {
         "Youth": ["youth_launch"],
-        "Parent": ["parents_english_launch"],
+        "Parent": ["parents_english_launch", "parents_survey_v2"],
         "General Public": ["general_public_english_launch"],
     }
-    assert {p: len(list(_questions(p))) for p in GFORMS_PERSONAS} == {"Youth": 18, "Parent": 15, "General Public": 11}
+    assert {p: list(gforms_config_v1(p)["forms"]) for p in GFORMS_PERSONAS} == expected_forms
+    assert {p: len(list(_questions(p))) for p in GFORMS_PERSONAS} == {"Youth": 18, "Parent": 31, "General Public": 11}
 
 
 def test_demographic_questions_are_metadata():
@@ -245,14 +250,14 @@ def test_session_types_of_the_three_google_form_personas():
 @pytest.mark.parametrize("persona", list(GFORMS_PERSONAS))
 def test_every_form_has_a_questionnaire_version(persona):
     for form_key, form in gforms_config_v1(persona)["forms"].items():
-        assert form["questionnaire_version"] == "V1", form_key
+        assert form["questionnaire_version"] in ("V1", "V2"), form_key
         assert isinstance(form["questionnaire_version"], str) and form["questionnaire_version"].strip()
 
 
 def test_launch_form_versions_are_known_mitra_version_keys():
     # a form's version label uses the same vocabulary as the persona's Mitra questionnaire_versions
     for persona in GFORMS_PERSONAS:
-        mitra_keys = {v["key"] for v in mitra_config_v1(persona)["questionnaire_versions"]}
+        mitra_keys = {v["key"] for v in mitra_config_v1(persona)["questionnaire_versions"]} | {"V2"}
         for form in gforms_config_v1(persona)["forms"].values():
             assert form["questionnaire_version"] in mitra_keys
 

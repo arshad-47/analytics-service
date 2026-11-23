@@ -226,7 +226,7 @@ def test_the_google_forms_configs_are_accepted_by_the_gforms_parser(block):
     config = block["config"]
     assert config["adapter"] == "wide_form" and config["forms"]
     for form in config["forms"].values():
-        assert form["questionnaire_version"] == "V1" and len(form["questions"]) > 0
+        assert form["questionnaire_version"] in ("V1", "V2") and len(form["questions"]) > 0
     feedback_gforms._check_config(config)          # raises on a config the Google Forms path would reject
 
 

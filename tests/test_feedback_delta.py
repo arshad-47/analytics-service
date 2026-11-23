@@ -497,8 +497,9 @@ def test_gforms_skipped_responses_go_to_dlq_with_row_numbers_status_still_succes
     assert set(by_row) == {2, 3}
     value, dlq_headers = by_row[2]
     assert value["submissionType"] == "feedback" and value["source"] == "google_forms" and value["csvUploadId"] == 7
-    assert value["submissionId"] is None and value["sessionId"] is None
+    assert value["submissionId"] == "gforms-upload-7-row-2" and value["sessionId"] == "gforms-upload-7-row-2"
     assert "(row 2)" in dlq_headers["reason"] and dlq_headers["tenantCode"] == "mitra"
+    assert dlq_headers["submissionId"] == "gforms-upload-7-row-2"
     assert "fine" not in json.dumps(value)  # no answer text in the DLQ stub
     assert len(_published(h)) == 1
 

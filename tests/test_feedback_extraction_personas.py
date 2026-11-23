@@ -202,7 +202,7 @@ def test_parent_child_fields_are_about_the_child_and_parent_fields_about_the_par
         "Pre-primary", "Primary (classes 1-5)", "Middle (classes 6-8)", "High school (classes 9-12)",
         "Undergraduate/postgraduate", "Skill programs", "Others", "Prefer not to say", "Invalid response",
         "Unsure / don't know", "Out of school / not currently enrolled")
-    assert grade.multi and grade.versions == ("V1",)
+    assert grade.multi and set(grade.versions) == {"V1", "V2"}
     assert by_name["respondent_relationship"].categories == (
         "Mother", "Father", "Guardian", "Other relative", "Unmapped", "Prefer not to say", "Invalid response")
     assert by_name["school_type"].categories == ("Government", "Private", "Others", "Not sure", "Prefer not to say", "Invalid response")

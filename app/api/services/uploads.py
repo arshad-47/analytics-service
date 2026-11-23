@@ -1399,15 +1399,17 @@ async def _process_feedback_inline(
         return
 
     if skipped:
-        # Assign synthetic row-based submissionId/sessionId if missing before logging and DLQ
+        # Display synthetic row-based submissionId/sessionId in logs for better visibility
+        logged_skipped = []
         for entry in skipped:
-            if not entry.get("submissionId") and entry.get("row") is not None:
-                synthetic_id = f"gforms-upload-{record_id}-row-{entry['row']}"
-                entry["submissionId"] = synthetic_id
-                entry["sessionId"] = synthetic_id
+            item = dict(entry)
+            if not item.get("submissionId") and item.get("row") is not None:
+                item["submissionId"] = f"gforms-upload-{record_id}-row-{item['row']}"
+                item["sessionId"] = item["submissionId"]
+            logged_skipped.append(item)
         logger.warning(
             "record %s: %d session(s)/response(s) were skipped (sent to the DLQ): %s",
-            record_id, len(skipped), skipped[:20],
+            record_id, len(skipped), logged_skipped[:20],
         )
 
     # --- 4. Publish valid sessions to Kafka ---
