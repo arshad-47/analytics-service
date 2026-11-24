@@ -1012,7 +1012,7 @@ def _build_dlq_messages(skipped: List[dict], record_id: int, tenant_code: str, s
         sub_id = entry.get("submissionId") or (
             f"gforms-upload-{record_id}-row-{entry['row']}" if entry.get("row") is not None else None
         )
-        sess_id = entry.get("sessionId") or sub_id
+        sess_id = entry.get("sessionId") or (sub_id if entry.get("row") is not None else None)
         value = {
             "submissionType": FEEDBACK_REPORT_TYPE,
             "eventType": "create",
