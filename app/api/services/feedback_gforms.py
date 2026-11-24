@@ -58,8 +58,21 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _TRAILING_JUNK = ' /"”“'
 _MAX_LISTED = 20
 _DEFAULT_LANGUAGE = "en"
-# Indic scripts Unicode ranges: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam
-_NON_ENGLISH_SCRIPT_RE = re.compile(r"[\u0900-\u0D7F]")
+
+
+def _has_non_english_script(text: str) -> bool:
+    """
+    Check if the text contains characters from any non-Latin script
+    (e.g. Indic scripts, Arabic/Urdu, Meitei Mayek, Ol Chiki, etc.).
+    Keeps English text, numbers, punctuation, spaces, and Latin diacritics valid.
+    """
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat.startswith(("L", "M")):  # Letter or Mark
+            name = unicodedata.name(ch, "")
+            if not name.startswith("LATIN"):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------------------------
@@ -397,9 +410,11 @@ def prepare_gforms_responses(
                 continue
             cleaned_val = value.strip()
             if enforce_english:
-                if _NON_ENGLISH_SCRIPT_RE.search(cleaned_val):
+                # 1. Check Language column (e.g. V2 where respondent selects language)
+                if question.get("question_key") == "LANGUAGE_IDENTIFICATION" and cleaned_val.lower() not in ("english", "en"):
                     non_english_cols.append(col)
-                elif question.get("question_key") == "LANGUAGE_IDENTIFICATION" and cleaned_val.lower() not in ("english", "en"):
+                # 2. Check actual text content for non-English scripts (e.g. V1 without language column, or regional text)
+                elif _has_non_english_script(cleaned_val):
                     non_english_cols.append(col)
             kinds.append(question.get("kind"))
             answers.append({"question_key": question["question_key"], "text": question["text"],
